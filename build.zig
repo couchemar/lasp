@@ -14,13 +14,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // Minish PBT dependency
+    const minish_dep = b.dependency("minish", .{});
+    const minish_module = minish_dep.module("minish");
+
     // Test step — runs all inline tests across the project.
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_module.addImport("minish", minish_module);
     const main_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = test_module,
     });
     const run_main_tests = b.addRunArtifact(main_tests);
 

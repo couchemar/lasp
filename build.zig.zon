@@ -1,0 +1,12 @@
+.{
+    .name = .lasp,
+    .version = "0.15.2",
+    .dependencies = .{
+        .minish = .{
+            .url = "https://github.com/CogitatorTech/minish/archive/refs/heads/main.tar.gz",
+            .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0x4db66db9ad3e800d,
+}
