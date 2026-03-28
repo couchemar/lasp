@@ -383,7 +383,7 @@ The parser functions as a CLI that generates JSON Event Streams, enabling simple
 **Commands:**
 ```bash
 code-parser parse file.rs --grammar grammars/rust.toml
-code-parser parse-repo ./repo --grammar-dir grammars/
+code-parser parse-dir ./repo --grammar-dir grammars/
 ```
 
 **Output JSON Code snippet Events:**
