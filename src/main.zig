@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const cli = @import("cli/args.zig");
+pub const tokenizer = @import("parser/tokenizer.zig");
 
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
@@ -47,6 +48,7 @@ test {
 test {
     // Pull in tests from all modules.
     _ = cli;
+    _ = tokenizer;
 }
 
 test "readSourceFile returns file contents" {
