@@ -6,6 +6,7 @@ const TokenMatcher = loader.TokenMatcher;
 const Capture = loader.Capture;
 const Pattern = loader.Pattern;
 const Token = tokenizer.Token;
+const TokenKind = tokenizer.TokenKind;
 
 // --- Data Types ---
 
@@ -34,20 +35,420 @@ pub const Automaton = struct {
     states: []const State,
 
     /// Check if a token matches a transition from the given state.
-    /// Returns the next state index and optional capture, or null if no match.
     pub fn step(self: Automaton, state_idx: usize, token: Token, source: []const u8) ?struct { next: usize, capture: ?CaptureValue } {
-        _ = self;
-        _ = state_idx;
-        _ = token;
-        _ = source;
-        @panic("TODO: implement Automaton.step");
+        const state = self.states[state_idx];
+        const text = source[token.start..token.end];
+
+        for (state.transitions) |tr| {
+            if (matchesTransition(tr.matcher, token.kind, text)) {
+                const cap: ?CaptureValue = if (tr.capture) |c|
+                    .{ .field_name = c.field_name, .value = text }
+                else
+                    null;
+                return .{ .next = tr.next_state, .capture = cap };
+            }
+        }
+        return null;
+    }
+};
+
+fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) bool {
+    return switch (matcher) {
+        .keyword_literal => |kw| kind == .keyword and std.mem.eql(u8, text, kw),
+        .symbol_literal => |sym| (kind == .delimiter or kind == .symbol) and std.mem.eql(u8, text, sym),
+        .identifier => kind == .identifier,
+        .capture => kind == .identifier,
+    };
+}
+
+
+// --- Mutable builder types used during compilation ---
+
+const MutableTransition = struct {
+    matcher: TokenMatcher,
+    next_state: usize,
+    capture: ?Capture,
+};
+
+const MutableState = struct {
+    transitions: std.ArrayList(MutableTransition),
+    event: ?EventInfo,
+
+    fn init() MutableState {
+        return .{ .transitions = .empty, .event = null };
     }
 };
 
 /// Compiles a list of patterns into a deterministic prefix trie automaton.
 /// Reuses shared prefix states across patterns.
 pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automaton {
-    _ = patterns;
-    _ = allocator;
-    @panic("TODO: implement compile");
+    var builder: std.ArrayList(MutableState) = .empty;
+
+    // State 0 = root (no event)
+    try builder.append(allocator, MutableState.init());
+
+    for (patterns) |pattern| {
+        var current: usize = 0;
+
+        // Walk/create path through trie
+        for (pattern.sequence, 0..) |matcher, seq_idx| {
+            const existing = findTransition(builder.items[current].transitions.items, matcher);
+            if (existing) |next_state| {
+                current = next_state;
+            } else {
+                // Create new state
+                const new_state = builder.items.len;
+                try builder.append(allocator, MutableState.init());
+
+                // Determine capture for this transition
+                const cap = findCaptureAtPosition(pattern.captures, seq_idx);
+
+                try builder.items[current].transitions.append(allocator, .{
+                    .matcher = matcher,
+                    .next_state = new_state,
+                    .capture = cap,
+                });
+                current = new_state;
+            }
+        }
+
+        // Mark terminal state
+        var cap_fields: std.ArrayList([]const u8) = .empty;
+        for (pattern.captures) |c| {
+            try cap_fields.append(allocator, c.field_name);
+        }
+        builder.items[current].event = .{
+            .type_name = pattern.type_name,
+            .capture_fields = try cap_fields.toOwnedSlice(allocator),
+        };
+    }
+
+    // Freeze mutable states into const slices
+    var states: std.ArrayList(State) = .empty;
+    for (builder.items) |*ms| {
+        try states.append(allocator, .{
+            .transitions = try freezeTransitions(ms.transitions.items, allocator),
+            .event = ms.event,
+        });
+    }
+
+    return .{ .states = try states.toOwnedSlice(allocator) };
+}
+
+fn findTransition(transitions: []const MutableTransition, matcher: TokenMatcher) ?usize {
+    for (transitions) |tr| {
+        if (matchersEqual(tr.matcher, matcher)) return tr.next_state;
+    }
+    return null;
+}
+
+fn matchersEqual(a: TokenMatcher, b: TokenMatcher) bool {
+    const tag_a: u2 = switch (a) {
+        .keyword_literal => 0,
+        .symbol_literal => 1,
+        .identifier => 2,
+        .capture => 3,
+    };
+    const tag_b: u2 = switch (b) {
+        .keyword_literal => 0,
+        .symbol_literal => 1,
+        .identifier => 2,
+        .capture => 3,
+    };
+    if (tag_a != tag_b) return false;
+
+    return switch (a) {
+        .keyword_literal => |ka| std.mem.eql(u8, ka, b.keyword_literal),
+        .symbol_literal => |sa| std.mem.eql(u8, sa, b.symbol_literal),
+        .identifier => true,
+        .capture => true, // captures match any identifier, same as identifier
+    };
+}
+
+fn findCaptureAtPosition(captures: []const Capture, position: usize) ?Capture {
+    for (captures) |c| {
+        if (c.position == position) return c;
+    }
+    return null;
+}
+
+fn freezeTransitions(mutable: []const MutableTransition, allocator: std.mem.Allocator) ![]const Transition {
+    var result: std.ArrayList(Transition) = .empty;
+    for (mutable) |mt| {
+        try result.append(allocator, .{
+            .matcher = mt.matcher,
+            .next_state = mt.next_state,
+            .capture = mt.capture,
+        });
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+
+// --- Unit Tests ---
+
+const testing = std.testing;
+
+test "compile: single pattern produces correct state count" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern: "fn" identifier "(" → 4 states (root + 3)
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .keyword_literal = "fn" },
+            .{ .identifier = {} },
+            .{ .symbol_literal = "(" },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, alloc);
+    try testing.expectEqual(@as(usize, 4), automaton.states.len);
+    // Root has no event
+    try testing.expect(automaton.states[0].event == null);
+    // Terminal state has event
+    try testing.expect(automaton.states[3].event != null);
+    try testing.expectEqualStrings("function", automaton.states[3].event.?.type_name);
+}
+
+test "compile: shared prefix" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern 1: "fn" identifier "("
+    // Pattern 2: "fn" identifier "{"
+    // Should share "fn" → identifier states, diverge at "(" vs "{"
+    const patterns = &[_]Pattern{
+        .{
+            .type_name = "function",
+            .sequence = &.{
+                .{ .keyword_literal = "fn" },
+                .{ .identifier = {} },
+                .{ .symbol_literal = "(" },
+            },
+            .captures = &.{},
+        },
+        .{
+            .type_name = "fn_block",
+            .sequence = &.{
+                .{ .keyword_literal = "fn" },
+                .{ .identifier = {} },
+                .{ .symbol_literal = "{" },
+            },
+            .captures = &.{},
+        },
+    };
+
+    const automaton = try compile(patterns, alloc);
+    // root → (fn) → state1 → (id) → state2 → (( or {) → state3 or state4
+    // 5 states total: root, after-fn, after-id, after-(, after-{
+    try testing.expectEqual(@as(usize, 5), automaton.states.len);
+    // Root has 1 transition (fn)
+    try testing.expectEqual(@as(usize, 1), automaton.states[0].transitions.len);
+    // State after identifier has 2 transitions (divergence)
+    try testing.expectEqual(@as(usize, 2), automaton.states[2].transitions.len);
+}
+
+test "compile: empty patterns produces root-only automaton" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const automaton = try compile(&.{}, arena.allocator());
+    try testing.expectEqual(@as(usize, 1), automaton.states.len);
+    try testing.expect(automaton.states[0].event == null);
+    try testing.expectEqual(@as(usize, 0), automaton.states[0].transitions.len);
+}
+
+test "step: matching token returns next state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{ .{ .keyword_literal = "fn" } },
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, arena.allocator());
+    const source = "fn";
+    const token = Token{ .kind = .keyword, .start = 0, .end = 2 };
+
+    const result = automaton.step(0, token, source);
+    try testing.expect(result != null);
+    try testing.expectEqual(@as(usize, 1), result.?.next);
+}
+
+test "step: non-matching token returns null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{ .{ .keyword_literal = "fn" } },
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, arena.allocator());
+    const source = "let";
+    const token = Token{ .kind = .keyword, .start = 0, .end = 3 };
+
+    const result = automaton.step(0, token, source);
+    try testing.expect(result == null);
+}
+
+test "step: capture returns value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .keyword_literal = "fn" },
+            .{ .capture = .{ .field_name = "name", .position = 1 } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 1 }},
+    }};
+
+    const automaton = try compile(patterns, arena.allocator());
+    const source = "fn add";
+
+    // Step 1: match "fn"
+    const r1 = automaton.step(0, .{ .kind = .keyword, .start = 0, .end = 2 }, source);
+    try testing.expect(r1 != null);
+    try testing.expect(r1.?.capture == null);
+
+    // Step 2: match identifier "add" with capture
+    const r2 = automaton.step(r1.?.next, .{ .kind = .identifier, .start = 3, .end = 6 }, source);
+    try testing.expect(r2 != null);
+    try testing.expect(r2.?.capture != null);
+    try testing.expectEqualStrings("name", r2.?.capture.?.field_name);
+    try testing.expectEqualStrings("add", r2.?.capture.?.value);
+}
+
+// --- Property Tests ---
+
+const minish = @import("minish");
+const gen = minish.gen;
+
+// Feature: phase2-grammar-automaton, Property 4: Automaton structural invariants
+test "property: automaton structural invariants" {
+    // Generate random pattern length (1-4)
+    const len_gen = gen.intRange(u8, 1, 4);
+
+    try minish.check(testing.allocator, len_gen, struct {
+        fn prop(pattern_len: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Build a pattern of the given length with alternating keyword/identifier
+            var seq: std.ArrayList(TokenMatcher) = .empty;
+            for (0..pattern_len) |i| {
+                if (i % 2 == 0) {
+                    try seq.append(alloc, .{ .keyword_literal = "kw" });
+                } else {
+                    try seq.append(alloc, .{ .identifier = {} });
+                }
+            }
+
+            const patterns = &[_]Pattern{.{
+                .type_name = "test",
+                .sequence = seq.items,
+                .captures = &.{},
+            }};
+
+            const automaton = try compile(patterns, alloc);
+
+            // (a) Root has no event
+            try testing.expect(automaton.states[0].event == null);
+
+            // (b) No state has duplicate matchers
+            for (automaton.states) |state| {
+                for (state.transitions, 0..) |tr_a, i| {
+                    for (state.transitions[i + 1 ..]) |tr_b| {
+                        try testing.expect(!matchersEqual(tr_a.matcher, tr_b.matcher));
+                    }
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase2-grammar-automaton, Property 5: Pattern path correctness
+test "property: pattern path correctness" {
+    const len_gen = gen.intRange(u8, 1, 4);
+
+    try minish.check(testing.allocator, len_gen, struct {
+        fn prop(pattern_len: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: std.ArrayList(TokenMatcher) = .empty;
+            for (0..pattern_len) |_| {
+                try seq.append(alloc, .{ .keyword_literal = "x" });
+            }
+
+            const patterns = &[_]Pattern{.{
+                .type_name = "test_type",
+                .sequence = seq.items,
+                .captures = &.{},
+            }};
+
+            const automaton = try compile(patterns, alloc);
+
+            // Walk the path: should be exactly pattern_len transitions to terminal
+            var state: usize = 0;
+            for (0..pattern_len) |_| {
+                try testing.expectEqual(@as(usize, 1), automaton.states[state].transitions.len);
+                state = automaton.states[state].transitions[0].next_state;
+            }
+            // Terminal state
+            try testing.expect(automaton.states[state].event != null);
+            try testing.expectEqualStrings("test_type", automaton.states[state].event.?.type_name);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase2-grammar-automaton, Property 6: Prefix sharing
+test "property: prefix sharing" {
+    const prefix_gen = gen.intRange(u8, 1, 3);
+
+    try minish.check(testing.allocator, prefix_gen, struct {
+        fn prop(prefix_len: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Two patterns sharing a prefix of prefix_len keywords, then diverging
+            var seq1: std.ArrayList(TokenMatcher) = .empty;
+            var seq2: std.ArrayList(TokenMatcher) = .empty;
+            for (0..prefix_len) |_| {
+                try seq1.append(alloc, .{ .keyword_literal = "shared" });
+                try seq2.append(alloc, .{ .keyword_literal = "shared" });
+            }
+            try seq1.append(alloc, .{ .symbol_literal = "(" });
+            try seq2.append(alloc, .{ .symbol_literal = "{" });
+
+            const patterns = &[_]Pattern{
+                .{ .type_name = "a", .sequence = seq1.items, .captures = &.{} },
+                .{ .type_name = "b", .sequence = seq2.items, .captures = &.{} },
+            };
+
+            const automaton = try compile(patterns, alloc);
+
+            // Walk shared prefix: each state should have exactly 1 transition
+            var state: usize = 0;
+            for (0..prefix_len) |_| {
+                try testing.expectEqual(@as(usize, 1), automaton.states[state].transitions.len);
+                state = automaton.states[state].transitions[0].next_state;
+            }
+            // Divergence point: should have 2 transitions
+            try testing.expectEqual(@as(usize, 2), automaton.states[state].transitions.len);
+        }
+    }.prop, .{ .num_runs = 100 });
 }
