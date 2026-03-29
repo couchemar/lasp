@@ -6,6 +6,10 @@
             .url = "https://github.com/CogitatorTech/minish/archive/refs/heads/main.tar.gz",
             .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
         },
+        .toml = .{
+            .url = "https://gitlab.com/devnw/zig/toml/-/archive/main/toml-main.tar.gz",
+            .hash = "toml-0.1.0-MHnSh64vAgAjI7CtbKkA7megV9k-TcduiLmxmF2nJNrq",
+        },
     },
     .paths = .{""},
     .fingerprint = 0x4db66db9ad3e800d,

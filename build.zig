@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // TOML parser dependency
+    const toml_dep = b.dependency("toml", .{});
+    const toml_module = toml_dep.module("toml");
+    exe.root_module.addImport("toml", toml_module);
+
     // Minish PBT dependency
     const minish_dep = b.dependency("minish", .{});
     const minish_module = minish_dep.module("minish");
@@ -25,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_module.addImport("minish", minish_module);
+    test_module.addImport("toml", toml_module);
     const main_tests = b.addTest(.{
         .root_module = test_module,
     });

@@ -2,6 +2,9 @@ const std = @import("std");
 pub const cli = @import("cli/args.zig");
 pub const tokenizer = @import("parser/tokenizer.zig");
 pub const json = @import("output/json.zig");
+pub const grammar_loader = @import("grammar/loader.zig");
+pub const grammar_compiler = @import("grammar/compiler.zig");
+pub const events = @import("parser/events.zig");
 
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
@@ -200,12 +203,12 @@ test "integration: parse produces valid JSON with expected token types" {
     // Verify it's valid JSON with "events" array
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
-    const events = parsed.value.object.get("events").?;
-    try std.testing.expect(events.array.items.len > 0);
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expect(json_events.array.items.len > 0);
 
     // Check that we get identifier tokens (sample.zig has identifiers)
     var has_identifier = false;
-    for (events.array.items) |event| {
+    for (json_events.array.items) |event| {
         const typ = event.object.get("type").?.string;
         if (std.mem.eql(u8, typ, "identifier")) has_identifier = true;
     }
@@ -222,12 +225,12 @@ test "integration: parse with --grammar produces keyword tokens" {
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
-    const events = parsed.value.object.get("events").?;
+    const json_events = parsed.value.object.get("events").?;
 
     // With keywords.txt containing "const", "pub", "fn", "return",
     // we should see keyword tokens
     var has_keyword = false;
-    for (events.array.items) |event| {
+    for (json_events.array.items) |event| {
         const typ = event.object.get("type").?.string;
         if (std.mem.eql(u8, typ, "keyword")) has_keyword = true;
     }
