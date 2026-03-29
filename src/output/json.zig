@@ -42,6 +42,43 @@ pub fn serializeTokens(tokens: []const Token, writer: anytype) !void {
     try writer.writeAll("] }");
 }
 
+const events_mod = @import("../parser/events.zig");
+const StructuralEvent = events_mod.StructuralEvent;
+
+/// Serializes structural events to JSON format.
+/// Format: { "events": [ { "type": "...", "start": N, "end": N, "confidence": F, ... } ] }
+pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !void {
+    try writer.writeAll("{ \"events\": [");
+
+    for (events_list, 0..) |event, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll(" { \"type\": \"");
+        try writer.writeAll(event.type_name);
+        try writer.writeAll("\", \"start\": ");
+        try writer.print("{d}", .{event.start});
+        try writer.writeAll(", \"end\": ");
+        try writer.print("{d}", .{event.end});
+        try writer.writeAll(", \"confidence\": ");
+        try writer.print("{d:.2}", .{event.confidence});
+
+        // Include capture fields
+        for (event.captures) |cap| {
+            try writer.writeAll(", \"");
+            try writer.writeAll(cap.field_name);
+            try writer.writeAll("\": \"");
+            try writer.writeAll(cap.value);
+            try writer.writeAll("\"");
+        }
+
+        try writer.writeAll(" }");
+    }
+
+    if (events_list.len > 0) {
+        try writer.writeAll(" ");
+    }
+    try writer.writeAll("] }");
+}
+
 
 // --- Unit Tests ---
 
@@ -183,6 +220,142 @@ test "property: JSON serialization correctness" {
             try testing.expectEqualStrings(expected_name, type_val.string);
             try testing.expectEqual(@as(i64, @intCast(start)), start_val.integer);
             try testing.expectEqual(@as(i64, @intCast(end)), end_val.integer);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Structural Event Tests ---
+
+fn serializeEventsToString(events_list: []const StructuralEvent) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(testing.allocator);
+    try serializeEvents(events_list, buf.writer(testing.allocator));
+    return buf.toOwnedSlice(testing.allocator);
+}
+
+test "serializeEvents: empty events" {
+    const result = try serializeEventsToString(&.{});
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("{ \"events\": [] }", result);
+}
+
+test "serializeEvents: event with name capture" {
+    const result = try serializeEventsToString(&.{.{
+        .type_name = "function",
+        .captures = &.{.{ .field_name = "name", .value = "add" }},
+        .start = 0,
+        .end = 10,
+        .confidence = 0.95,
+    }});
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expectEqualStrings("function", event.get("type").?.string);
+    try testing.expectEqualStrings("add", event.get("name").?.string);
+    try testing.expectEqual(@as(i64, 0), event.get("start").?.integer);
+    try testing.expectEqual(@as(i64, 10), event.get("end").?.integer);
+}
+
+test "serializeEvents: event with callee capture" {
+    const result = try serializeEventsToString(&.{.{
+        .type_name = "call",
+        .captures = &.{.{ .field_name = "callee", .value = "validate" }},
+        .start = 20,
+        .end = 32,
+        .confidence = 0.88,
+    }});
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expectEqualStrings("call", event.get("type").?.string);
+    try testing.expectEqualStrings("validate", event.get("callee").?.string);
+}
+
+test "serializeEvents: event without captures" {
+    const result = try serializeEventsToString(&.{.{
+        .type_name = "import",
+        .captures = &.{},
+        .start = 5,
+        .end = 15,
+        .confidence = 0.70,
+    }});
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expectEqualStrings("import", event.get("type").?.string);
+    try testing.expect(event.get("name") == null);
+    try testing.expect(event.get("callee") == null);
+}
+
+test "serializeEvents: output is valid JSON" {
+    const result = try serializeEventsToString(&.{
+        .{ .type_name = "function", .captures = &.{.{ .field_name = "name", .value = "foo" }}, .start = 0, .end = 10, .confidence = 0.95 },
+        .{ .type_name = "call", .captures = &.{.{ .field_name = "callee", .value = "bar" }}, .start = 15, .end = 25, .confidence = 0.80 },
+    });
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.get("events").?.array.items.len);
+}
+
+// Feature: phase2-grammar-automaton, Property 11: Event JSON serialization correctness
+test "property: event JSON serialization correctness" {
+    const event_gen = comptime gen.tuple3(
+        []const u8,
+        u16,
+        u16,
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.intRange(u16, 0, 1000),
+        gen.intRange(u16, 0, 1000),
+    );
+
+    try minish.check(testing.allocator, event_gen, struct {
+        fn prop(vals: struct { []const u8, u16, u16 }) !void {
+            const type_name = vals[0];
+            const start: usize = @intCast(vals[1]);
+            const end: usize = start + @as(usize, @intCast(vals[2]));
+
+            const events_list = &[_]StructuralEvent{.{
+                .type_name = type_name,
+                .captures = &.{.{ .field_name = "name", .value = "test" }},
+                .start = start,
+                .end = end,
+                .confidence = 0.85,
+            }};
+
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(testing.allocator);
+            try serializeEvents(events_list, buf.writer(testing.allocator));
+
+            // (a) Valid JSON
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf.items, .{});
+            defer parsed.deinit();
+
+            // (b) Has "events" array
+            const json_events = parsed.value.object.get("events").?;
+            try testing.expectEqual(@as(usize, 1), json_events.array.items.len);
+
+            // (c) Has required fields
+            const event = json_events.array.items[0].object;
+            try testing.expect(event.get("type") != null);
+            try testing.expect(event.get("start") != null);
+            try testing.expect(event.get("end") != null);
+            try testing.expect(event.get("confidence") != null);
+
+            // (d) name capture present
+            try testing.expect(event.get("name") != null);
+
+            // (e) Values correct
+            try testing.expectEqualStrings(type_name, event.get("type").?.string);
+            try testing.expectEqual(@as(i64, @intCast(start)), event.get("start").?.integer);
+            try testing.expectEqual(@as(i64, @intCast(end)), event.get("end").?.integer);
         }
     }.prop, .{ .num_runs = 100 });
 }
