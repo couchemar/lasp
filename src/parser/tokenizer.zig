@@ -378,3 +378,346 @@ test "tokenize mixed expression" {
         .{ .kind = .identifier, .text = "y" },
     });
 }
+
+// --- Property Tests ---
+
+const minish = @import("minish");
+const gen = minish.gen;
+
+// Feature: phase1-tokenizer-cli, Property 5: Token bounds invariant
+test "property: token bounds invariant" {
+    // For any source bytes, every token satisfies start <= end <= source.len
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 256, .charset = .ascii });
+
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(source: []const u8) !void {
+            const tokens = try tokenize(source, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            for (tokens) |tok| {
+                try testing.expect(tok.start <= tok.end);
+                try testing.expect(tok.end <= source.len);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 6: Identifier classification
+test "property: identifier classification" {
+    // For any string matching [a-zA-Z_][a-zA-Z0-9_]* surrounded by whitespace,
+    // tokenizer produces .identifier (no keyword table)
+    const ident_gen = gen.string(.{ .min_len = 1, .max_len = 32, .charset = .alpha });
+
+    try minish.check(testing.allocator, ident_gen, struct {
+        fn prop(ident: []const u8) !void {
+            // Use "x <ident> x" to avoid leading whitespace triggering indent
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "x {s} x", .{ident}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Expect: identifier("x"), identifier(ident), identifier("x")
+            try testing.expectEqual(@as(usize, 3), tokens.len);
+            try testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+            try testing.expectEqualStrings(ident, input[tokens[1].start..tokens[1].end]);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 7: Keyword classification correctness
+test "property: keyword classification correctness" {
+    const ident_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alpha });
+
+    // Part A: with keyword table, matching identifier → .keyword
+    try minish.check(testing.allocator, ident_gen, struct {
+        fn prop(word: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "x {s} x", .{word}) catch return;
+
+            const kw_table = &[_][]const u8{word};
+            const tokens = try tokenize(input, kw_table, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Expect: identifier("x"), keyword(word), identifier("x")
+            try testing.expectEqual(@as(usize, 3), tokens.len);
+            try testing.expectEqual(TokenKind.keyword, tokens[1].kind);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Part B: without keyword table, no .keyword tokens ever
+    try minish.check(testing.allocator, ident_gen, struct {
+        fn prop(word: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "x {s} x", .{word}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            for (tokens) |tok| {
+                try testing.expect(tok.kind != .keyword);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 8: Comment recognition
+test "property: comment recognition" {
+    // Content for comments: alphanumeric to avoid accidental comment terminators
+    const content_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .alphanumeric });
+
+    // Line comment with //
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "//{s}\n", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // First token should be .comment spanning from // to before \n
+            try testing.expect(tokens.len >= 1);
+            try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(2 + content.len, tokens[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Line comment with #
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "#{s}\n", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            try testing.expect(tokens.len >= 1);
+            try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(1 + content.len, tokens[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Block comment with /* ... */
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "/*{s}*/", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            try testing.expectEqual(@as(usize, 1), tokens.len);
+            try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(input.len, tokens[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 9: String literal recognition
+test "property: string literal recognition" {
+    // Use alphanumeric content to avoid unescaped quotes or backslashes
+    const content_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .alphanumeric });
+
+    // Double-quoted strings
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "\"{s}\"", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            try testing.expectEqual(@as(usize, 1), tokens.len);
+            try testing.expectEqual(TokenKind.string, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(input.len, tokens[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Single-quoted strings
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "'{s}'", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            try testing.expectEqual(@as(usize, 1), tokens.len);
+            try testing.expectEqual(TokenKind.string, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(input.len, tokens[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Escaped quotes don't terminate early
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            // Build: "content\"content"
+            const input = std.fmt.bufPrint(&buf, "\"{s}\\\"{s}\"", .{ content, content }) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            try testing.expectEqual(@as(usize, 1), tokens.len);
+            try testing.expectEqual(TokenKind.string, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(input.len, tokens[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 10: Number literal recognition
+test "property: number literal recognition" {
+    // Integer digits
+    const digits_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .numeric });
+
+    // Integer numbers
+    try minish.check(testing.allocator, digits_gen, struct {
+        fn prop(digits: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "x {s} x", .{digits}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Expect: identifier("x"), number(digits), identifier("x")
+            try testing.expectEqual(@as(usize, 3), tokens.len);
+            try testing.expectEqual(TokenKind.number, tokens[1].kind);
+            try testing.expectEqualStrings(digits, input[tokens[1].start..tokens[1].end]);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Decimal numbers: integer_part.fractional_part
+    const pair_gen = gen.tuple2(
+        []const u8,
+        []const u8,
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .numeric }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .numeric }),
+    );
+
+    try minish.check(testing.allocator, pair_gen, struct {
+        fn prop(parts: struct { []const u8, []const u8 }) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "x {s}.{s} x", .{ parts[0], parts[1] }) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Expect: identifier("x"), number(N.N), identifier("x")
+            try testing.expectEqual(@as(usize, 3), tokens.len);
+            try testing.expectEqual(TokenKind.number, tokens[1].kind);
+
+            // Token text should be "integer.fractional"
+            var expected_buf: [64]u8 = undefined;
+            const expected = std.fmt.bufPrint(&expected_buf, "{s}.{s}", .{ parts[0], parts[1] }) catch return;
+            try testing.expectEqualStrings(expected, input[tokens[1].start..tokens[1].end]);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 11: Indent recognition
+test "property: indent recognition" {
+    // Generate whitespace strings of spaces and tabs
+    const ws_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .custom, .custom_chars = " \t" });
+
+    try minish.check(testing.allocator, ws_gen, struct {
+        fn prop(ws: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            // "\n<whitespace>x" — indent after newline
+            const input = std.fmt.bufPrint(&buf, "\n{s}x", .{ws}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Expect: newline, indent, identifier
+            try testing.expect(tokens.len >= 2);
+            try testing.expectEqual(TokenKind.newline, tokens[0].kind);
+            try testing.expectEqual(TokenKind.indent, tokens[1].kind);
+
+            // Indent token should cover exactly the whitespace
+            const indent_text = input[tokens[1].start..tokens[1].end];
+            try testing.expectEqualStrings(ws, indent_text);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 12: Non-indentation whitespace skipping
+test "property: non-indentation whitespace skipping" {
+    // Generate whitespace of varying length between two identifiers
+    const ws_gen = gen.string(.{ .min_len = 1, .max_len = 32, .charset = .custom, .custom_chars = " \t" });
+
+    try minish.check(testing.allocator, ws_gen, struct {
+        fn prop(ws: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            // "a<whitespace>b" — whitespace between tokens, not at line start
+            const input = std.fmt.bufPrint(&buf, "a{s}b", .{ws}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Should produce exactly two identifier tokens, no whitespace tokens
+            try testing.expectEqual(@as(usize, 2), tokens.len);
+            try testing.expectEqual(TokenKind.identifier, tokens[0].kind);
+            try testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase1-tokenizer-cli, Property 13: Unclosed construct resilience
+test "property: unclosed construct resilience" {
+    const content_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .alphanumeric });
+
+    // Unclosed double-quoted string
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "\"{s}", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Should produce a string token extending to end of input
+            try testing.expect(tokens.len >= 1);
+            const last = tokens[tokens.len - 1];
+            try testing.expectEqual(TokenKind.string, last.kind);
+            try testing.expectEqual(input.len, last.end);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Unclosed single-quoted string
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "'{s}", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            try testing.expect(tokens.len >= 1);
+            const last = tokens[tokens.len - 1];
+            try testing.expectEqual(TokenKind.string, last.kind);
+            try testing.expectEqual(input.len, last.end);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Unclosed block comment
+    try minish.check(testing.allocator, content_gen, struct {
+        fn prop(content: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "/*{s}", .{content}) catch return;
+
+            const tokens = try tokenize(input, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            try testing.expect(tokens.len >= 1);
+            const last = tokens[tokens.len - 1];
+            try testing.expectEqual(TokenKind.comment, last.kind);
+            try testing.expectEqual(input.len, last.end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
