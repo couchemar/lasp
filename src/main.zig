@@ -29,21 +29,6 @@ fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     return file.readToEndAlloc(allocator, std.math.maxInt(usize));
 }
 
-/// Reads a keyword file (one keyword per line) and returns a slice of keyword strings.
-/// Uses the provided allocator for all allocations. Trims empty lines.
-fn loadKeywordFile(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {
-    const content = try readSourceFile(allocator, path);
-    var keywords: std.ArrayList([]const u8) = .empty;
-    var iter = std.mem.tokenizeScalar(u8, content, '\n');
-    while (iter.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len > 0) {
-            try keywords.append(allocator, trimmed);
-        }
-    }
-    return keywords.toOwnedSlice(allocator);
-}
-
 pub fn main() !void {
     // 1. Set up arena allocator
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -65,26 +50,41 @@ pub fn main() !void {
 
     // 4. Read source file
     const source = readSourceFile(allocator, parsed.target_path) catch {
-        // readSourceFile already printed the error to stderr
         std.process.fatal("failed to read file: {s}", .{parsed.target_path});
     };
 
-    // 5. Load keyword table if --grammar provided
-    const keywords: ?[]const []const u8 = if (parsed.grammar_path) |gp|
-        loadKeywordFile(allocator, gp) catch {
-            std.process.fatal("failed to load grammar file: {s}", .{gp});
-        }
-    else
-        null;
-
-    // 6. Tokenize
-    const tokens = try tokenizer.tokenize(source, keywords, allocator);
-
-    // 7. Serialize to JSON on stdout
+    // 5. Stdout setup
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
-    try json.serializeTokens(tokens, stdout);
+
+    // 6. Dispatch based on grammar
+    if (parsed.grammar_path) |gp| {
+        // Phase 2: TOML grammar → structural events
+        const grammar_source = readSourceFile(allocator, gp) catch {
+            std.process.fatal("failed to read grammar file: {s}", .{gp});
+        };
+        const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
+            const msg: []const u8 = switch (err) {
+                error.InvalidToml => "invalid TOML syntax in grammar file",
+                error.MissingPatterns => "grammar file missing required [[patterns]] section",
+                error.EmptyPatternSequence => "pattern has empty sequence",
+                error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
+                error.OutOfMemory => "out of memory",
+                else => "unknown grammar error",
+            };
+            std.process.fatal("error: {s}: {s}", .{ msg, gp });
+        };
+        const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
+        const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
+        const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, allocator);
+        try json.serializeEvents(structural_events, stdout);
+    } else {
+        // No grammar: raw token output
+        const tokens = try tokenizer.tokenize(source, null, allocator);
+        try json.serializeTokens(tokens, stdout);
+    }
+
     try stdout.writeAll("\n");
     try stdout.flush();
 }
@@ -113,29 +113,6 @@ test "readSourceFile returns FileNotFound for missing file" {
     const allocator = std.testing.allocator;
     const result = readSourceFile(allocator, "nonexistent_file_that_does_not_exist.txt");
     try std.testing.expectError(error.FileNotFound, result);
-}
-
-test "loadKeywordFile loads keywords from file" {
-    // Use arena since loadKeywordFile internally allocates file content
-    // that isn't returned — mirrors real usage in main()
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    // Write a temp keyword file
-    const tmp = try std.fs.cwd().createFile("test_keywords.txt", .{});
-    defer std.fs.cwd().deleteFile("test_keywords.txt") catch {};
-    try tmp.writeAll("fn\nstruct\nuse\npub\n\nconst\n");
-    tmp.close();
-
-    const keywords = try loadKeywordFile(allocator, "test_keywords.txt");
-
-    try std.testing.expectEqual(@as(usize, 5), keywords.len);
-    try std.testing.expectEqualStrings("fn", keywords[0]);
-    try std.testing.expectEqualStrings("struct", keywords[1]);
-    try std.testing.expectEqualStrings("use", keywords[2]);
-    try std.testing.expectEqualStrings("pub", keywords[3]);
-    try std.testing.expectEqualStrings("const", keywords[4]);
 }
 
 const minish = @import("minish");
@@ -216,28 +193,6 @@ test "integration: parse produces valid JSON with expected token types" {
     try std.testing.expect(has_identifier);
 }
 
-test "integration: parse with --grammar produces keyword tokens" {
-    const allocator = std.testing.allocator;
-    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/keywords.txt" });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
-    defer parsed.deinit();
-    const json_events = parsed.value.object.get("events").?;
-
-    // With keywords.txt containing "const", "pub", "fn", "return",
-    // we should see keyword tokens
-    var has_keyword = false;
-    for (json_events.array.items) |event| {
-        const typ = event.object.get("type").?.string;
-        if (std.mem.eql(u8, typ, "keyword")) has_keyword = true;
-    }
-    try std.testing.expect(has_keyword);
-}
-
 test "integration: parse nonexistent file exits non-zero" {
     const allocator = std.testing.allocator;
     const result = try runLasp(allocator, &.{ "parse", "nonexistent.zig" });
@@ -259,11 +214,77 @@ test "integration: no args prints usage and exits non-zero" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    // Should exit with non-zero
     switch (result.term) {
         .Exited => |code| try std.testing.expect(code != 0),
         else => {},
     }
-    // Stderr should contain error/usage message
+    try std.testing.expect(result.stderr.len > 0);
+}
+
+test "integration: parse with TOML grammar produces structural events" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expect(json_events.array.items.len > 0);
+
+    // Should have structural events with "confidence" field
+    var has_function = false;
+    for (json_events.array.items) |event| {
+        const typ = event.object.get("type").?.string;
+        try std.testing.expect(event.object.get("confidence") != null);
+        if (std.mem.eql(u8, typ, "function")) has_function = true;
+    }
+    try std.testing.expect(has_function);
+}
+
+test "integration: parse without grammar produces raw tokens" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expect(json_events.array.items.len > 0);
+
+    // Raw tokens have "type" but no "confidence"
+    const first = json_events.array.items[0].object;
+    try std.testing.expect(first.get("type") != null);
+    try std.testing.expect(first.get("confidence") == null);
+}
+
+test "integration: nonexistent grammar file exits non-zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "nonexistent.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+    try std.testing.expect(result.stderr.len > 0);
+}
+
+test "integration: malformed grammar file exits non-zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/malformed.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
     try std.testing.expect(result.stderr.len > 0);
 }

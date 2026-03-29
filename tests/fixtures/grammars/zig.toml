@@ -1,0 +1,24 @@
+[language]
+name = "zig"
+
+[keywords]
+function = ["fn"]
+declaration = ["const", "var", "pub"]
+control = ["return", "if", "else", "while", "for"]
+type = ["struct", "enum", "union"]
+
+[[patterns]]
+type = "function"
+sequence = ["fn", "$name:IDENTIFIER", "("]
+
+[[patterns]]
+type = "struct"
+sequence = ["struct", "$name:IDENTIFIER"]
+
+[[patterns]]
+type = "call"
+sequence = ["$callee:IDENTIFIER", "("]
+
+[blocks]
+open = "{"
+close = "}"
