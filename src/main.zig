@@ -40,7 +40,50 @@ fn loadKeywordFile(allocator: std.mem.Allocator, path: []const u8) ![]const []co
     return keywords.toOwnedSlice(allocator);
 }
 
-pub fn main() void {}
+pub fn main() !void {
+    // 1. Set up arena allocator
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // 2. Collect CLI args (skip binary name)
+    var arg_list: std.ArrayList([]const u8) = .empty;
+    var args_iter = std.process.args();
+    _ = args_iter.next(); // skip binary name
+    while (args_iter.next()) |arg| {
+        try arg_list.append(allocator, arg);
+    }
+
+    // 3. Parse CLI args
+    const parsed = cli.parseArgs(arg_list.items) catch |err| {
+        std.process.fatal("{s}", .{cli.formatCliError(err)});
+    };
+
+    // 4. Read source file
+    const source = readSourceFile(allocator, parsed.target_path) catch {
+        // readSourceFile already printed the error to stderr
+        std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+    };
+
+    // 5. Load keyword table if --grammar provided
+    const keywords: ?[]const []const u8 = if (parsed.grammar_path) |gp|
+        loadKeywordFile(allocator, gp) catch {
+            std.process.fatal("failed to load grammar file: {s}", .{gp});
+        }
+    else
+        null;
+
+    // 6. Tokenize
+    const tokens = try tokenizer.tokenize(source, keywords, allocator);
+
+    // 7. Serialize to JSON on stdout
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    try json.serializeTokens(tokens, stdout);
+    try stdout.writeAll("\n");
+    try stdout.flush();
+}
 
 test {
     std.testing.refAllDeclsRecursive(@This());
@@ -116,4 +159,107 @@ test "property: file read round trip" {
             try std.testing.expectEqualSlices(u8, data, content);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// --- Integration Tests ---
+
+fn runLasp(allocator: std.mem.Allocator, args: []const []const u8) !struct { stdout: []u8, stderr: []u8, term: std.process.Child.Term } {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "zig-out/bin/lasp");
+    for (args) |a| try argv.append(allocator, a);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    try child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024);
+    const term = try child.wait();
+
+    // collectOutput manages the ArrayList buffers; extract owned slices
+    const stdout_slice = try allocator.dupe(u8, stdout_buf.items);
+    const stderr_slice = try allocator.dupe(u8, stderr_buf.items);
+    stdout_buf.deinit(allocator);
+    stderr_buf.deinit(allocator);
+
+    return .{ .stdout = stdout_slice, .stderr = stderr_slice, .term = term };
+}
+
+test "integration: parse produces valid JSON with expected token types" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+
+    // Verify it's valid JSON with "events" array
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events = parsed.value.object.get("events").?;
+    try std.testing.expect(events.array.items.len > 0);
+
+    // Check that we get identifier tokens (sample.zig has identifiers)
+    var has_identifier = false;
+    for (events.array.items) |event| {
+        const typ = event.object.get("type").?.string;
+        if (std.mem.eql(u8, typ, "identifier")) has_identifier = true;
+    }
+    try std.testing.expect(has_identifier);
+}
+
+test "integration: parse with --grammar produces keyword tokens" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/keywords.txt" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events = parsed.value.object.get("events").?;
+
+    // With keywords.txt containing "const", "pub", "fn", "return",
+    // we should see keyword tokens
+    var has_keyword = false;
+    for (events.array.items) |event| {
+        const typ = event.object.get("type").?.string;
+        if (std.mem.eql(u8, typ, "keyword")) has_keyword = true;
+    }
+    try std.testing.expect(has_keyword);
+}
+
+test "integration: parse nonexistent file exits non-zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "nonexistent.zig" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should exit with non-zero
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => {}, // Signal/other termination is also non-zero
+    }
+    // Stderr should contain error message
+    try std.testing.expect(result.stderr.len > 0);
+}
+
+test "integration: no args prints usage and exits non-zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should exit with non-zero
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+    // Stderr should contain error/usage message
+    try std.testing.expect(result.stderr.len > 0);
 }

@@ -21,6 +21,18 @@ pub const CliError = error{
     MissingFlagValue,
 };
 
+/// Returns a human-readable error message for a CliError.
+pub fn formatCliError(err: CliError) []const u8 {
+    return switch (err) {
+        error.NoCommand => "error: no command provided. Usage: lasp <parse|parse-dir> <path> [flags]",
+        error.UnrecognizedCommand => "error: unrecognized command",
+        error.UnrecognizedFlag => "error: unrecognized flag",
+        error.MissingFilePath => "error: parse command requires a file path",
+        error.MissingDirectoryPath => "error: parse-dir command requires a directory path",
+        error.MissingFlagValue => "error: flag requires a value",
+    };
+}
+
 /// Parses command-line arguments into a ParsedArgs struct.
 /// Receives args[1..] (binary name already stripped).
 /// Returns CliError on invalid input. Does not allocate.
