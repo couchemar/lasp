@@ -1,6 +1,7 @@
 const std = @import("std");
 pub const cli = @import("cli/args.zig");
 pub const tokenizer = @import("parser/tokenizer.zig");
+pub const json = @import("output/json.zig");
 
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
