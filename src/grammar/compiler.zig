@@ -61,7 +61,6 @@ fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) b
     };
 }
 
-
 // --- Mutable builder types used during compilation ---
 
 const MutableTransition = struct {
@@ -184,7 +183,6 @@ fn freezeTransitions(mutable: []const MutableTransition, allocator: std.mem.Allo
     return result.toOwnedSlice(allocator);
 }
 
-
 // --- Unit Tests ---
 
 const testing = std.testing;
@@ -269,13 +267,13 @@ test "step: matching token returns next state" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .keyword_literal = "fn" } },
+        .sequence = &.{.{ .keyword_literal = "fn" }},
         .captures = &.{},
     }};
 
     const automaton = try compile(patterns, arena.allocator());
     const source = "fn";
-    const token = Token{ .kind = .keyword, .start = 0, .end = 2 };
+    const token = Token{ .kind = .keyword, .start = 0, .end = 2, .line = 1 };
 
     const result = automaton.step(0, token, source);
     try testing.expect(result != null);
@@ -288,13 +286,13 @@ test "step: non-matching token returns null" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .keyword_literal = "fn" } },
+        .sequence = &.{.{ .keyword_literal = "fn" }},
         .captures = &.{},
     }};
 
     const automaton = try compile(patterns, arena.allocator());
     const source = "let";
-    const token = Token{ .kind = .keyword, .start = 0, .end = 3 };
+    const token = Token{ .kind = .keyword, .start = 0, .end = 3, .line = 1 };
 
     const result = automaton.step(0, token, source);
     try testing.expect(result == null);
@@ -317,12 +315,12 @@ test "step: capture returns value" {
     const source = "fn add";
 
     // Step 1: match "fn"
-    const r1 = automaton.step(0, .{ .kind = .keyword, .start = 0, .end = 2 }, source);
+    const r1 = automaton.step(0, .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 }, source);
     try testing.expect(r1 != null);
     try testing.expect(r1.?.capture == null);
 
     // Step 2: match identifier "add" with capture
-    const r2 = automaton.step(r1.?.next, .{ .kind = .identifier, .start = 3, .end = 6 }, source);
+    const r2 = automaton.step(r1.?.next, .{ .kind = .identifier, .start = 3, .end = 6, .line = 1 }, source);
     try testing.expect(r2 != null);
     try testing.expect(r2.?.capture != null);
     try testing.expectEqualStrings("name", r2.?.capture.?.field_name);

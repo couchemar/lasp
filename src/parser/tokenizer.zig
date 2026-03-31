@@ -17,6 +17,7 @@ pub const Token = struct {
     kind: TokenKind,
     start: usize,
     end: usize,
+    line: usize,
 };
 
 // --- Character classification helpers ---
@@ -78,21 +79,23 @@ pub fn tokenize(
     var tokens: std.ArrayList(Token) = .empty;
     var i: usize = 0;
     var at_line_start = true;
+    var current_line: usize = 1;
 
     while (i < source.len) {
         const c = source[i];
 
         // Newline
         if (c == '\n') {
-            try tokens.append(allocator, .{ .kind = .newline, .start = i, .end = i + 1 });
+            try tokens.append(allocator, .{ .kind = .newline, .start = i, .end = i + 1, .line = current_line });
             i += 1;
             at_line_start = true;
+            current_line += 1;
 
             // Check for indent after newline
             const indent_start = i;
             while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
             if (i > indent_start) {
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i });
+                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line });
             }
             continue;
         }
@@ -102,7 +105,7 @@ pub fn tokenize(
             if (at_line_start) {
                 const indent_start = i;
                 while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i });
+                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line });
                 at_line_start = false;
             } else {
                 i += 1;
@@ -116,7 +119,7 @@ pub fn tokenize(
         if (c == '#' or (c == '/' and i + 1 < source.len and source[i + 1] == '/')) {
             const start = i;
             while (i < source.len and source[i] != '\n') : (i += 1) {}
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i });
+            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line });
             continue;
         }
 
@@ -134,7 +137,7 @@ pub fn tokenize(
                 // Unclosed block comment — extend to end
                 i = source.len;
             }
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i });
+            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line });
             continue;
         }
 
@@ -155,7 +158,7 @@ pub fn tokenize(
                 i += 1;
             }
             // If we exited without finding closing quote, i == source.len (unclosed string)
-            try tokens.append(allocator, .{ .kind = .string, .start = start, .end = i });
+            try tokens.append(allocator, .{ .kind = .string, .start = start, .end = i, .line = current_line });
             continue;
         }
 
@@ -167,7 +170,7 @@ pub fn tokenize(
                 i += 1;
                 while (i < source.len and isDigit(source[i])) : (i += 1) {}
             }
-            try tokens.append(allocator, .{ .kind = .number, .start = start, .end = i });
+            try tokens.append(allocator, .{ .kind = .number, .start = start, .end = i, .line = current_line });
             continue;
         }
 
@@ -180,27 +183,27 @@ pub fn tokenize(
                 (if (isKeyword(text, kt)) TokenKind.keyword else TokenKind.identifier)
             else
                 .identifier;
-            try tokens.append(allocator, .{ .kind = kind, .start = start, .end = i });
+            try tokens.append(allocator, .{ .kind = kind, .start = start, .end = i, .line = current_line });
             continue;
         }
 
         // Operators
         if (isOperator(c)) {
-            try tokens.append(allocator, .{ .kind = .operator, .start = i, .end = i + 1 });
+            try tokens.append(allocator, .{ .kind = .operator, .start = i, .end = i + 1, .line = current_line });
             i += 1;
             continue;
         }
 
         // Delimiters
         if (isDelimiter(c)) {
-            try tokens.append(allocator, .{ .kind = .delimiter, .start = i, .end = i + 1 });
+            try tokens.append(allocator, .{ .kind = .delimiter, .start = i, .end = i + 1, .line = current_line });
             i += 1;
             continue;
         }
 
         // Symbols
         if (isSymbol(c)) {
-            try tokens.append(allocator, .{ .kind = .symbol, .start = i, .end = i + 1 });
+            try tokens.append(allocator, .{ .kind = .symbol, .start = i, .end = i + 1, .line = current_line });
             i += 1;
             continue;
         }

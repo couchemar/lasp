@@ -20,7 +20,7 @@ fn tokenKindToString(kind: TokenKind) []const u8 {
 }
 
 /// Serializes a token array to JSON format and writes to the provided writer.
-/// Format: { "events": [ { "type": "...", "start": N, "end": N }, ... ] }
+/// Format: { "events": [ { "type": "...", "start": N, "end": N, "line": N }, ... ] }
 /// Writes directly to the writer with no intermediate string allocation.
 pub fn serializeTokens(tokens: []const Token, writer: anytype) !void {
     try writer.writeAll("{ \"events\": [");
@@ -33,6 +33,8 @@ pub fn serializeTokens(tokens: []const Token, writer: anytype) !void {
         try writer.print("{d}", .{tok.start});
         try writer.writeAll(", \"end\": ");
         try writer.print("{d}", .{tok.end});
+        try writer.writeAll(", \"line\": ");
+        try writer.print("{d}", .{tok.line});
         try writer.writeAll(" }");
     }
 
@@ -46,7 +48,7 @@ const events_mod = @import("../parser/events.zig");
 const StructuralEvent = events_mod.StructuralEvent;
 
 /// Serializes structural events to JSON format.
-/// Format: { "events": [ { "type": "...", "start": N, "end": N, "confidence": F, ... } ] }
+/// Format: { "events": [ { "type": "...", "start": N, "end": N, "line": N, "confidence": F, ... } ] }
 pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !void {
     try writer.writeAll("{ \"events\": [");
 
@@ -58,6 +60,8 @@ pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !v
         try writer.print("{d}", .{event.start});
         try writer.writeAll(", \"end\": ");
         try writer.print("{d}", .{event.end});
+        try writer.writeAll(", \"line\": ");
+        try writer.print("{d}", .{event.line});
         try writer.writeAll(", \"confidence\": ");
         try writer.print("{d:.2}", .{event.confidence});
 
@@ -79,7 +83,6 @@ pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !v
     try writer.writeAll("] }");
 }
 
-
 // --- Unit Tests ---
 
 const testing = std.testing;
@@ -99,37 +102,37 @@ test "serializeTokens empty tokens" {
 
 test "serializeTokens single token" {
     const tokens = [_]Token{
-        .{ .kind = .identifier, .start = 0, .end = 5 },
+        .{ .kind = .identifier, .start = 0, .end = 5, .line = 1 },
     };
     const result = try serializeToString(&tokens);
     defer testing.allocator.free(result);
     try testing.expectEqualStrings(
-        "{ \"events\": [ { \"type\": \"identifier\", \"start\": 0, \"end\": 5 } ] }",
+        "{ \"events\": [ { \"type\": \"identifier\", \"start\": 0, \"end\": 5, \"line\": 1 } ] }",
         result,
     );
 }
 
 test "serializeTokens multiple tokens" {
     const tokens = [_]Token{
-        .{ .kind = .keyword, .start = 0, .end = 2 },
-        .{ .kind = .identifier, .start = 3, .end = 6 },
-        .{ .kind = .delimiter, .start = 6, .end = 7 },
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1 },
     };
     const result = try serializeToString(&tokens);
     defer testing.allocator.free(result);
 
     const expected =
-        "{ \"events\": [ { \"type\": \"keyword\", \"start\": 0, \"end\": 2 }," ++
-        " { \"type\": \"identifier\", \"start\": 3, \"end\": 6 }," ++
-        " { \"type\": \"delimiter\", \"start\": 6, \"end\": 7 } ] }";
+        "{ \"events\": [ { \"type\": \"keyword\", \"start\": 0, \"end\": 2, \"line\": 1 }," ++
+        " { \"type\": \"identifier\", \"start\": 3, \"end\": 6, \"line\": 1 }," ++
+        " { \"type\": \"delimiter\", \"start\": 6, \"end\": 7, \"line\": 1 } ] }";
     try testing.expectEqualStrings(expected, result);
 }
 
 test "serializeTokens output is valid JSON" {
     const tokens = [_]Token{
-        .{ .kind = .string, .start = 0, .end = 7 },
-        .{ .kind = .operator, .start = 8, .end = 9 },
-        .{ .kind = .number, .start = 10, .end = 12 },
+        .{ .kind = .string, .start = 0, .end = 7, .line = 1 },
+        .{ .kind = .operator, .start = 8, .end = 9, .line = 1 },
+        .{ .kind = .number, .start = 10, .end = 12, .line = 1 },
     };
     const result = try serializeToString(&tokens);
     defer testing.allocator.free(result);
@@ -154,7 +157,7 @@ test "serializeTokens all token kinds" {
     const names = [_][]const u8{ "identifier", "keyword", "symbol", "string", "number", "operator", "newline", "indent", "comment", "delimiter" };
 
     for (kinds, names) |kind, expected_name| {
-        const tokens = [_]Token{.{ .kind = kind, .start = 0, .end = 1 }};
+        const tokens = [_]Token{.{ .kind = kind, .start = 0, .end = 1, .line = 1 }};
         const result = try serializeToString(&tokens);
         defer testing.allocator.free(result);
 
@@ -196,7 +199,7 @@ test "property: JSON serialization correctness" {
             const kind = kinds[kind_idx];
             const expected_name = names[kind_idx];
 
-            const tokens = [_]Token{.{ .kind = kind, .start = start, .end = end }};
+            const tokens = [_]Token{.{ .kind = kind, .start = start, .end = end, .line = 1 }};
 
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(testing.allocator);
@@ -245,6 +248,7 @@ test "serializeEvents: event with name capture" {
         .captures = &.{.{ .field_name = "name", .value = "add" }},
         .start = 0,
         .end = 10,
+        .line = 1,
         .confidence = 0.95,
     }});
     defer testing.allocator.free(result);
@@ -264,6 +268,7 @@ test "serializeEvents: event with callee capture" {
         .captures = &.{.{ .field_name = "callee", .value = "validate" }},
         .start = 20,
         .end = 32,
+        .line = 2,
         .confidence = 0.88,
     }});
     defer testing.allocator.free(result);
@@ -281,6 +286,7 @@ test "serializeEvents: event without captures" {
         .captures = &.{},
         .start = 5,
         .end = 15,
+        .line = 1,
         .confidence = 0.70,
     }});
     defer testing.allocator.free(result);
@@ -295,8 +301,8 @@ test "serializeEvents: event without captures" {
 
 test "serializeEvents: output is valid JSON" {
     const result = try serializeEventsToString(&.{
-        .{ .type_name = "function", .captures = &.{.{ .field_name = "name", .value = "foo" }}, .start = 0, .end = 10, .confidence = 0.95 },
-        .{ .type_name = "call", .captures = &.{.{ .field_name = "callee", .value = "bar" }}, .start = 15, .end = 25, .confidence = 0.80 },
+        .{ .type_name = "function", .captures = &.{.{ .field_name = "name", .value = "foo" }}, .start = 0, .end = 10, .line = 1, .confidence = 0.95 },
+        .{ .type_name = "call", .captures = &.{.{ .field_name = "callee", .value = "bar" }}, .start = 15, .end = 25, .line = 2, .confidence = 0.80 },
     });
     defer testing.allocator.free(result);
 
@@ -327,6 +333,7 @@ test "property: event JSON serialization correctness" {
                 .captures = &.{.{ .field_name = "name", .value = "test" }},
                 .start = start,
                 .end = end,
+                .line = 1,
                 .confidence = 0.85,
             }};
 

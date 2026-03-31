@@ -72,11 +72,21 @@ pub fn parse(
                 const confidence = events_mod.computeConfidence(matched_kinds.items, max_score);
 
                 if (confidence >= 0.3) {
+                    // Find the line number from the first token in the pattern
+                    var pattern_line: usize = 1;
+                    for (tokens) |t| {
+                        if (t.start == pattern_start) {
+                            pattern_line = t.line;
+                            break;
+                        }
+                    }
+
                     try result.append(allocator, .{
                         .type_name = event_info.type_name,
                         .captures = try pending_captures.toOwnedSlice(allocator),
                         .start = pattern_start,
                         .end = token.end,
+                        .line = pattern_line,
                         .confidence = confidence,
                     });
                 } else {
@@ -103,7 +113,6 @@ fn findPatternMaxScore(patterns: []const loader.Pattern, type_name: []const u8) 
     return 1.0; // fallback
 }
 
-
 // --- Unit Tests ---
 
 const testing = std.testing;
@@ -126,9 +135,9 @@ test "parse: single pattern match emits event" {
     const automaton = try compiler.compile(patterns, alloc);
     const source = "fn add(";
     const tokens = &[_]Token{
-        .{ .kind = .keyword, .start = 0, .end = 2 },
-        .{ .kind = .identifier, .start = 3, .end = 6 },
-        .{ .kind = .delimiter, .start = 6, .end = 7 },
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1 },
     };
 
     const result = try parse(automaton, tokens, source, patterns, alloc);
@@ -156,8 +165,8 @@ test "parse: no matching pattern emits nothing" {
     const automaton = try compiler.compile(patterns, alloc);
     const source = "let x";
     const tokens = &[_]Token{
-        .{ .kind = .keyword, .start = 0, .end = 3 },
-        .{ .kind = .identifier, .start = 4, .end = 5 },
+        .{ .kind = .keyword, .start = 0, .end = 3, .line = 1 },
+        .{ .kind = .identifier, .start = 4, .end = 5, .line = 1 },
     };
 
     const result = try parse(automaton, tokens, source, patterns, alloc);
@@ -179,10 +188,10 @@ test "parse: skip tokens between structural tokens" {
     // "fn\n  add" — newline and indent between fn and add
     const source = "fn\n  add";
     const tokens = &[_]Token{
-        .{ .kind = .keyword, .start = 0, .end = 2 },
-        .{ .kind = .newline, .start = 2, .end = 3 },
-        .{ .kind = .indent, .start = 3, .end = 5 },
-        .{ .kind = .identifier, .start = 5, .end = 8 },
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 },
+        .{ .kind = .newline, .start = 2, .end = 3, .line = 1 },
+        .{ .kind = .indent, .start = 3, .end = 5, .line = 2 },
+        .{ .kind = .identifier, .start = 5, .end = 8, .line = 2 },
     };
 
     const result = try parse(automaton, tokens, source, patterns, alloc);
@@ -209,9 +218,9 @@ test "parse: confidence computation for known tokens" {
     const automaton = try compiler.compile(patterns, alloc);
     const source = "fn add(";
     const tokens = &[_]Token{
-        .{ .kind = .keyword, .start = 0, .end = 2 },
-        .{ .kind = .identifier, .start = 3, .end = 6 },
-        .{ .kind = .delimiter, .start = 6, .end = 7 },
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1 },
     };
 
     const result = try parse(automaton, tokens, source, patterns, alloc);
@@ -234,10 +243,10 @@ test "parse: multiple pattern matches" {
     const automaton = try compiler.compile(patterns, alloc);
     const source = "foo( bar(";
     const tokens = &[_]Token{
-        .{ .kind = .identifier, .start = 0, .end = 3 },
-        .{ .kind = .delimiter, .start = 3, .end = 4 },
-        .{ .kind = .identifier, .start = 5, .end = 8 },
-        .{ .kind = .delimiter, .start = 8, .end = 9 },
+        .{ .kind = .identifier, .start = 0, .end = 3, .line = 1 },
+        .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1 },
+        .{ .kind = .identifier, .start = 5, .end = 8, .line = 1 },
+        .{ .kind = .delimiter, .start = 8, .end = 9, .line = 1 },
     };
 
     const result = try parse(automaton, tokens, source, patterns, alloc);
@@ -276,8 +285,8 @@ test "property: engine pattern match correctness" {
             var buf: [256]u8 = undefined;
             const source = std.fmt.bufPrint(&buf, "fn {s}", .{ident}) catch return;
             const tokens = &[_]Token{
-                .{ .kind = .keyword, .start = 0, .end = 2 },
-                .{ .kind = .identifier, .start = 3, .end = 3 + ident.len },
+                .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 },
+                .{ .kind = .identifier, .start = 3, .end = 3 + ident.len, .line = 1 },
             };
 
             const result = try parse(automaton, tokens, source, patterns, alloc);
@@ -311,11 +320,11 @@ test "property: engine skip token transparency" {
 
             // Build token stream with skip tokens inserted between fn and add
             var tokens: std.ArrayList(Token) = .empty;
-            try tokens.append(alloc, .{ .kind = .keyword, .start = 0, .end = 2 });
+            try tokens.append(alloc, .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 });
             for (0..num_skips) |_| {
-                try tokens.append(alloc, .{ .kind = .newline, .start = 2, .end = 3 });
+                try tokens.append(alloc, .{ .kind = .newline, .start = 2, .end = 3, .line = 1 });
             }
-            try tokens.append(alloc, .{ .kind = .identifier, .start = 3, .end = 6 });
+            try tokens.append(alloc, .{ .kind = .identifier, .start = 3, .end = 6, .line = 2 });
 
             const result = try parse(automaton, tokens.items, source, patterns, alloc);
             // Should always match regardless of skip tokens
@@ -345,8 +354,8 @@ test "property: event field invariants" {
             var buf: [256]u8 = undefined;
             const source = std.fmt.bufPrint(&buf, "{s}(", .{ident}) catch return;
             const tokens = &[_]Token{
-                .{ .kind = .identifier, .start = 0, .end = ident.len },
-                .{ .kind = .delimiter, .start = ident.len, .end = ident.len + 1 },
+                .{ .kind = .identifier, .start = 0, .end = ident.len, .line = 1 },
+                .{ .kind = .delimiter, .start = ident.len, .end = ident.len + 1, .line = 1 },
             };
 
             const result = try parse(automaton, tokens, source, patterns, alloc);

@@ -10,6 +10,7 @@ pub const StructuralEvent = struct {
     captures: []const CaptureEntry,
     start: usize,
     end: usize,
+    line: usize,
     confidence: f32,
 };
 
