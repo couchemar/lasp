@@ -1,0 +1,4 @@
+[[patterns]]
+type = "function"
+sequence = ["fn", "$name:IDENTIFIER", "("]
+position = "invalid"
