@@ -1,0 +1,32 @@
+[language]
+name = "zig"
+
+[keywords]
+function = ["fn", "pub"]
+struct = ["struct", "enum", "union"]
+import = ["@import"]
+control = ["if", "else", "while", "for", "switch", "return", "break", "continue"]
+
+[[patterns]]
+type = "function"
+sequence = ["fn", "$name:IDENTIFIER", "("]
+
+[[patterns]]
+type = "pub_function"
+sequence = ["pub", "fn", "$name:IDENTIFIER", "("]
+
+[[patterns]]
+type = "struct"
+sequence = ["$name:IDENTIFIER", "=", "struct"]
+
+[[patterns]]
+type = "enum"
+sequence = ["$name:IDENTIFIER", "=", "enum"]
+
+[[patterns]]
+type = "call"
+sequence = ["$callee:IDENTIFIER", "("]
+
+[blocks]
+open = "{"
+close = "}"

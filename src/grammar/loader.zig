@@ -691,3 +691,44 @@ test "property: invalid TOML rejection" {
         }
     }.prop, .{ .num_runs = 100 });
 }
+
+// --- Example Grammar File Verification Tests ---
+
+test "example grammar: erlang.toml parses without errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const file = try std.fs.cwd().openFile("examples/grammars/erlang.toml", .{});
+    defer file.close();
+    const source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const grammar = try parseGrammar(source, alloc);
+    try testing.expectEqualStrings("erlang", grammar.language_name.?);
+    try testing.expect(grammar.patterns.len >= 7);
+    try testing.expect(grammar.keyword_table.len > 0);
+    try testing.expectEqualStrings("begin", grammar.blocks.open.?);
+    try testing.expectEqualStrings("end", grammar.blocks.close.?);
+    // Verify function pattern has position and exclude
+    for (grammar.patterns) |p| {
+        if (std.mem.eql(u8, p.type_name, "function")) {
+            try testing.expect(p.position != null);
+            try testing.expectEqual(PositionConstraint.start, p.position.?);
+            try testing.expect(p.exclude.len == 2);
+            break;
+        }
+    }
+}
+
+test "example grammar: zig.toml parses without errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const file = try std.fs.cwd().openFile("examples/grammars/zig.toml", .{});
+    defer file.close();
+    const source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const grammar = try parseGrammar(source, alloc);
+    try testing.expectEqualStrings("zig", grammar.language_name.?);
+    try testing.expect(grammar.patterns.len >= 5);
+    try testing.expect(grammar.keyword_table.len > 0);
+    try testing.expectEqualStrings("{", grammar.blocks.open.?);
+    try testing.expectEqualStrings("}", grammar.blocks.close.?);
+}

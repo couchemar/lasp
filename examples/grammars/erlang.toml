@@ -1,0 +1,41 @@
+[language]
+name = "erlang"
+
+[keywords]
+declaration = ["-module", "-export", "-spec", "-type", "-record", "-behaviour", "-include", "-include_lib", "-define", "-ignore_xref", "-export_type"]
+control = ["case", "of", "end", "if", "when", "try", "catch", "after", "receive", "begin", "maybe", "else"]
+function = ["fun"]
+
+[[patterns]]
+type = "module"
+sequence = ["-module", "(", "$name:IDENTIFIER"]
+
+[[patterns]]
+type = "export"
+sequence = ["-export", "("]
+
+[[patterns]]
+type = "spec"
+sequence = ["-spec", "$name:IDENTIFIER", "("]
+
+[[patterns]]
+type = "function"
+sequence = ["$name:IDENTIFIER", "("]
+position = "start"
+exclude = ["-spec", "-type"]
+
+[[patterns]]
+type = "call"
+sequence = ["$callee:IDENTIFIER", ":", "$name:IDENTIFIER", "("]
+
+[[patterns]]
+type = "type"
+sequence = ["-type", "$name:IDENTIFIER"]
+
+[[patterns]]
+type = "record"
+sequence = ["-record", "(", "$name:IDENTIFIER"]
+
+[blocks]
+open = "begin"
+close = "end"
