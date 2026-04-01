@@ -18,6 +18,7 @@ pub const Token = struct {
     start: usize,
     end: usize,
     line: usize,
+    col: usize,
 };
 
 // --- Character classification helpers ---
@@ -80,22 +81,24 @@ pub fn tokenize(
     var i: usize = 0;
     var at_line_start = true;
     var current_line: usize = 1;
+    var line_start: usize = 0;
 
     while (i < source.len) {
         const c = source[i];
 
         // Newline
         if (c == '\n') {
-            try tokens.append(allocator, .{ .kind = .newline, .start = i, .end = i + 1, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .newline, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
             i += 1;
             at_line_start = true;
             current_line += 1;
+            line_start = i;
 
             // Check for indent after newline
             const indent_start = i;
             while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
             if (i > indent_start) {
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line });
+                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
             }
             continue;
         }
@@ -105,7 +108,7 @@ pub fn tokenize(
             if (at_line_start) {
                 const indent_start = i;
                 while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line });
+                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
                 at_line_start = false;
             } else {
                 i += 1;
@@ -119,7 +122,7 @@ pub fn tokenize(
         if (c == '#' or (c == '/' and i + 1 < source.len and source[i + 1] == '/')) {
             const start = i;
             while (i < source.len and source[i] != '\n') : (i += 1) {}
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line, .col = start - line_start });
             continue;
         }
 
@@ -137,7 +140,7 @@ pub fn tokenize(
                 // Unclosed block comment — extend to end
                 i = source.len;
             }
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line, .col = start - line_start });
             continue;
         }
 
@@ -158,7 +161,7 @@ pub fn tokenize(
                 i += 1;
             }
             // If we exited without finding closing quote, i == source.len (unclosed string)
-            try tokens.append(allocator, .{ .kind = .string, .start = start, .end = i, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .string, .start = start, .end = i, .line = current_line, .col = start - line_start });
             continue;
         }
 
@@ -170,7 +173,7 @@ pub fn tokenize(
                 i += 1;
                 while (i < source.len and isDigit(source[i])) : (i += 1) {}
             }
-            try tokens.append(allocator, .{ .kind = .number, .start = start, .end = i, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .number, .start = start, .end = i, .line = current_line, .col = start - line_start });
             continue;
         }
 
@@ -183,27 +186,27 @@ pub fn tokenize(
                 (if (isKeyword(text, kt)) TokenKind.keyword else TokenKind.identifier)
             else
                 .identifier;
-            try tokens.append(allocator, .{ .kind = kind, .start = start, .end = i, .line = current_line });
+            try tokens.append(allocator, .{ .kind = kind, .start = start, .end = i, .line = current_line, .col = start - line_start });
             continue;
         }
 
         // Operators
         if (isOperator(c)) {
-            try tokens.append(allocator, .{ .kind = .operator, .start = i, .end = i + 1, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .operator, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
             i += 1;
             continue;
         }
 
         // Delimiters
         if (isDelimiter(c)) {
-            try tokens.append(allocator, .{ .kind = .delimiter, .start = i, .end = i + 1, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .delimiter, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
             i += 1;
             continue;
         }
 
         // Symbols
         if (isSymbol(c)) {
-            try tokens.append(allocator, .{ .kind = .symbol, .start = i, .end = i + 1, .line = current_line });
+            try tokens.append(allocator, .{ .kind = .symbol, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
             i += 1;
             continue;
         }
@@ -382,14 +385,100 @@ test "tokenize mixed expression" {
     });
 }
 
+// --- Column Tracking Unit Tests ---
+
+test "column tracking: first line tokens have col equal to start offset" {
+    const source = "hello world";
+    const tokens = try tokenize(source, null, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    // "hello" starts at byte 0
+    try testing.expectEqual(@as(usize, 0), tokens[0].col);
+    // "world" starts at byte 6
+    try testing.expectEqual(@as(usize, 6), tokens[1].col);
+}
+
+test "column tracking: tokens after newline have col relative to newline" {
+    const source = "a\n  bc";
+    const tokens = try tokenize(source, null, testing.allocator);
+    defer testing.allocator.free(tokens);
+    // tokens: identifier("a"), newline, indent("  "), identifier("bc")
+    try testing.expectEqual(@as(usize, 4), tokens.len);
+    try testing.expectEqual(@as(usize, 0), tokens[0].col); // "a" at byte 0, line_start=0
+    try testing.expectEqual(@as(usize, 1), tokens[1].col); // newline at byte 1, line_start=0
+    try testing.expectEqual(@as(usize, 0), tokens[2].col); // indent at byte 2, line_start=2
+    try testing.expectEqual(@as(usize, 2), tokens[3].col); // "bc" at byte 4, line_start=2
+}
+
+test "column tracking: tab counts as 1 column (byte-level)" {
+    const source = "\tx";
+    const tokens = try tokenize(source, null, testing.allocator);
+    defer testing.allocator.free(tokens);
+    // tokens: indent("\t"), identifier("x")
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    try testing.expectEqual(@as(usize, 0), tokens[0].col); // indent at byte 0
+    try testing.expectEqual(@as(usize, 1), tokens[1].col); // "x" at byte 1
+}
+
+test "column tracking: multiple lines with varying indentation" {
+    const source = "fn add\n    x\n  y";
+    const tokens = try tokenize(source, null, testing.allocator);
+    defer testing.allocator.free(tokens);
+    // Line 1: "fn"(col=0) "add"(col=3)
+    // newline(col=6)
+    // Line 2: indent "    "(col=0) "x"(col=4)
+    // newline(col=5)
+    // Line 3: indent "  "(col=0) "y"(col=2)
+    try testing.expectEqual(@as(usize, 0), tokens[0].col); // "fn"
+    try testing.expectEqual(@as(usize, 3), tokens[1].col); // "add"
+    // tokens[2] = newline
+    try testing.expectEqual(@as(usize, 0), tokens[3].col); // indent "    "
+    try testing.expectEqual(@as(usize, 4), tokens[4].col); // "x"
+    // tokens[5] = newline
+    try testing.expectEqual(@as(usize, 0), tokens[6].col); // indent "  "
+    try testing.expectEqual(@as(usize, 2), tokens[7].col); // "y"
+}
+
 // --- Property Tests ---
 
 const minish = @import("minish");
 const gen = minish.gen;
 
+// Feature: phase3-multi-language-patterns, Property 1: Column tracking correctness
+test "property: column tracking correctness" {
+    // For any source byte string, every token has col == token.start - (position after most recent newline before token.start)
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 256, .charset = .ascii });
+
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(source: []const u8) !void {
+            const tokens = try tokenize(source, null, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            for (tokens) |tok| {
+                // Find the position after the most recent newline before token.start
+                var line_start: usize = 0;
+                for (source[0..tok.start]) |ch| {
+                    if (ch == '\n') {
+                        line_start = 0; // will be set properly below
+                    }
+                }
+                // Recompute: scan for last newline before tok.start
+                line_start = 0;
+                var j: usize = 0;
+                while (j < tok.start) : (j += 1) {
+                    if (source[j] == '\n') {
+                        line_start = j + 1;
+                    }
+                }
+                const expected_col = tok.start - line_start;
+                try testing.expectEqual(expected_col, tok.col);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
 // Feature: phase1-tokenizer-cli, Property 5: Token bounds invariant
-test "property: token bounds invariant" {
-    // For any source bytes, every token satisfies start <= end <= source.len
+test "property: token bounds invariant" { // For any source bytes, every token satisfies start <= end <= source.len
     const source_gen = gen.string(.{ .min_len = 0, .max_len = 256, .charset = .ascii });
 
     try minish.check(testing.allocator, source_gen, struct {

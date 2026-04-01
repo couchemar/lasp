@@ -273,7 +273,7 @@ test "step: matching token returns next state" {
 
     const automaton = try compile(patterns, arena.allocator());
     const source = "fn";
-    const token = Token{ .kind = .keyword, .start = 0, .end = 2, .line = 1 };
+    const token = Token{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 };
 
     const result = automaton.step(0, token, source);
     try testing.expect(result != null);
@@ -292,7 +292,7 @@ test "step: non-matching token returns null" {
 
     const automaton = try compile(patterns, arena.allocator());
     const source = "let";
-    const token = Token{ .kind = .keyword, .start = 0, .end = 3, .line = 1 };
+    const token = Token{ .kind = .keyword, .start = 0, .end = 3, .line = 1, .col = 0 };
 
     const result = automaton.step(0, token, source);
     try testing.expect(result == null);
@@ -315,12 +315,12 @@ test "step: capture returns value" {
     const source = "fn add";
 
     // Step 1: match "fn"
-    const r1 = automaton.step(0, .{ .kind = .keyword, .start = 0, .end = 2, .line = 1 }, source);
+    const r1 = automaton.step(0, .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 }, source);
     try testing.expect(r1 != null);
     try testing.expect(r1.?.capture == null);
 
     // Step 2: match identifier "add" with capture
-    const r2 = automaton.step(r1.?.next, .{ .kind = .identifier, .start = 3, .end = 6, .line = 1 }, source);
+    const r2 = automaton.step(r1.?.next, .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 }, source);
     try testing.expect(r2 != null);
     try testing.expect(r2.?.capture != null);
     try testing.expectEqualStrings("name", r2.?.capture.?.field_name);
