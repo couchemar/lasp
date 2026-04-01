@@ -289,3 +289,72 @@ test "integration: malformed grammar file exits non-zero" {
     }
     try std.testing.expect(result.stderr.len > 0);
 }
+
+// --- Phase 3 Integration Tests ---
+
+test "integration: structural events include col field" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    for (json_events.array.items) |event| {
+        // Every structural event must have a "col" field
+        try std.testing.expect(event.object.get("col") != null);
+    }
+}
+
+test "integration: raw token events include col field" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    for (json_events.array.items) |event| {
+        try std.testing.expect(event.object.get("col") != null);
+    }
+}
+
+test "integration: Erlang grammar with position filtering" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.erl", "--grammar", "examples/grammars/erlang.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expect(json_events.array.items.len > 0);
+
+    // All events should have col field
+    for (json_events.array.items) |event| {
+        try std.testing.expect(event.object.get("col") != null);
+    }
+}
+
+test "integration: invalid position value exits non-zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/invalid_position.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+    try std.testing.expect(result.stderr.len > 0);
+}

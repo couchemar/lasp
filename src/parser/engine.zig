@@ -97,6 +97,7 @@ pub fn parse(
     var result: std.ArrayList(StructuralEvent) = .empty;
     var pending_captures: std.ArrayList(CaptureEntry) = .empty;
     var matched_kinds: std.ArrayList(TokenKind) = .empty;
+    var matched_texts: std.ArrayList([]const u8) = .empty;
 
     var lookback = LookbackBuffer{};
     var block_stack = BlockStack{};
@@ -132,6 +133,7 @@ pub fn parse(
             }
             state = step_result.next;
             try matched_kinds.append(allocator, token.kind);
+            try matched_texts.append(allocator, text);
 
             if (step_result.capture) |cap| {
                 try pending_captures.append(allocator, .{
@@ -154,6 +156,7 @@ pub fn parse(
                                     state = 0;
                                     pending_captures.clearRetainingCapacity();
                                     matched_kinds.clearRetainingCapacity();
+                                    matched_texts.clearRetainingCapacity();
                                     continue;
                                 }
                             },
@@ -175,6 +178,7 @@ pub fn parse(
                             state = 0;
                             pending_captures.clearRetainingCapacity();
                             matched_kinds.clearRetainingCapacity();
+                            matched_texts.clearRetainingCapacity();
                             continue;
                         }
                     }
@@ -194,6 +198,20 @@ pub fn parse(
                         }
                     }
 
+                    // Rebuild captures from pattern definitions using matched token texts
+                    // This avoids the shared-prefix capture field name bug in the automaton
+                    pending_captures.clearRetainingCapacity();
+                    if (pattern) |p| {
+                        for (p.captures) |cap| {
+                            if (cap.position < matched_texts.items.len) {
+                                try pending_captures.append(allocator, .{
+                                    .field_name = cap.field_name,
+                                    .value = matched_texts.items[cap.position],
+                                });
+                            }
+                        }
+                    }
+
                     try result.append(allocator, .{
                         .type_name = event_info.type_name,
                         .captures = try pending_captures.toOwnedSlice(allocator),
@@ -210,11 +228,13 @@ pub fn parse(
 
                 state = 0;
                 matched_kinds.clearRetainingCapacity();
+                matched_texts.clearRetainingCapacity();
             }
         } else {
             state = 0;
             pending_captures.clearRetainingCapacity();
             matched_kinds.clearRetainingCapacity();
+            matched_texts.clearRetainingCapacity();
         }
     }
 
