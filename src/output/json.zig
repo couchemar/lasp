@@ -67,6 +67,22 @@ pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !v
         try writer.writeAll(", \"confidence\": ");
         try writer.print("{d:.2}", .{event.confidence});
 
+        // Include col field
+        try writer.writeAll(", \"col\": ");
+        try writer.print("{d}", .{event.col});
+
+        // Include block_start when present
+        if (event.block_start) |bs| {
+            try writer.writeAll(", \"block_start\": ");
+            try writer.print("{d}", .{bs});
+        }
+
+        // Include block_end when present
+        if (event.block_end) |be| {
+            try writer.writeAll(", \"block_end\": ");
+            try writer.print("{d}", .{be});
+        }
+
         // Include capture fields
         for (event.captures) |cap| {
             try writer.writeAll(", \"");
@@ -316,6 +332,93 @@ test "serializeEvents: output is valid JSON" {
     try testing.expectEqual(@as(usize, 2), parsed.value.object.get("events").?.array.items.len);
 }
 
+test "serializeTokens: col field in token JSON" {
+    const tokens = [_]Token{
+        .{ .kind = .identifier, .start = 5, .end = 8, .line = 2, .col = 3 },
+    };
+    const result = try serializeToString(&tokens);
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 3), event.get("col").?.integer);
+}
+
+test "serializeEvents: col field in structural event JSON" {
+    const result = try serializeEventsToString(&.{.{
+        .type_name = "function",
+        .captures = &.{},
+        .start = 0,
+        .end = 10,
+        .line = 1,
+        .col = 4,
+        .confidence = 0.90,
+    }});
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 4), event.get("col").?.integer);
+}
+
+test "serializeEvents: block_start present when non-null" {
+    const result = try serializeEventsToString(&.{.{
+        .type_name = "call",
+        .captures = &.{},
+        .start = 5,
+        .end = 10,
+        .line = 1,
+        .col = 2,
+        .confidence = 0.85,
+        .block_start = 0,
+    }});
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 0), event.get("block_start").?.integer);
+}
+
+test "serializeEvents: block_start omitted when null" {
+    const result = try serializeEventsToString(&.{.{
+        .type_name = "call",
+        .captures = &.{},
+        .start = 5,
+        .end = 10,
+        .line = 1,
+        .col = 0,
+        .confidence = 0.85,
+    }});
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expect(event.get("block_start") == null);
+}
+
+test "serializeEvents: block_end present when non-null" {
+    const result = try serializeEventsToString(&.{.{
+        .type_name = "call",
+        .captures = &.{},
+        .start = 5,
+        .end = 10,
+        .line = 1,
+        .col = 0,
+        .confidence = 0.85,
+        .block_end = 42,
+    }});
+    defer testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 42), event.get("block_end").?.integer);
+}
+
 // Feature: phase2-grammar-automaton, Property 11: Event JSON serialization correctness
 test "property: event JSON serialization correctness" {
     const event_gen = comptime gen.tuple3(
@@ -369,6 +472,64 @@ test "property: event JSON serialization correctness" {
             try testing.expectEqualStrings(type_name, event.get("type").?.string);
             try testing.expectEqual(@as(i64, @intCast(start)), event.get("start").?.integer);
             try testing.expectEqual(@as(i64, @intCast(end)), event.get("end").?.integer);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase3-multi-language-patterns, Property 7: JSON serialization of extended fields
+test "property: JSON serialization of extended fields" {
+    const field_gen = comptime gen.tuple3(
+        u16,
+        u16,
+        bool,
+        gen.intRange(u16, 0, 1000),
+        gen.intRange(u16, 0, 1000),
+        gen.boolean(),
+    );
+
+    try minish.check(testing.allocator, field_gen, struct {
+        fn prop(vals: struct { u16, u16, bool }) !void {
+            const col: usize = @intCast(vals[0]);
+            const block_offset: usize = @intCast(vals[1]);
+            const has_block = vals[2];
+
+            const events_list = &[_]StructuralEvent{.{
+                .type_name = "test",
+                .captures = &.{},
+                .start = 0,
+                .end = 10,
+                .line = 1,
+                .col = col,
+                .confidence = 0.90,
+                .block_start = if (has_block) block_offset else null,
+                .block_end = null,
+            }};
+
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(testing.allocator);
+            try serializeEvents(events_list, buf.writer(testing.allocator));
+
+            // (a) Valid JSON
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf.items, .{});
+            defer parsed.deinit();
+
+            const json_events = parsed.value.object.get("events").?;
+            try testing.expectEqual(@as(usize, 1), json_events.array.items.len);
+
+            const event = json_events.array.items[0].object;
+
+            // (b) col field present with correct value
+            try testing.expectEqual(@as(i64, @intCast(col)), event.get("col").?.integer);
+
+            // (c) block_start conditional
+            if (has_block) {
+                try testing.expectEqual(@as(i64, @intCast(block_offset)), event.get("block_start").?.integer);
+            } else {
+                try testing.expect(event.get("block_start") == null);
+            }
+
+            // (d) block_end omitted when null
+            try testing.expect(event.get("block_end") == null);
         }
     }.prop, .{ .num_runs = 100 });
 }
