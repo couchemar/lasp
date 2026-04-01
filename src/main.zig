@@ -70,6 +70,7 @@ pub fn main() !void {
                 error.MissingPatterns => "grammar file missing required [[patterns]] section",
                 error.EmptyPatternSequence => "pattern has empty sequence",
                 error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
+                error.InvalidPositionValue => "invalid position value, expected 'start'",
                 error.OutOfMemory => "out of memory",
                 else => "unknown grammar error",
             };
@@ -77,7 +78,7 @@ pub fn main() !void {
         };
         const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
         const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
-        const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, allocator);
+        const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, allocator);
         try json.serializeEvents(structural_events, stdout);
     } else {
         // No grammar: raw token output
