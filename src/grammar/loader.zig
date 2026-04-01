@@ -16,10 +16,16 @@ pub const KeywordCategory = struct {
     keywords: []const []const u8,
 };
 
+pub const PositionConstraint = enum {
+    start, // column 0
+};
+
 pub const Pattern = struct {
     type_name: []const u8,
     sequence: []const TokenMatcher,
     captures: []const Capture,
+    position: ?PositionConstraint = null,
+    exclude: []const []const u8 = &.{},
 };
 
 pub const TokenMatcher = union(enum) {
@@ -46,6 +52,7 @@ pub const GrammarError = error{
     MissingPatterns,
     EmptyPatternSequence,
     InvalidCaptureFormat,
+    InvalidPositionValue,
     OutOfMemory,
 };
 
@@ -149,6 +156,27 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
             .type_name = type_name,
             .sequence = try matchers.toOwnedSlice(allocator),
             .captures = try captures.toOwnedSlice(allocator),
+            .position = blk: {
+                if (pattern_table.get("position")) |pos_val| {
+                    if (std.mem.eql(u8, pos_val.string, "start")) {
+                        break :blk .start;
+                    } else {
+                        return error.InvalidPositionValue;
+                    }
+                }
+                break :blk null;
+            },
+            .exclude = blk: {
+                if (pattern_table.get("exclude")) |exc_val| {
+                    if (exc_val.array.items.len == 0) break :blk &.{};
+                    var exc_list: std.ArrayList([]const u8) = .empty;
+                    for (exc_val.array.items) |item| {
+                        try exc_list.append(allocator, try allocator.dupe(u8, item.string));
+                    }
+                    break :blk try exc_list.toOwnedSlice(allocator);
+                }
+                break :blk &.{};
+            },
         });
     }
 
@@ -219,7 +247,28 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
             }
             try w.writeAll("\"");
         }
-        try w.writeAll("]\n\n");
+        try w.writeAll("]\n");
+
+        // position field
+        if (pattern.position) |pos| {
+            switch (pos) {
+                .start => try w.writeAll("position = \"start\"\n"),
+            }
+        }
+
+        // exclude field
+        if (pattern.exclude.len > 0) {
+            try w.writeAll("exclude = [");
+            for (pattern.exclude, 0..) |exc, j| {
+                if (j > 0) try w.writeAll(", ");
+                try w.writeAll("\"");
+                try w.writeAll(exc);
+                try w.writeAll("\"");
+            }
+            try w.writeAll("]\n");
+        }
+
+        try w.writeAll("\n");
     }
 
     // [blocks]
@@ -389,6 +438,84 @@ test "parseGrammar: keyword flattening" {
     try testing.expect(found_struct);
 }
 
+test "parseGrammar: position = start" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\position = "start"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), grammar.patterns.len);
+    try testing.expect(grammar.patterns[0].position != null);
+    try testing.expectEqual(PositionConstraint.start, grammar.patterns[0].position.?);
+}
+
+test "parseGrammar: exclude list" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\exclude = ["-spec", "-type"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), grammar.patterns[0].exclude.len);
+    try testing.expectEqualStrings("-spec", grammar.patterns[0].exclude[0]);
+    try testing.expectEqualStrings("-type", grammar.patterns[0].exclude[1]);
+}
+
+test "parseGrammar: invalid position value returns error" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\position = "invalid"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.InvalidPositionValue, result);
+}
+
+test "parseGrammar: empty exclude array means no exclusions" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\exclude = []
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 0), grammar.patterns[0].exclude.len);
+}
+
+test "parseGrammar: Phase 2 grammar backward compatibility (no position/exclude)" {
+    const source =
+        \\[[patterns]]
+        \\type = "call"
+        \\sequence = ["identifier", "("]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expect(grammar.patterns[0].position == null);
+    try testing.expectEqual(@as(usize, 0), grammar.patterns[0].exclude.len);
+}
+
 // --- Property Tests ---
 
 const minish = @import("minish");
@@ -442,6 +569,67 @@ test "property: grammar TOML round-trip" {
             try testing.expectEqual(original.patterns[0].captures.len, parsed.patterns[0].captures.len);
             try testing.expectEqualStrings("{", parsed.blocks.open.?);
             try testing.expectEqualStrings("}", parsed.blocks.close.?);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: phase3-multi-language-patterns, Property 2: Grammar TOML round-trip with position and exclude
+test "property: grammar TOML round-trip with position and exclude" {
+    // Generate a random boolean for position (true = .start, false = null)
+    // and a random exclude string
+    const pair_gen = comptime gen.tuple2(
+        bool,
+        []const u8,
+        gen.boolean(),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, pair_gen, struct {
+        fn prop(vals: struct { bool, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const has_position = vals[0];
+            const exc_token = vals[1];
+
+            const original = Grammar{
+                .language_name = "test",
+                .keyword_categories = &.{},
+                .keyword_table = &.{},
+                .patterns = &.{
+                    .{
+                        .type_name = "function",
+                        .sequence = &.{
+                            .{ .keyword_literal = "fn" },
+                            .{ .capture = .{ .field_name = "name", .position = 1 } },
+                            .{ .symbol_literal = "(" },
+                        },
+                        .captures = &.{
+                            .{ .field_name = "name", .position = 1 },
+                        },
+                        .position = if (has_position) .start else null,
+                        .exclude = &.{exc_token},
+                    },
+                },
+                .blocks = .{},
+            };
+
+            // Round-trip: format → parse
+            const toml_str = try formatGrammar(original, alloc);
+            const parsed = try parseGrammar(toml_str, alloc);
+
+            // Verify position round-trips
+            if (has_position) {
+                try testing.expect(parsed.patterns[0].position != null);
+                try testing.expectEqual(PositionConstraint.start, parsed.patterns[0].position.?);
+            } else {
+                try testing.expect(parsed.patterns[0].position == null);
+            }
+
+            // Verify exclude round-trips
+            try testing.expectEqual(@as(usize, 1), parsed.patterns[0].exclude.len);
+            try testing.expectEqualStrings(exc_token, parsed.patterns[0].exclude[0]);
         }
     }.prop, .{ .num_runs = 100 });
 }
