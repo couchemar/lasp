@@ -251,6 +251,7 @@ test "serializeEvents: event with name capture" {
         .start = 0,
         .end = 10,
         .line = 1,
+        .col = 0,
         .confidence = 0.95,
     }});
     defer testing.allocator.free(result);
@@ -271,6 +272,7 @@ test "serializeEvents: event with callee capture" {
         .start = 20,
         .end = 32,
         .line = 2,
+        .col = 0,
         .confidence = 0.88,
     }});
     defer testing.allocator.free(result);
@@ -289,6 +291,7 @@ test "serializeEvents: event without captures" {
         .start = 5,
         .end = 15,
         .line = 1,
+        .col = 0,
         .confidence = 0.70,
     }});
     defer testing.allocator.free(result);
@@ -303,8 +306,8 @@ test "serializeEvents: event without captures" {
 
 test "serializeEvents: output is valid JSON" {
     const result = try serializeEventsToString(&.{
-        .{ .type_name = "function", .captures = &.{.{ .field_name = "name", .value = "foo" }}, .start = 0, .end = 10, .line = 1, .confidence = 0.95 },
-        .{ .type_name = "call", .captures = &.{.{ .field_name = "callee", .value = "bar" }}, .start = 15, .end = 25, .line = 2, .confidence = 0.80 },
+        .{ .type_name = "function", .captures = &.{.{ .field_name = "name", .value = "foo" }}, .start = 0, .end = 10, .line = 1, .col = 0, .confidence = 0.95 },
+        .{ .type_name = "call", .captures = &.{.{ .field_name = "callee", .value = "bar" }}, .start = 15, .end = 25, .line = 2, .col = 0, .confidence = 0.80 },
     });
     defer testing.allocator.free(result);
 
@@ -336,6 +339,7 @@ test "property: event JSON serialization correctness" {
                 .start = start,
                 .end = end,
                 .line = 1,
+                .col = 0,
                 .confidence = 0.85,
             }};
 

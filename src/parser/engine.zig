@@ -87,6 +87,7 @@ pub fn parse(
                         .start = pattern_start,
                         .end = token.end,
                         .line = pattern_line,
+                        .col = 0,
                         .confidence = confidence,
                     });
                 } else {

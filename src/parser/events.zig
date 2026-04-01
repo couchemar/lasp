@@ -11,7 +11,10 @@ pub const StructuralEvent = struct {
     start: usize,
     end: usize,
     line: usize,
+    col: usize,
     confidence: f32,
+    block_start: ?usize = null,
+    block_end: ?usize = null,
 };
 
 pub const CaptureEntry = struct {
