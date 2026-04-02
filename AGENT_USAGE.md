@@ -2,16 +2,11 @@
 
 ## What LASP Does
 
-LASP is a language-agnostic structural parser. Given source code and an optional TOML grammar file, it detects structural constructs (functions, calls, structs, imports) and outputs them as JSON events. No full AST — just the structural skeleton.
+LASP is a language-agnostic structural parser. Given source code and a TOML grammar file, it detects structural constructs (functions, calls, structs, imports) and outputs them as JSON. No full AST — just the structural skeleton.
 
-## Binaries
+## Binary
 
-| Binary | Path | When to use |
-|--------|------|-------------|
-| Stable | `.bin/lasp` | Known-good build, safe for analysis |
-| Development | `zig-out/bin/lasp` | Latest build after `zig build` |
-
-Build the development binary: `zig build`
+The LASP binary is located at `.bin/lasp`. It is a standalone CLI tool with no runtime dependencies.
 
 ## Commands
 
@@ -30,6 +25,8 @@ Returns every token with type, byte offsets, line number, and column:
 ] }
 ```
 
+Use this to explore a file's token structure before writing a grammar.
+
 ### Structural parsing (with grammar)
 
 ```bash
@@ -42,19 +39,13 @@ Returns structural events with captures, confidence scores, and position info:
 
 ```json
 { "events": [
-  { "type": "function", "start": 0, "end": 15, "line": 1, "col": 0, "confidence": 1.00, "name": "add" }
+  { "type": "function", "start": 0, "end": 15, "line": 1, "confidence": 1.00, "col": 0, "name": "add" }
 ] }
 ```
 
-## Available Grammars
-
-| File | Language | Notes |
-|------|----------|-------|
-| `tests/fixtures/grammars/zig.toml` | Zig | Functions, structs, calls |
-
 ## Writing a Grammar
 
-Grammars are TOML files with these sections:
+Grammars are TOML files. You can write one for any language without recompiling LASP.
 
 ```toml
 [language]
@@ -82,9 +73,9 @@ open = "{"
 close = "}"
 ```
 
-### Phase 3 features (position and exclude)
+### Position constraints
 
-Constrain patterns to match only at column 0 (line start):
+Restrict a pattern to match only at column 0 (line start):
 
 ```toml
 [[patterns]]
@@ -93,7 +84,9 @@ sequence = ["$name:IDENTIFIER", "("]
 position = "start"
 ```
 
-Exclude matches preceded by specific tokens:
+### Exclusion patterns
+
+Discard matches preceded by specific tokens:
 
 ```toml
 [[patterns]]
@@ -110,33 +103,15 @@ exclude = ["-spec", "-type"]
 | `"fn"` | Exact keyword text |
 | `"("` | Exact symbol/delimiter |
 | `"identifier"` | Any identifier token |
-| `"$name:IDENTIFIER"` | Identifier, captured as `name` field |
+| `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
 
-## Practical Workflows
+## Workflow: Analyze an Unfamiliar Codebase
 
-### Explore an unfamiliar file
-
-```bash
-# See all tokens
-.bin/lasp parse src/parser/engine.zig
-
-# See structural events with the Zig grammar
-.bin/lasp parse src/parser/engine.zig -g tests/fixtures/grammars/zig.toml
-```
-
-### Write a grammar for a new language
-
-1. Run `lasp parse <file>` without a grammar to see the raw token stream
-2. Identify the keyword/symbol patterns that mark structural constructs
+1. Run `.bin/lasp parse <file>` without a grammar to see raw tokens
+2. Identify keyword/symbol patterns that mark structural constructs
 3. Write a `.toml` grammar with those patterns
-4. Run `lasp parse <file> -g <grammar.toml>` and check the output
+4. Run `.bin/lasp parse <file> -g <grammar.toml>` and check the output
 5. Iterate: adjust patterns, add captures, tune position/exclude constraints
-
-### Compare stable vs development output
-
-```bash
-diff <(.bin/lasp parse file.zig -g grammar.toml) <(zig-out/bin/lasp parse file.zig -g grammar.toml)
-```
 
 ## Output Fields
 
@@ -160,7 +135,7 @@ diff <(.bin/lasp parse file.zig -g grammar.toml) <(zig-out/bin/lasp parse file.z
 | `line` | int | 1-based line number |
 | `col` | int | 0-based column of first matched token |
 | `confidence` | float | Match confidence 0.0–1.0 |
-| `block_start` | int? | Byte offset of enclosing block open delimiter (if inside a block) |
+| `block_start` | int? | Byte offset of enclosing block open delimiter (only when inside a block) |
 | `name`, `callee`, etc. | string? | Captured fields from `$field:IDENTIFIER` patterns |
 
 ## Error Cases
