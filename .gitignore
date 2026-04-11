@@ -5,4 +5,4 @@ zig-cache/
 .cache/
 .bin/
 result
-evaluation_records
+feedbacks
