@@ -183,8 +183,12 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
     // --- [blocks] (optional) ---
     var blocks = BlockConfig{};
     if (root.get("blocks")) |blocks_table| {
-        if (blocks_table.get("open")) |v| blocks.open = try allocator.dupe(u8, v.string);
-        if (blocks_table.get("close")) |v| blocks.close = try allocator.dupe(u8, v.string);
+        if (blocks_table.get("open")) |v| {
+            if (v.string.len > 0) blocks.open = try allocator.dupe(u8, v.string);
+        }
+        if (blocks_table.get("close")) |v| {
+            if (v.string.len > 0) blocks.close = try allocator.dupe(u8, v.string);
+        }
         if (blocks_table.get("indentation")) |v| blocks.indentation = v.bool;
     }
 
