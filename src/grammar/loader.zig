@@ -33,6 +33,7 @@ pub const TokenMatcher = union(enum) {
     symbol_literal: []const u8,
     identifier: void,
     capture: Capture,
+    identifier_literal: []const u8,
 };
 
 pub const Capture = struct {
@@ -82,6 +83,11 @@ fn parseSequenceElement(s: []const u8, position: usize, allocator: std.mem.Alloc
     // Identifier wildcard
     if (std.mem.eql(u8, s, "identifier")) {
         return .{ .matcher = .{ .identifier = {} }, .capture = null };
+    }
+    // EXACT IDENTIFIER matching (Config:IDENTIFIER)
+    if (std.mem.endsWith(u8, s, ":IDENTIFIER") and s.len > 11 and s[0] != '$') {
+        const exact_text = try allocator.dupe(u8, s[0 .. s.len - 11]);
+        return .{ .matcher = .{ .identifier_literal = exact_text }, .capture = null };
     }
     // Symbol/delimiter literal (single char)
     if (isSymbolOrDelimiter(s)) {
@@ -248,6 +254,10 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                     try w.writeAll(cap.field_name);
                     try w.writeAll(":IDENTIFIER");
                 },
+                .identifier_literal => |id| {
+                    try w.writeAll(id);
+                    try w.writeAll(":IDENTIFIER");
+                },
             }
             try w.writeAll("\"");
         }
@@ -375,6 +385,24 @@ test "parseGrammar: capture parsing" {
     try testing.expectEqualStrings("name", seq[1].capture.field_name);
     try testing.expectEqual(@as(usize, 1), seq[1].capture.position);
     try testing.expect(seq[2] == .symbol_literal);
+}
+
+test "parseGrammar: identifier_literal parsing" {
+    const source =
+        \\[[patterns]]
+        \\type = "call"
+        \\sequence = ["Config:IDENTIFIER", "identifier"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    const seq = grammar.patterns[0].sequence;
+    try testing.expectEqual(@as(usize, 2), seq.len);
+    try testing.expect(seq[0] == .identifier_literal);
+    try testing.expectEqualStrings("Config", seq[0].identifier_literal);
+    try testing.expect(seq[1] == .identifier);
 }
 
 test "parseGrammar: missing patterns returns error" {

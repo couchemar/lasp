@@ -58,6 +58,7 @@ fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) b
         .symbol_literal => |sym| (kind == .delimiter or kind == .symbol) and std.mem.eql(u8, text, sym),
         .identifier => kind == .identifier,
         .capture => kind == .identifier,
+        .identifier_literal => |id| kind == .identifier and std.mem.eql(u8, text, id),
     };
 }
 
@@ -142,17 +143,19 @@ fn findTransition(transitions: []const MutableTransition, matcher: TokenMatcher)
 }
 
 fn matchersEqual(a: TokenMatcher, b: TokenMatcher) bool {
-    const tag_a: u2 = switch (a) {
+    const tag_a: u3 = switch (a) {
         .keyword_literal => 0,
         .symbol_literal => 1,
         .identifier => 2,
         .capture => 3,
+        .identifier_literal => 4,
     };
-    const tag_b: u2 = switch (b) {
+    const tag_b: u3 = switch (b) {
         .keyword_literal => 0,
         .symbol_literal => 1,
         .identifier => 2,
         .capture => 3,
+        .identifier_literal => 4,
     };
     if (tag_a != tag_b) return false;
 
@@ -161,6 +164,7 @@ fn matchersEqual(a: TokenMatcher, b: TokenMatcher) bool {
         .symbol_literal => |sa| std.mem.eql(u8, sa, b.symbol_literal),
         .identifier => true,
         .capture => true, // captures match any identifier, same as identifier
+        .identifier_literal => |ia| std.mem.eql(u8, ia, b.identifier_literal),
     };
 }
 
@@ -278,6 +282,30 @@ test "step: matching token returns next state" {
     const result = automaton.step(0, token, source);
     try testing.expect(result != null);
     try testing.expectEqual(@as(usize, 1), result.?.next);
+}
+
+test "step: matching identifier_literal returns next state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "test",
+        .sequence = &.{.{ .identifier_literal = "Config" }},
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, arena.allocator());
+    const source = "Config";
+    const token = Token{ .kind = .identifier, .start = 0, .end = 6, .line = 1, .col = 0 };
+
+    const result = automaton.step(0, token, source);
+    try testing.expect(result != null);
+    try testing.expectEqual(@as(usize, 1), result.?.next);
+
+    const fail_source = "Other";
+    const fail_token = Token{ .kind = .identifier, .start = 0, .end = 5, .line = 1, .col = 0 };
+    const fail_result = automaton.step(0, fail_token, fail_source);
+    try testing.expect(fail_result == null);
 }
 
 test "step: non-matching token returns null" {

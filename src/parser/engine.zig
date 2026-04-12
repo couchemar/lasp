@@ -77,7 +77,7 @@ fn patternMaxScore(sequence: []const TokenMatcher) f32 {
         total += switch (m) {
             .keyword_literal => events_mod.evidence_weights.keyword,
             .symbol_literal => events_mod.evidence_weights.symbol,
-            .identifier, .capture => events_mod.evidence_weights.identifier,
+            .identifier, .capture, .identifier_literal => events_mod.evidence_weights.identifier,
         };
     }
     return total;
@@ -288,6 +288,35 @@ test "parse: single pattern match emits event" {
     try testing.expectEqual(@as(usize, 1), result[0].captures.len);
     try testing.expectEqualStrings("name", result[0].captures[0].field_name);
     try testing.expectEqualStrings("add", result[0].captures[0].value);
+    try testing.expect(result[0].confidence > 0.3);
+}
+
+test "parse: identifier_literal matching pattern emits event" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "test_literal",
+        .sequence = &.{
+            .{ .identifier_literal = "Config" },
+            .{ .symbol_literal = "(" },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "Config(";
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 6, .line = 1, .col = 0 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("test_literal", result[0].type_name);
+    try testing.expectEqual(@as(usize, 0), result[0].start);
+    try testing.expectEqual(@as(usize, 7), result[0].end);
     try testing.expect(result[0].confidence > 0.3);
 }
 
