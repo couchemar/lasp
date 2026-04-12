@@ -894,3 +894,141 @@ test "property: empty block delimiters treated as absent" {
         }
     }.prop, .{ .num_runs = 100 });
 }
+
+// --- Preservation Property Tests (empty-blocks-misleading-error) ---
+// Property 2: Non-Empty Delimiter Behavior Unchanged
+// These tests capture baseline behavior on UNFIXED code for non-buggy inputs.
+// They MUST PASS on both unfixed and fixed code.
+
+// Concrete preservation test: non-empty delimiters preserved
+test "preservation: non-empty delimiters preserved correctly" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[blocks]
+        \\open = "{"
+        \\close = "}"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqualStrings("{", grammar.blocks.open.?);
+    try testing.expectEqualStrings("}", grammar.blocks.close.?);
+}
+
+// Concrete preservation test: multi-char delimiters preserved
+test "preservation: multi-char delimiters preserved correctly" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\
+        \\[blocks]
+        \\open = "begin"
+        \\close = "end"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqualStrings("begin", grammar.blocks.open.?);
+    try testing.expectEqualStrings("end", grammar.blocks.close.?);
+}
+
+// Concrete preservation test: no [blocks] section → null defaults
+test "preservation: no blocks section returns null defaults" {
+    const source =
+        \\[[patterns]]
+        \\type = "call"
+        \\sequence = ["identifier", "("]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expect(grammar.blocks.open == null);
+    try testing.expect(grammar.blocks.close == null);
+    try testing.expect(grammar.blocks.indentation == false);
+}
+
+// Concrete preservation test: missing [[patterns]] still returns error
+test "preservation: missing patterns still returns MissingPatterns" {
+    const source =
+        \\[language]
+        \\name = "test"
+        \\
+        \\[blocks]
+        \\open = "{"
+        \\close = "}"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.MissingPatterns, result);
+}
+
+// Concrete preservation test: indentation-only blocks
+test "preservation: indentation-only blocks with null delimiters" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["def", "$name:IDENTIFIER", "("]
+        \\
+        \\[blocks]
+        \\indentation = true
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expect(grammar.blocks.open == null);
+    try testing.expect(grammar.blocks.close == null);
+    try testing.expect(grammar.blocks.indentation == true);
+}
+
+// Property-based test: non-empty delimiters are always preserved
+test "property: non-empty block delimiters preserved" {
+    // Generate random non-empty delimiter strings (alpha, len 1-8)
+    const pair_gen = comptime gen.tuple2(
+        []const u8,
+        []const u8,
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, pair_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const open_delim = vals[0];
+            const close_delim = vals[1];
+
+            // Build TOML with non-empty delimiters and a valid [[patterns]] section
+            var buf: std.ArrayList(u8) = .empty;
+            const w = buf.writer(alloc);
+
+            try w.writeAll("[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n\n[blocks]\nopen = \"");
+            try w.writeAll(open_delim);
+            try w.writeAll("\"\nclose = \"");
+            try w.writeAll(close_delim);
+            try w.writeAll("\"\n");
+
+            const source = buf.items;
+            const grammar = try parseGrammar(source, alloc);
+
+            // Non-empty delimiters must be preserved exactly
+            try testing.expectEqualStrings(open_delim, grammar.blocks.open.?);
+            try testing.expectEqualStrings(close_delim, grammar.blocks.close.?);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
