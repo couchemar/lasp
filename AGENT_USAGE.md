@@ -104,6 +104,7 @@ exclude = ["-spec", "-type"]
 | `"("` | Exact symbol/delimiter |
 | `"identifier"` | Any identifier token |
 | `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
+| `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
 
 ## Workflow: Analyze an Unfamiliar Codebase
 

@@ -294,15 +294,23 @@ nodes:
 ### Available Token Primitives
 - **Keywords**: `"fn"`, `"class"`, `"import"`.
 - **Identifiers**: `IDENTIFIER`.
+- **Exact Identifiers**: `"Config:IDENTIFIER"` — matches an identifier token with exact text (no capture).
 - **Symbols**: `"{"`, `":"`, `","`.
 
 ### Identifier Captures
 Captures allow patterns to extract values from tokens. Represented by `$name:IDENTIFIER`.
-Pattern: `"fn" $name:IDENTIFIER "("\n
+Pattern: `"fn" $name:IDENTIFIER "("` 
 Outputs `Capture` struct:
 ```zig
 const Capture = struct { name: []const u8, position: usize };
 ```
+
+### Exact Identifier Matching
+To match an identifier with specific text without capturing, use `Name:IDENTIFIER`:
+```toml
+sequence = ["Config:IDENTIFIER", ".", "$method:IDENTIFIER", "("]
+```
+This matches only when the identifier text is exactly `"Config"`. Unlike keyword literals, this matches `.identifier` tokens — useful for names that aren't language keywords.
 
 ### Block Definitions
 Blocks describe structural scopes either by tokens (`{ }`) or explicitly mapped for python/YAML logic:
