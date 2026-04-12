@@ -732,3 +732,165 @@ test "example grammar: zig.toml parses without errors" {
     try testing.expectEqualStrings("{", grammar.blocks.open.?);
     try testing.expectEqualStrings("}", grammar.blocks.close.?);
 }
+
+// --- Bug Condition Exploration Tests (empty-blocks-misleading-error) ---
+// Property 1: Empty Block Delimiters Cause Misleading Error
+// These tests encode the EXPECTED (correct) behavior.
+// They MUST FAIL on unfixed code — failure confirms the bug exists.
+
+// Concrete unit test: both open and close empty
+test "bug exploration: both empty block delimiters treated as absent" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[blocks]
+        \\open = ""
+        \\close = ""
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+
+    // Expected: parsing succeeds (no MissingPatterns error)
+    const grammar = result catch |err| {
+        std.debug.print("COUNTEREXAMPLE: both empty delimiters caused {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    // Expected: empty strings become null, not non-null empty slices
+    if (grammar.blocks.open) |open| {
+        std.debug.print("COUNTEREXAMPLE: blocks.open is non-null with len={d}\n", .{open.len});
+        return error.TestUnexpectedResult;
+    }
+    if (grammar.blocks.close) |close| {
+        std.debug.print("COUNTEREXAMPLE: blocks.close is non-null with len={d}\n", .{close.len});
+        return error.TestUnexpectedResult;
+    }
+}
+
+// Concrete unit test: empty open only
+test "bug exploration: empty open delimiter treated as absent" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[blocks]
+        \\open = ""
+        \\close = "}"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+
+    const grammar = result catch |err| {
+        std.debug.print("COUNTEREXAMPLE: empty open + non-empty close caused {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    // Expected: open = null (was empty string)
+    if (grammar.blocks.open) |open| {
+        std.debug.print("COUNTEREXAMPLE: blocks.open is non-null with len={d}\n", .{open.len});
+        return error.TestUnexpectedResult;
+    }
+
+    // Expected: close = "}" (preserved)
+    try testing.expectEqualStrings("}", grammar.blocks.close.?);
+}
+
+// Concrete unit test: empty close only
+test "bug exploration: empty close delimiter treated as absent" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[blocks]
+        \\open = "{"
+        \\close = ""
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+
+    const grammar = result catch |err| {
+        std.debug.print("COUNTEREXAMPLE: non-empty open + empty close caused {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    // Expected: open = "{" (preserved)
+    try testing.expectEqualStrings("{", grammar.blocks.open.?);
+
+    // Expected: close = null (was empty string)
+    if (grammar.blocks.close) |close| {
+        std.debug.print("COUNTEREXAMPLE: blocks.close is non-null with len={d}\n", .{close.len});
+        return error.TestUnexpectedResult;
+    }
+}
+
+// Property-based test: empty block delimiters should be treated as absent
+test "property: empty block delimiters treated as absent" {
+    // Generate a boolean (true = open empty, false = close empty) and a random pattern type
+    const pair_gen = comptime gen.tuple2(
+        bool,
+        []const u8,
+        gen.boolean(),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, pair_gen, struct {
+        fn prop(vals: struct { bool, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const open_empty = vals[0];
+            const pattern_type = vals[1];
+
+            // Build TOML with empty delimiter(s) and a valid [[patterns]] section
+            var buf: std.ArrayList(u8) = .empty;
+            const w = buf.writer(alloc);
+
+            try w.writeAll("[[patterns]]\ntype = \"");
+            try w.writeAll(pattern_type);
+            try w.writeAll("\"\nsequence = [\"identifier\", \"(\"]\n\n[blocks]\n");
+
+            if (open_empty) {
+                try w.writeAll("open = \"\"\nclose = \"}\"\n");
+            } else {
+                try w.writeAll("open = \"{\"\nclose = \"\"\n");
+            }
+
+            const source = buf.items;
+            const result = parseGrammar(source, alloc);
+
+            // Expected: parsing succeeds (no MissingPatterns)
+            const grammar = result catch |err| {
+                std.debug.print("COUNTEREXAMPLE: pattern_type=\"{s}\" open_empty={} caused {s}\n", .{ pattern_type, open_empty, @errorName(err) });
+                return err;
+            };
+
+            // Expected: empty delimiter becomes null
+            if (open_empty) {
+                if (grammar.blocks.open) |open| {
+                    std.debug.print("COUNTEREXAMPLE: open_empty=true but blocks.open is non-null len={d}\n", .{open.len});
+                    return error.TestUnexpectedResult;
+                }
+                // Non-empty delimiter preserved
+                try testing.expectEqualStrings("}", grammar.blocks.close.?);
+            } else {
+                if (grammar.blocks.close) |close| {
+                    std.debug.print("COUNTEREXAMPLE: close_empty=true but blocks.close is non-null len={d}\n", .{close.len});
+                    return error.TestUnexpectedResult;
+                }
+                // Non-empty delimiter preserved
+                try testing.expectEqualStrings("{", grammar.blocks.open.?);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
