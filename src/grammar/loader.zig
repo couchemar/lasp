@@ -26,6 +26,7 @@ pub const Pattern = struct {
     captures: []const Capture,
     position: ?PositionConstraint = null,
     exclude: []const []const u8 = &.{},
+    not_preceded_by: []const []const u8 = &.{},
 };
 
 pub const TokenMatcher = union(enum) {
@@ -183,6 +184,17 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
                 }
                 break :blk &.{};
             },
+            .not_preceded_by = blk: {
+                if (pattern_table.get("not_preceded_by")) |npb_val| {
+                    if (npb_val.array.items.len == 0) break :blk &.{};
+                    var npb_list: std.ArrayList([]const u8) = .empty;
+                    for (npb_val.array.items) |item| {
+                        try npb_list.append(allocator, try allocator.dupe(u8, item.string));
+                    }
+                    break :blk try npb_list.toOwnedSlice(allocator);
+                }
+                break :blk &.{};
+            },
         });
     }
 
@@ -277,6 +289,18 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                 if (j > 0) try w.writeAll(", ");
                 try w.writeAll("\"");
                 try w.writeAll(exc);
+                try w.writeAll("\"");
+            }
+            try w.writeAll("]\n");
+        }
+
+        // not_preceded_by field
+        if (pattern.not_preceded_by.len > 0) {
+            try w.writeAll("not_preceded_by = [");
+            for (pattern.not_preceded_by, 0..) |npb, j| {
+                if (j > 0) try w.writeAll(", ");
+                try w.writeAll("\"");
+                try w.writeAll(npb);
                 try w.writeAll("\"");
             }
             try w.writeAll("]\n");
@@ -518,6 +542,125 @@ test "parseGrammar: invalid position value returns error" {
     try testing.expectError(error.InvalidPositionValue, result);
 }
 
+test "parseGrammar: not_preceded_by with non-empty array" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\not_preceded_by = ["fun", "="]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), grammar.patterns[0].not_preceded_by.len);
+    try testing.expectEqualStrings("fun", grammar.patterns[0].not_preceded_by[0]);
+    try testing.expectEqualStrings("=", grammar.patterns[0].not_preceded_by[1]);
+}
+
+test "parseGrammar: not_preceded_by with empty array" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\not_preceded_by = []
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 0), grammar.patterns[0].not_preceded_by.len);
+}
+
+test "parseGrammar: omitted not_preceded_by defaults to empty" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 0), grammar.patterns[0].not_preceded_by.len);
+}
+
+test "parseGrammar: combined exclude and not_preceded_by" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\exclude = ["-spec", "-type"]
+        \\not_preceded_by = ["fun", "="]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), grammar.patterns[0].exclude.len);
+    try testing.expectEqualStrings("-spec", grammar.patterns[0].exclude[0]);
+    try testing.expectEqual(@as(usize, 2), grammar.patterns[0].not_preceded_by.len);
+    try testing.expectEqualStrings("fun", grammar.patterns[0].not_preceded_by[0]);
+    try testing.expectEqualStrings("=", grammar.patterns[0].not_preceded_by[1]);
+}
+
+test "formatGrammar: serializes non-empty not_preceded_by, omits when empty" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern with not_preceded_by
+    const with_npb = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .capture = .{ .field_name = "name", .position = 0 } },
+                    .{ .symbol_literal = "(" },
+                },
+                .captures = &.{
+                    .{ .field_name = "name", .position = 0 },
+                },
+                .not_preceded_by = &.{ "fun", "=" },
+            },
+        },
+        .blocks = .{},
+    };
+
+    const toml_with = try formatGrammar(with_npb, alloc);
+    try testing.expect(std.mem.indexOf(u8, toml_with, "not_preceded_by = [\"fun\", \"=\"]") != null);
+
+    // Pattern without not_preceded_by (empty)
+    const without_npb = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .capture = .{ .field_name = "name", .position = 0 } },
+                    .{ .symbol_literal = "(" },
+                },
+                .captures = &.{
+                    .{ .field_name = "name", .position = 0 },
+                },
+            },
+        },
+        .blocks = .{},
+    };
+
+    const toml_without = try formatGrammar(without_npb, alloc);
+    try testing.expect(std.mem.indexOf(u8, toml_without, "not_preceded_by") == null);
+}
+
 test "parseGrammar: empty exclude array means no exclusions" {
     const source =
         \\[[patterns]]
@@ -662,6 +805,75 @@ test "property: grammar TOML round-trip with position and exclude" {
             // Verify exclude round-trips
             try testing.expectEqual(@as(usize, 1), parsed.patterns[0].exclude.len);
             try testing.expectEqualStrings(exc_token, parsed.patterns[0].exclude[0]);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: not-preceded-by-constraint, Property 1: Grammar TOML round-trip with not_preceded_by
+// **Validates: Requirements 1.1, 1.4, 3.1, 3.3**
+test "property: grammar TOML round-trip with not_preceded_by" {
+    // Generate a random boolean for position, a random exclude string, and a random not_preceded_by string
+    const triple_gen = comptime gen.tuple3(
+        bool,
+        []const u8,
+        []const u8,
+        gen.boolean(),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, triple_gen, struct {
+        fn prop(vals: struct { bool, []const u8, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const has_position = vals[0];
+            const exc_token = vals[1];
+            const npb_token = vals[2];
+
+            const original = Grammar{
+                .language_name = "test",
+                .keyword_categories = &.{},
+                .keyword_table = &.{},
+                .patterns = &.{
+                    .{
+                        .type_name = "function",
+                        .sequence = &.{
+                            .{ .keyword_literal = "fn" },
+                            .{ .capture = .{ .field_name = "name", .position = 1 } },
+                            .{ .symbol_literal = "(" },
+                        },
+                        .captures = &.{
+                            .{ .field_name = "name", .position = 1 },
+                        },
+                        .position = if (has_position) .start else null,
+                        .exclude = &.{exc_token},
+                        .not_preceded_by = &.{npb_token},
+                    },
+                },
+                .blocks = .{},
+            };
+
+            // Round-trip: format → parse
+            const toml_str = try formatGrammar(original, alloc);
+            const parsed = try parseGrammar(toml_str, alloc);
+
+            // Verify position round-trips
+            if (has_position) {
+                try testing.expect(parsed.patterns[0].position != null);
+                try testing.expectEqual(PositionConstraint.start, parsed.patterns[0].position.?);
+            } else {
+                try testing.expect(parsed.patterns[0].position == null);
+            }
+
+            // Verify exclude round-trips
+            try testing.expectEqual(@as(usize, 1), parsed.patterns[0].exclude.len);
+            try testing.expectEqualStrings(exc_token, parsed.patterns[0].exclude[0]);
+
+            // Verify not_preceded_by round-trips
+            try testing.expectEqual(@as(usize, 1), parsed.patterns[0].not_preceded_by.len);
+            try testing.expectEqualStrings(npb_token, parsed.patterns[0].not_preceded_by[0]);
         }
     }.prop, .{ .num_runs = 100 });
 }
