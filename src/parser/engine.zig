@@ -101,6 +101,8 @@ pub fn parse(
 
     var lookback = LookbackBuffer{};
     var block_stack = BlockStack{};
+    var prev_token_text: ?[]const u8 = null;
+    var match_start_prev_token: ?[]const u8 = null;
 
     var state: usize = 0;
     var pattern_start: usize = 0;
@@ -126,10 +128,15 @@ pub fn parse(
         // Push to lookback before automaton stepping
         lookback.push(text);
 
+        // Snapshot prev_token_text before updating for not_preceded_by
+        const saved_prev = prev_token_text;
+        prev_token_text = text;
+
         if (automaton.step(state, token, source)) |step_result| {
             if (state == 0) {
                 pattern_start = token.start;
                 pattern_col = token.col;
+                match_start_prev_token = saved_prev;
             }
             state = step_result.next;
             try matched_kinds.append(allocator, token.kind);
@@ -181,6 +188,29 @@ pub fn parse(
                             matched_texts.clearRetainingCapacity();
                             continue;
                         }
+                    }
+                }
+
+                // not_preceded_by check
+                if (pattern) |p| {
+                    if (p.not_preceded_by.len > 0) {
+                        if (match_start_prev_token) |prev_text| {
+                            var rejected = false;
+                            for (p.not_preceded_by) |npb| {
+                                if (std.mem.eql(u8, prev_text, npb)) {
+                                    rejected = true;
+                                    break;
+                                }
+                            }
+                            if (rejected) {
+                                state = 0;
+                                pending_captures.clearRetainingCapacity();
+                                matched_kinds.clearRetainingCapacity();
+                                matched_texts.clearRetainingCapacity();
+                                continue;
+                            }
+                        }
+                        // match_start_prev_token == null means start of stream → pass
                     }
                 }
 
@@ -928,6 +958,330 @@ test "property: block stack annotates events correctly" {
                 const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, alloc);
                 try testing.expectEqual(@as(usize, 1), result.len);
                 try testing.expectEqual(@as(?usize, null), result[0].block_start);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- not_preceded_by Unit Tests ---
+
+test "parse: not_preceded_by rejects match when preceding token matches" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .captures = &.{},
+        .not_preceded_by = &.{"fun"},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    // "fun add(" — "fun" precedes the match
+    const source = "fun add(";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 3, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 4, .end = 7, .line = 1, .col = 4 },
+        .{ .kind = .delimiter, .start = 7, .end = 8, .line = 1, .col = 7 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "parse: not_preceded_by allows match when preceding token does not match" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .captures = &.{},
+        .not_preceded_by = &.{"fun"},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    // "module add(" — "module" does not match "fun"
+    const source = "module add(";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 6, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 7, .end = 10, .line = 1, .col = 7 },
+        .{ .kind = .delimiter, .start = 10, .end = 11, .line = 1, .col = 10 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("function", result[0].type_name);
+}
+
+test "parse: not_preceded_by passes at start of stream (no preceding token)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .captures = &.{},
+        .not_preceded_by = &.{"fun"},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    // "add(" — no preceding token at all
+    const source = "add(";
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 },
+        .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("function", result[0].type_name);
+}
+
+test "parse: combined position, exclude, and not_preceded_by constraints" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern with all three constraints
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .captures = &.{},
+        .position = .start,
+        .exclude = &.{"-spec"},
+        .not_preceded_by = &.{"="},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // Case 1: all constraints pass → event emitted
+    {
+        const source = "add(";
+        const tokens = &[_]Token{
+            .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 },
+            .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
+        };
+        const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+    }
+
+    // Case 2: not_preceded_by rejects (= precedes)
+    {
+        const source = "= add(";
+        const tokens = &[_]Token{
+            .{ .kind = .operator, .start = 0, .end = 1, .line = 1, .col = 0 },
+            .{ .kind = .identifier, .start = 2, .end = 5, .line = 1, .col = 2 },
+            .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
+        };
+        const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+        try testing.expectEqual(@as(usize, 0), result.len);
+    }
+
+    // Case 3: exclude rejects (-spec in lookback)
+    {
+        const source = "-spec add(";
+        const tokens = &[_]Token{
+            .{ .kind = .keyword, .start = 0, .end = 5, .line = 1, .col = 0 },
+            .{ .kind = .identifier, .start = 6, .end = 9, .line = 1, .col = 6 },
+            .{ .kind = .delimiter, .start = 9, .end = 10, .line = 1, .col = 9 },
+        };
+        const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+        try testing.expectEqual(@as(usize, 0), result.len);
+    }
+}
+
+// --- not_preceded_by Property Tests ---
+
+// Feature: not-preceded-by-constraint, Property 2: Engine not_preceded_by constraint enforcement
+// **Validates: Requirements 2.2, 2.3, 2.4, 2.7**
+test "property: engine not_preceded_by constraint enforcement" {
+    // Generate a random preceding token and a not_preceded_by list entry
+    const str_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, str_gen, struct {
+        fn prop(npb_entry: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "call",
+                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .captures = &.{},
+                .not_preceded_by = &.{npb_entry},
+            }};
+
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // Case A: preceding token matches npb_entry → should be rejected
+            {
+                var buf: [256]u8 = undefined;
+                const source = std.fmt.bufPrint(&buf, "{s} add(", .{npb_entry}) catch return;
+                const npb_end = npb_entry.len;
+                const id_start = npb_end + 1;
+                const id_end = id_start + 3;
+
+                const tokens = &[_]Token{
+                    .{ .kind = .keyword, .start = 0, .end = npb_end, .line = 1, .col = 0 },
+                    .{ .kind = .identifier, .start = id_start, .end = id_end, .line = 1, .col = id_start },
+                    .{ .kind = .delimiter, .start = id_end, .end = id_end + 1, .line = 1, .col = id_end },
+                };
+
+                const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+                try testing.expectEqual(@as(usize, 0), result.len);
+            }
+
+            // Case B: preceding token does NOT match → should emit event
+            // Use "zzz_nomatch" which won't equal any alpha string of len 1-8
+            {
+                const safe_prev = "zzz_nomatch";
+                var buf2: [256]u8 = undefined;
+                const source2 = std.fmt.bufPrint(&buf2, "{s} add(", .{safe_prev}) catch return;
+                const prev_end = safe_prev.len;
+                const id_start2 = prev_end + 1;
+                const id_end2 = id_start2 + 3;
+
+                const tokens2 = &[_]Token{
+                    .{ .kind = .keyword, .start = 0, .end = prev_end, .line = 1, .col = 0 },
+                    .{ .kind = .identifier, .start = id_start2, .end = id_end2, .line = 1, .col = id_start2 },
+                    .{ .kind = .delimiter, .start = id_end2, .end = id_end2 + 1, .line = 1, .col = id_end2 },
+                };
+
+                const result2 = try parse(automaton, tokens2, source2, patterns, .{}, alloc);
+                try testing.expectEqual(@as(usize, 1), result2.len);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: not-preceded-by-constraint, Property 3: Engine checks only the most recent preceding non-skip token
+// **Validates: Requirements 4.2, 4.3**
+test "property: engine checks only most recent preceding non-skip token" {
+    const str_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, str_gen, struct {
+        fn prop(npb_entry: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "call",
+                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .captures = &.{},
+                .not_preceded_by = &.{npb_entry},
+            }};
+
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // Case A: npb_entry is first token, "ok" is second (immediately preceding) → should emit
+            {
+                var buf: [256]u8 = undefined;
+                const source = std.fmt.bufPrint(&buf, "{s} ok add(", .{npb_entry}) catch return;
+                const npb_end = npb_entry.len;
+                const ok_start = npb_end + 1;
+                const ok_end = ok_start + 2;
+                const id_start = ok_end + 1;
+                const id_end = id_start + 3;
+
+                const tokens = &[_]Token{
+                    .{ .kind = .keyword, .start = 0, .end = npb_end, .line = 1, .col = 0 },
+                    .{ .kind = .keyword, .start = ok_start, .end = ok_end, .line = 1, .col = ok_start },
+                    .{ .kind = .identifier, .start = id_start, .end = id_end, .line = 1, .col = id_start },
+                    .{ .kind = .delimiter, .start = id_end, .end = id_end + 1, .line = 1, .col = id_end },
+                };
+
+                const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+                // "ok" is the immediately preceding token, not npb_entry → should emit
+                try testing.expectEqual(@as(usize, 1), result.len);
+            }
+
+            // Case B: "ok" is first token, npb_entry is second (immediately preceding) → should reject
+            {
+                var buf2: [256]u8 = undefined;
+                const source2 = std.fmt.bufPrint(&buf2, "ok {s} add(", .{npb_entry}) catch return;
+                const ok_end2: usize = 2;
+                const npb_start2 = ok_end2 + 1;
+                const npb_end2 = npb_start2 + npb_entry.len;
+                const id_start2 = npb_end2 + 1;
+                const id_end2 = id_start2 + 3;
+
+                const tokens2 = &[_]Token{
+                    .{ .kind = .keyword, .start = 0, .end = ok_end2, .line = 1, .col = 0 },
+                    .{ .kind = .keyword, .start = npb_start2, .end = npb_end2, .line = 1, .col = npb_start2 },
+                    .{ .kind = .identifier, .start = id_start2, .end = id_end2, .line = 1, .col = id_start2 },
+                    .{ .kind = .delimiter, .start = id_end2, .end = id_end2 + 1, .line = 1, .col = id_end2 },
+                };
+
+                const result2 = try parse(automaton, tokens2, source2, patterns, .{}, alloc);
+                // npb_entry is the immediately preceding token → should reject
+                try testing.expectEqual(@as(usize, 0), result2.len);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: not-preceded-by-constraint, Property 4: Engine evaluates exclude and not_preceded_by independently
+// **Validates: Requirements 2.6, 2.8**
+test "property: engine evaluates exclude and not_preceded_by independently" {
+    const str_gen = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha });
+
+    try minish.check(testing.allocator, str_gen, struct {
+        fn prop(token_text: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Use token_text as both the exclude and not_preceded_by entry
+            // and "safe" as a non-matching token
+            const exc_entry = token_text;
+            const npb_entry = token_text;
+
+            const patterns_both = &[_]loader.Pattern{.{
+                .type_name = "call",
+                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .captures = &.{},
+                .exclude = &.{exc_entry},
+                .not_preceded_by = &.{npb_entry},
+            }};
+
+            const automaton = try compiler.compile(patterns_both, alloc);
+
+            // Case 1: both pass (preceding token is "safe", not in exclude or npb)
+            {
+                const source = "safe add(";
+                const tokens = &[_]Token{
+                    .{ .kind = .keyword, .start = 0, .end = 4, .line = 1, .col = 0 },
+                    .{ .kind = .identifier, .start = 5, .end = 8, .line = 1, .col = 5 },
+                    .{ .kind = .delimiter, .start = 8, .end = 9, .line = 1, .col = 8 },
+                };
+                const result = try parse(automaton, tokens, source, patterns_both, .{}, alloc);
+                // "safe" doesn't match exclude or npb → event emitted
+                if (!std.mem.eql(u8, token_text, "safe")) {
+                    try testing.expectEqual(@as(usize, 1), result.len);
+                }
+            }
+
+            // Case 2: both reject (preceding token matches both exclude and npb)
+            {
+                var buf: [256]u8 = undefined;
+                const source = std.fmt.bufPrint(&buf, "{s} add(", .{token_text}) catch return;
+                const t_end = token_text.len;
+                const id_start = t_end + 1;
+                const id_end = id_start + 3;
+
+                const tokens = &[_]Token{
+                    .{ .kind = .keyword, .start = 0, .end = t_end, .line = 1, .col = 0 },
+                    .{ .kind = .identifier, .start = id_start, .end = id_end, .line = 1, .col = id_start },
+                    .{ .kind = .delimiter, .start = id_end, .end = id_end + 1, .line = 1, .col = id_end },
+                };
+                const result = try parse(automaton, tokens, source, patterns_both, .{}, alloc);
+                // token_text matches both → rejected
+                try testing.expectEqual(@as(usize, 0), result.len);
             }
         }
     }.prop, .{ .num_runs = 100 });
