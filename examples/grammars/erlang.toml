@@ -23,6 +23,7 @@ type = "function"
 sequence = ["$name:IDENTIFIER", "("]
 position = "start"
 exclude = ["-spec", "-type"]
+not_preceded_by = ["fun", "="]
 
 [[patterns]]
 type = "call"

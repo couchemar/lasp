@@ -1286,3 +1286,99 @@ test "property: engine evaluates exclude and not_preceded_by independently" {
         }
     }.prop, .{ .num_runs = 100 });
 }
+
+// --- End-to-end integration tests: Erlang grammar with not_preceded_by ---
+
+test "e2e: Erlang grammar rejects fun(Entry) as function definition" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Load the actual Erlang grammar
+    const file = try std.fs.cwd().openFile("examples/grammars/erlang.toml", .{});
+    defer file.close();
+    const grammar_source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+
+    // Erlang source: fun(Entry) -> ... is a lambda, not a function definition
+    const source = "fun(Entry) ->\n    Entry\nend";
+    const tokens = try tokenizer.tokenize(source, grammar.keyword_table, alloc);
+    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, alloc);
+
+    // "fun" should NOT be detected as a function definition
+    // because not_preceded_by doesn't apply here — the issue is that "fun" itself
+    // starts the pattern. Actually, "fun" is in the keyword table as a keyword,
+    // so the pattern ["$name:IDENTIFIER", "("] won't match "fun" because
+    // the tokenizer classifies "fun" as .keyword, not .identifier.
+    // Let's verify no "function" event with name="fun" is emitted.
+    for (events) |ev| {
+        if (std.mem.eql(u8, ev.type_name, "function")) {
+            for (ev.captures) |cap| {
+                if (std.mem.eql(u8, cap.field_name, "name")) {
+                    try testing.expect(!std.mem.eql(u8, cap.value, "fun"));
+                }
+            }
+        }
+    }
+}
+
+test "e2e: Erlang grammar rejects function after = operator" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Load the actual Erlang grammar
+    const file = try std.fs.cwd().openFile("examples/grammars/erlang.toml", .{});
+    defer file.close();
+    const grammar_source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+
+    // Erlang source: Config = get_env(app) — "get_env" preceded by "=" should not be a function def
+    const source = "Config = get_env(app)";
+    const tokens = try tokenizer.tokenize(source, grammar.keyword_table, alloc);
+    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, alloc);
+
+    // "get_env" should NOT be detected as a function definition because "=" precedes it
+    for (events) |ev| {
+        if (std.mem.eql(u8, ev.type_name, "function")) {
+            for (ev.captures) |cap| {
+                if (std.mem.eql(u8, cap.field_name, "name")) {
+                    try testing.expect(!std.mem.eql(u8, cap.value, "get_env"));
+                }
+            }
+        }
+    }
+}
+
+test "e2e: Erlang grammar still detects real function definitions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Load the actual Erlang grammar
+    const file = try std.fs.cwd().openFile("examples/grammars/erlang.toml", .{});
+    defer file.close();
+    const grammar_source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+
+    // Erlang source: a real function definition at column 0
+    const source = "handle_call(Request, From, State) ->\n    {reply, ok, State}.";
+    const tokens = try tokenizer.tokenize(source, grammar.keyword_table, alloc);
+    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, alloc);
+
+    // "handle_call" SHOULD be detected as a function definition
+    var found_function = false;
+    for (events) |ev| {
+        if (std.mem.eql(u8, ev.type_name, "function")) {
+            for (ev.captures) |cap| {
+                if (std.mem.eql(u8, cap.field_name, "name") and std.mem.eql(u8, cap.value, "handle_call")) {
+                    found_function = true;
+                }
+            }
+        }
+    }
+    try testing.expect(found_function);
+}

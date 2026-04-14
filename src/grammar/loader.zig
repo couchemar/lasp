@@ -957,6 +957,9 @@ test "example grammar: erlang.toml parses without errors" {
             try testing.expect(p.position != null);
             try testing.expectEqual(PositionConstraint.start, p.position.?);
             try testing.expect(p.exclude.len == 2);
+            try testing.expect(p.not_preceded_by.len == 2);
+            try testing.expectEqualStrings("fun", p.not_preceded_by[0]);
+            try testing.expectEqualStrings("=", p.not_preceded_by[1]);
             break;
         }
     }
