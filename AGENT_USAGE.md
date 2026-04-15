@@ -96,15 +96,58 @@ position = "start"
 exclude = ["-spec", "-type"]
 ```
 
+### Not-preceded-by constraint
+
+Discard matches where the immediately preceding token matches:
+
+```toml
+[[patterns]]
+type = "function"
+sequence = ["$name:IDENTIFIER", "("]
+position = "start"
+not_preceded_by = ["fun", "="]
+```
+
+Unlike `exclude` (which checks a 4-token lookback buffer), `not_preceded_by` checks only the single immediately preceding non-skip token. Use it for short keywords and operators.
+
+### Optional elements
+
+Mark sequence elements as optional with `?` — they boost confidence when present but don't prevent matching when absent:
+
+```toml
+[[patterns]]
+type = "function"
+sequence = ["fn", "$name:IDENTIFIER", "(?"]
+```
+
+When `(` is present: confidence = 1.0. When absent: confidence < 1.0 but the event is still emitted.
+
+### Configurable weights
+
+Override default evidence weights per language:
+
+```toml
+[weights]
+keyword = 0.6
+identifier = 0.2
+symbol = 0.15
+block = 0.3
+relaxed_keyword = 0.1
+```
+
+Omitted keys use defaults. Negative values are rejected.
+
 ### Sequence elements
 
 | Element | Matches |
 |---------|---------|
-| `"fn"` | Exact keyword text |
+| `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
 | `"("` | Exact symbol/delimiter |
 | `"identifier"` | Any identifier token |
 | `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
+| `"fn?"` | Optional keyword — boosts confidence when present |
+| `"(?"` | Optional symbol — boosts confidence when present |
 
 ## Workflow: Analyze an Unfamiliar Codebase
 
@@ -139,6 +182,25 @@ exclude = ["-spec", "-type"]
 | `block_start` | int? | Byte offset of enclosing block open delimiter (only when inside a block) |
 | `name`, `callee`, etc. | string? | Captured fields from `$field:IDENTIFIER` patterns |
 
+## Confidence Scoring
+
+Confidence reflects how certain the parser is about a match:
+
+| Score | Meaning |
+|-------|---------|
+| 1.0 | All elements matched with expected token kinds |
+| 0.7–0.9 | Strong match — some elements matched via relaxed matching or optional elements absent |
+| 0.5–0.7 | Plausible — partial structure, missing signals |
+| 0.3–0.5 | Weak guess — minimal evidence |
+| < 0.3 | Filtered out (not emitted) |
+
+Confidence < 1.0 happens when:
+- A keyword in the pattern matched an identifier token (relaxed match, e.g., `fn` not in `[keywords]`)
+- Optional elements (`?` suffix) were absent
+- Competing patterns resolved to a lower-scoring match
+
+Agents can use confidence to decide whether to trust a match, refine the grammar, or ask an LLM for disambiguation.
+
 ## Error Cases
 
 | Condition | Behavior |
@@ -148,4 +210,5 @@ exclude = ["-spec", "-type"]
 | Invalid TOML | stderr message, non-zero exit |
 | Missing `[[patterns]]` | stderr message, non-zero exit |
 | Invalid `position` value | stderr message, non-zero exit |
+| Negative weight value | stderr message, non-zero exit |
 | No args | Usage message on stderr, non-zero exit |

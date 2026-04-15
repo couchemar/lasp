@@ -328,59 +328,49 @@ To ensure deterministic execution and prevent runaway states:
 ---
 
 ## 🎯 Probabilistic Parsing
-When parsing unknown languages, incomplete code, or ambiguous constructs, deterministic rules may falter. **Probabilistic parsing** extends the deterministic matching by assigning confidence scores.
+LASP implements probabilistic confidence scoring — each structural match carries a confidence score from 0.0 to 1.0 reflecting how certain the parser is about the match.
 
 Instead of asking *"Is this definitely a function?"*, the parser asks: *"How likely is this structure to represent a function?"*
 
-### Rule Scoring
-Each parsing rule contributes a score based on matched evidence.
-For pattern: `(keyword)? identifier "(" args ")" block`
+### How Confidence Works (Implemented)
+
+**Relaxed keyword matching**: When a keyword in a pattern (e.g., `"fn"`) encounters an identifier token with matching text (because `fn` isn't in the `[keywords]` section), it matches with reduced weight (0.1 instead of 0.5). This produces confidence < 1.0.
+
+**Optional elements**: Sequence elements suffixed with `?` boost confidence when present but don't prevent matching when absent. Pattern `["fn", "$name:IDENTIFIER", "(?"]` matches `fn add` with confidence ~0.78 and `fn add(` with confidence 1.0.
+
+**Competing patterns**: When multiple patterns share a prefix and reach terminal states for overlapping token ranges, the engine buffers candidates and emits only the best match (highest confidence → longest match → grammar order).
+
+**Configurable weights**: Grammar authors can override default evidence weights via a `[weights]` section.
+
+### Evidence Weights (Defaults)
 
 | Feature          | Weight |
 |------------------|--------|
-| function keyword | +0.5   |
+| keyword          | +0.5   |
 | identifier       | +0.2   |
-| parentheses      | +0.2   |
+| symbol           | +0.2   |
 | block            | +0.3   |
-
-For example, `def add(a,b):` scores `0.5 + 0.2 + 0.2 + 0.3 = 1.2` which normalizes to a high confidence `~0.95`.
-
-### Handling Incomplete Code
-If the code is `fn add(a,b`, the parser matches:
-- keyword `+0.5`
-- identifier `+0.2`
-- parenthesis start `+0.2`
-Result: `Function(name="add", confidence=0.65)`
-
-### Probabilistic Pattern Matching (Multiple Interpretations)
-When dealing with ambiguous tokens like `foo(bar)`, multiple rules may match the exact same code fragment. The parser selects the highest score but may preserve alternatives.
-
-| Rule Interpretation | Score |
-|---------------------|-------|
-| Function call       | 0.88  |
-| Constructor call    | 0.40  |
-| Macro invocation    | 0.22  |
+| relaxed_keyword  | +0.1   |
 
 ### Confidence Thresholds
 | Confidence   | Interpretation |
 |--------------|----------------|
-| >= 0.8      | Strong match   |
-| 0.5 – 0.8  | Probable match |
-| 0.3 – 0.5  | Weak match     |
-| < 0.3      | Ignored        |
-
-### Scoring Sources
-Probabilities are derived iteratively from multiple continuous signals:
-- **Structural Evidence:** (e.g. matching `(`, `}`, indentation scales confidence)
-- **Keyword Matching:** (`def`, `function`, `class` rapidly boosts declaration structures)
-- **Context Evaluation:** (e.g. finding `router.get("/users")` assigns `endpoint_probability = 0.9` vs baseline `0.6` method confidence without framework knowledge)
-- **Frequency:** Repeated similar structures build dynamic confidence thresholds over the repository instance.
+| 1.0          | Perfect match — all elements matched with expected token kinds |
+| 0.7 – 0.9   | Strong match — relaxed keywords or missing optional elements |
+| 0.5 – 0.7   | Probable match — partial structure |
+| 0.3 – 0.5   | Weak match |
+| < 0.3       | Ignored (filtered out) |
 
 ### AI Integration Advantages
 Confidence scores allow agents operating autonomously over massive unknown dependencies to:
 1. Systematically choose the most statistically likely interpretation
 2. Request deeper language model analysis exclusively on nodes where `confidence < 0.8`
-3. Combine and test multiple probabilistic hypotheses for conflicting fragments automatically
+3. Refine grammars iteratively — low confidence signals missing keywords or patterns
+
+### Future Scoring Enhancements (Planned)
+- **Noise penalty**: Unexpected tokens between matched elements reduce confidence (infrastructure in place, capped at 0.5)
+- **Context evaluation**: Framework-aware scoring (e.g., `router.get("/users")` → endpoint detection)
+- **Frequency-based thresholds**: Repeated similar structures build dynamic confidence over a repository
 
 ---
 
