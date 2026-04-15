@@ -3,12 +3,21 @@ const toml = @import("toml");
 
 // --- Data Types ---
 
+pub const EvidenceWeights = struct {
+    keyword: f32 = 0.5,
+    identifier: f32 = 0.2,
+    symbol: f32 = 0.2,
+    block: f32 = 0.3,
+    relaxed_keyword: f32 = 0.1,
+};
+
 pub const Grammar = struct {
     language_name: ?[]const u8,
     keyword_categories: []const KeywordCategory,
     keyword_table: []const []const u8,
     patterns: []const Pattern,
     blocks: BlockConfig,
+    weights: EvidenceWeights = .{},
 };
 
 pub const KeywordCategory = struct {
@@ -60,6 +69,7 @@ pub const GrammarError = error{
     EmptyPatternSequence,
     InvalidCaptureFormat,
     InvalidPositionValue,
+    InvalidWeightValue,
     OutOfMemory,
 };
 
@@ -72,6 +82,17 @@ fn isSymbolOrDelimiter(s: []const u8) bool {
         if (s[0] == c) return true;
     }
     return false;
+}
+
+/// Extracts an f32 from a TOML value that may be either .float or .integer.
+/// Returns null if the value is neither type.
+fn tomlToF32(v: anytype) ?f32 {
+    // The TOML value is a tagged union pointer — dereference and switch on tag
+    return switch (v.*) {
+        .float => |f| @as(f32, @floatCast(f)),
+        .integer => |i| @as(f32, @floatFromInt(i)),
+        else => null,
+    };
 }
 
 /// Parses a single pattern sequence string into a SequenceElement.
@@ -230,6 +251,37 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         .keyword_table = try all_keywords.toOwnedSlice(allocator),
         .patterns = try patterns.toOwnedSlice(allocator),
         .blocks = blocks,
+        .weights = blk: {
+            var w = EvidenceWeights{};
+            if (root.get("weights")) |wt| {
+                if (wt.get("keyword")) |v| {
+                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                    if (val < 0.0) return error.InvalidWeightValue;
+                    w.keyword = val;
+                }
+                if (wt.get("identifier")) |v| {
+                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                    if (val < 0.0) return error.InvalidWeightValue;
+                    w.identifier = val;
+                }
+                if (wt.get("symbol")) |v| {
+                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                    if (val < 0.0) return error.InvalidWeightValue;
+                    w.symbol = val;
+                }
+                if (wt.get("block")) |v| {
+                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                    if (val < 0.0) return error.InvalidWeightValue;
+                    w.block = val;
+                }
+                if (wt.get("relaxed_keyword")) |v| {
+                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                    if (val < 0.0) return error.InvalidWeightValue;
+                    w.relaxed_keyword = val;
+                }
+            }
+            break :blk w;
+        },
     };
 }
 
@@ -339,6 +391,35 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
         }
         if (grammar.blocks.indentation) {
             try w.writeAll("indentation = true\n");
+        }
+    }
+
+    // [weights] — only serialize when values differ from defaults
+    {
+        const defaults = EvidenceWeights{};
+        const wts = grammar.weights;
+        if (wts.keyword != defaults.keyword or
+            wts.identifier != defaults.identifier or
+            wts.symbol != defaults.symbol or
+            wts.block != defaults.block or
+            wts.relaxed_keyword != defaults.relaxed_keyword)
+        {
+            try w.writeAll("\n[weights]\n");
+            if (wts.keyword != defaults.keyword) {
+                try std.fmt.format(w, "keyword = {d}\n", .{wts.keyword});
+            }
+            if (wts.identifier != defaults.identifier) {
+                try std.fmt.format(w, "identifier = {d}\n", .{wts.identifier});
+            }
+            if (wts.symbol != defaults.symbol) {
+                try std.fmt.format(w, "symbol = {d}\n", .{wts.symbol});
+            }
+            if (wts.block != defaults.block) {
+                try std.fmt.format(w, "block = {d}\n", .{wts.block});
+            }
+            if (wts.relaxed_keyword != defaults.relaxed_keyword) {
+                try std.fmt.format(w, "relaxed_keyword = {d}\n", .{wts.relaxed_keyword});
+            }
         }
     }
 
@@ -1473,4 +1554,273 @@ test "formatGrammar: round-trip preserves optional elements" {
     try testing.expect(parsed.patterns[0].sequence[2].is_optional);
     try testing.expect(parsed.patterns[0].sequence[2].matcher == .symbol_literal);
     try testing.expectEqualStrings("{", parsed.patterns[0].sequence[2].matcher.symbol_literal);
+}
+
+// --- Phase 5: Configurable Weights Property Tests ---
+
+// Feature: probabilistic-confidence-scoring, Property 9: Weight parsing with defaults
+// **Validates: Requirements 5.1, 5.2, 5.3**
+test "property: weight parsing with defaults" {
+    // Generate a random bitmask (0-31) to select which weight keys to include,
+    // and random percentage values (0-100) for each key.
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        u8,
+        gen.intRange(u8, 0, 31),
+        gen.intRange(u8, 0, 100),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const bitmask = vals[0];
+            const pct = vals[1];
+            const weight_val: f32 = @as(f32, @floatFromInt(pct)) / 100.0;
+
+            const keys = [_][]const u8{ "keyword", "identifier", "symbol", "block", "relaxed_keyword" };
+            const defaults = [_]f32{ 0.5, 0.2, 0.2, 0.3, 0.1 };
+
+            // Build TOML with a [weights] section containing only selected keys
+            var buf: std.ArrayList(u8) = .empty;
+            const w = buf.writer(alloc);
+            try w.writeAll("[[patterns]]\ntype = \"test\"\nsequence = [\"identifier\", \"(\"]\n\n");
+
+            var has_any = false;
+            for (0..5) |i| {
+                if (bitmask & (@as(u8, 1) << @intCast(i)) != 0) {
+                    if (!has_any) {
+                        try w.writeAll("[weights]\n");
+                        has_any = true;
+                    }
+                    try std.fmt.format(w, "{s} = {d:.2}\n", .{ keys[i], weight_val });
+                }
+            }
+
+            const source = buf.items;
+            const grammar = try parseGrammar(source, alloc);
+
+            // Verify: specified keys have custom values, omitted keys have defaults
+            const parsed_vals = [_]f32{
+                grammar.weights.keyword,
+                grammar.weights.identifier,
+                grammar.weights.symbol,
+                grammar.weights.block,
+                grammar.weights.relaxed_keyword,
+            };
+
+            for (0..5) |i| {
+                if (bitmask & (@as(u8, 1) << @intCast(i)) != 0) {
+                    // Specified key: should have custom value
+                    try testing.expectApproxEqAbs(weight_val, parsed_vals[i], 0.01);
+                } else {
+                    // Omitted key: should have default value
+                    try testing.expectApproxEqAbs(defaults[i], parsed_vals[i], 0.001);
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring, Property 10: Negative weight rejection
+// **Validates: Requirements 5.5**
+test "property: negative weight rejection" {
+    // Generate a random key index (0-4) and a random negative percentage (1-100)
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        u8,
+        gen.intRange(u8, 0, 4),
+        gen.intRange(u8, 1, 100),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const key_idx = vals[0];
+            const pct = vals[1];
+            const neg_val: f32 = -@as(f32, @floatFromInt(pct)) / 100.0;
+
+            const keys = [_][]const u8{ "keyword", "identifier", "symbol", "block", "relaxed_keyword" };
+
+            // Build TOML with a negative weight value
+            var buf: std.ArrayList(u8) = .empty;
+            const w = buf.writer(alloc);
+            try w.writeAll("[[patterns]]\ntype = \"test\"\nsequence = [\"identifier\", \"(\"]\n\n[weights]\n");
+            try std.fmt.format(w, "{s} = {d:.2}\n", .{ keys[key_idx], neg_val });
+
+            const source = buf.items;
+            const result = parseGrammar(source, alloc);
+            try testing.expectError(error.InvalidWeightValue, result);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring, Property 11: Grammar TOML round-trip with weights
+// **Validates: Requirements 5.6**
+test "property: grammar TOML round-trip with weights" {
+    // Generate 5 random percentage values (0-100) for each weight key
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        u8,
+        u8,
+        gen.intRange(u8, 0, 100),
+        gen.intRange(u8, 0, 100),
+        gen.intRange(u8, 0, 100),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Use the 3 generated values to derive 5 weight values
+            const w_keyword: f32 = @as(f32, @floatFromInt(vals[0])) / 100.0;
+            const w_identifier: f32 = @as(f32, @floatFromInt(vals[1])) / 100.0;
+            const w_symbol: f32 = @as(f32, @floatFromInt(vals[2])) / 100.0;
+            // Derive block and relaxed_keyword from combinations
+            const w_block: f32 = @as(f32, @floatFromInt((vals[0] +% vals[1]) % 101)) / 100.0;
+            const w_relaxed: f32 = @as(f32, @floatFromInt((vals[1] +% vals[2]) % 101)) / 100.0;
+
+            const original = Grammar{
+                .language_name = "test",
+                .keyword_categories = &.{},
+                .keyword_table = &.{},
+                .patterns = &.{
+                    .{
+                        .type_name = "function",
+                        .sequence = &.{
+                            .{ .matcher = .{ .keyword_literal = "fn" } },
+                            .{ .matcher = .{ .identifier = {} } },
+                            .{ .matcher = .{ .symbol_literal = "(" } },
+                        },
+                        .captures = &.{},
+                    },
+                },
+                .blocks = .{},
+                .weights = .{
+                    .keyword = w_keyword,
+                    .identifier = w_identifier,
+                    .symbol = w_symbol,
+                    .block = w_block,
+                    .relaxed_keyword = w_relaxed,
+                },
+            };
+
+            // Round-trip: format → parse
+            const toml_str = try formatGrammar(original, alloc);
+            const parsed = try parseGrammar(toml_str, alloc);
+
+            // Verify weight values are preserved
+            try testing.expectApproxEqAbs(w_keyword, parsed.weights.keyword, 0.01);
+            try testing.expectApproxEqAbs(w_identifier, parsed.weights.identifier, 0.01);
+            try testing.expectApproxEqAbs(w_symbol, parsed.weights.symbol, 0.01);
+            try testing.expectApproxEqAbs(w_block, parsed.weights.block, 0.01);
+            try testing.expectApproxEqAbs(w_relaxed, parsed.weights.relaxed_keyword, 0.01);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 5: Configurable Weights Unit Tests (loader) ---
+
+test "parseGrammar: partial weight spec uses defaults for omitted keys" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[weights]
+        \\keyword = 0.6
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    // keyword overridden
+    try testing.expectApproxEqAbs(@as(f32, 0.6), grammar.weights.keyword, 0.001);
+    // others use defaults
+    try testing.expectApproxEqAbs(@as(f32, 0.2), grammar.weights.identifier, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), grammar.weights.symbol, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), grammar.weights.block, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), grammar.weights.relaxed_keyword, 0.001);
+}
+
+test "parseGrammar: negative weight returns InvalidWeightValue" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[weights]
+        \\keyword = -0.5
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.InvalidWeightValue, result);
+}
+
+test "parseGrammar: round-trip with all weight fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const original = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .identifier = {} } },
+                },
+                .captures = &.{},
+            },
+        },
+        .blocks = .{},
+        .weights = .{
+            .keyword = 0.7,
+            .identifier = 0.3,
+            .symbol = 0.15,
+            .block = 0.4,
+            .relaxed_keyword = 0.05,
+        },
+    };
+
+    const toml_str = try formatGrammar(original, alloc);
+    const parsed = try parseGrammar(toml_str, alloc);
+
+    try testing.expectApproxEqAbs(@as(f32, 0.7), parsed.weights.keyword, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), parsed.weights.identifier, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.15), parsed.weights.symbol, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), parsed.weights.block, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.05), parsed.weights.relaxed_keyword, 0.01);
+}
+
+test "parseGrammar: omitted weights section uses all defaults" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    const defaults = EvidenceWeights{};
+    try testing.expectApproxEqAbs(defaults.keyword, grammar.weights.keyword, 0.001);
+    try testing.expectApproxEqAbs(defaults.identifier, grammar.weights.identifier, 0.001);
+    try testing.expectApproxEqAbs(defaults.symbol, grammar.weights.symbol, 0.001);
+    try testing.expectApproxEqAbs(defaults.block, grammar.weights.block, 0.001);
+    try testing.expectApproxEqAbs(defaults.relaxed_keyword, grammar.weights.relaxed_keyword, 0.001);
 }

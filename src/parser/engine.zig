@@ -72,13 +72,13 @@ fn shouldSkip(kind: TokenKind) bool {
 }
 
 /// Computes the max possible confidence score for a pattern's matchers.
-fn patternMaxScore(sequence: []const loader.SequenceElement) f32 {
+fn patternMaxScore(sequence: []const loader.SequenceElement, weights: loader.EvidenceWeights) f32 {
     var total: f32 = 0.0;
     for (sequence) |elem| {
         total += switch (elem.matcher) {
-            .keyword_literal => events_mod.evidence_weights.keyword,
-            .symbol_literal => events_mod.evidence_weights.symbol,
-            .identifier, .capture, .identifier_literal => events_mod.evidence_weights.identifier,
+            .keyword_literal => weights.keyword,
+            .symbol_literal => weights.symbol,
+            .identifier, .capture, .identifier_literal => weights.identifier,
         };
     }
     return total;
@@ -133,6 +133,7 @@ pub fn parse(
     source: []const u8,
     patterns: []const loader.Pattern,
     blocks: loader.BlockConfig,
+    weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
 ) ![]StructuralEvent {
     var result: std.ArrayList(StructuralEvent) = .empty;
@@ -236,6 +237,7 @@ pub fn parse(
                     block_stack,
                     tokens,
                     token,
+                    weights,
                     allocator,
                 );
 
@@ -358,6 +360,7 @@ pub fn parse(
                             block_stack,
                             tokens,
                             token,
+                            weights,
                             allocator,
                         );
 
@@ -389,6 +392,7 @@ pub fn parse(
                         block_stack,
                         tokens,
                         token,
+                        weights,
                         allocator,
                     );
 
@@ -445,6 +449,7 @@ fn bufferCandidate(
     block_stack: BlockStack,
     tokens: []const Token,
     token: Token,
+    weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
 ) !bool {
     const pattern = findPattern(patterns, event_info.type_name);
@@ -481,13 +486,18 @@ fn bufferCandidate(
     }
 
     // Compute confidence
-    const max_score = if (pattern) |p| patternMaxScore(p.sequence) else 1.0;
+    const max_score = if (pattern) |p| patternMaxScore(p.sequence, weights) else 1.0;
     var matched_weights: f32 = 0.0;
     for (matched_kinds.items, matched_qualities.items) |kind, quality| {
         if (quality == .relaxed_match) {
-            matched_weights += events_mod.evidence_weights.relaxed_keyword;
+            matched_weights += weights.relaxed_keyword;
         } else {
-            matched_weights += events_mod.weightForKind(kind);
+            matched_weights += switch (kind) {
+                .keyword => weights.keyword,
+                .identifier => weights.identifier,
+                .delimiter, .symbol => weights.symbol,
+                else => 0.0,
+            };
         }
     }
     const confidence = events_mod.computeConfidence(matched_weights, max_score, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
@@ -556,6 +566,7 @@ fn bufferCandidateWithMinEvidence(
     block_stack: BlockStack,
     tokens: []const Token,
     token: Token,
+    weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
 ) !bool {
     const pattern = findPattern(patterns, event_info.type_name);
@@ -592,6 +603,7 @@ fn bufferCandidateWithMinEvidence(
         block_stack,
         tokens,
         token,
+        weights,
         allocator,
     );
 }
@@ -603,8 +615,8 @@ fn findPattern(patterns: []const loader.Pattern, type_name: []const u8) ?loader.
     return null;
 }
 
-fn findPatternMaxScore(patterns: []const loader.Pattern, type_name: []const u8) f32 {
-    if (findPattern(patterns, type_name)) |p| return patternMaxScore(p.sequence);
+fn findPatternMaxScore(patterns: []const loader.Pattern, type_name: []const u8, weights: loader.EvidenceWeights) f32 {
+    if (findPattern(patterns, type_name)) |p| return patternMaxScore(p.sequence, weights);
     return 1.0; // fallback
 }
 
@@ -635,7 +647,7 @@ test "parse: single pattern match emits event" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
     try testing.expectEqual(@as(usize, 0), result[0].start);
@@ -667,7 +679,7 @@ test "parse: identifier_literal matching pattern emits event" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("test_literal", result[0].type_name);
     try testing.expectEqual(@as(usize, 0), result[0].start);
@@ -693,7 +705,7 @@ test "parse: no matching pattern emits nothing" {
         .{ .kind = .identifier, .start = 4, .end = 5, .line = 1, .col = 4 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
@@ -718,7 +730,7 @@ test "parse: skip tokens between structural tokens" {
         .{ .kind = .identifier, .start = 5, .end = 8, .line = 2, .col = 2 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
 }
@@ -747,7 +759,7 @@ test "parse: confidence computation for known tokens" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // All tokens matched their expected kinds, so confidence = 1.0
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
@@ -773,7 +785,7 @@ test "parse: multiple pattern matches" {
         .{ .kind = .delimiter, .start = 8, .end = 9, .line = 1, .col = 8 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 2), result.len);
     try testing.expectEqualStrings("call", result[0].type_name);
     try testing.expectEqualStrings("call", result[1].type_name);
@@ -846,7 +858,7 @@ test "parse: position = start at col 0 emits event" {
         .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(usize, 0), result[0].col);
 }
@@ -870,7 +882,7 @@ test "parse: position = start at col > 0 discards event" {
         .{ .kind = .identifier, .start = 5, .end = 8, .line = 1, .col = 5 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
@@ -895,7 +907,7 @@ test "parse: exclude with matching lookback discards event" {
         .{ .kind = .delimiter, .start = 9, .end = 10, .line = 1, .col = 9 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
@@ -918,7 +930,7 @@ test "parse: exclude with no matching lookback emits event" {
         .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
 }
 
@@ -942,7 +954,7 @@ test "parse: block delimiters set block_start on events" {
         .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(?usize, 0), result[0].block_start);
 }
@@ -965,7 +977,7 @@ test "parse: no blocks section means block_start is null" {
         .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(?usize, null), result[0].block_start);
 }
@@ -990,7 +1002,7 @@ test "parse: unmatched close delimiter does not crash" {
     };
 
     // Should not crash even with unmatched close delimiter
-    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(?usize, null), result[0].block_start);
 }
@@ -1029,7 +1041,7 @@ test "property: engine pattern match correctness" {
                 .{ .kind = .identifier, .start = 3, .end = 3 + ident.len, .line = 1, .col = 3 },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings("function", result[0].type_name);
             try testing.expectEqual(@as(usize, 1), result[0].captures.len);
@@ -1066,7 +1078,7 @@ test "property: engine skip token transparency" {
             }
             try tokens.append(alloc, .{ .kind = .identifier, .start = 3, .end = 6, .line = 2, .col = 0 });
 
-            const result = try parse(automaton, tokens.items, source, patterns, .{}, alloc);
+            const result = try parse(automaton, tokens.items, source, patterns, .{}, .{}, alloc);
             // Should always match regardless of skip tokens
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings("function", result[0].type_name);
@@ -1098,7 +1110,7 @@ test "property: event field invariants" {
                 .{ .kind = .delimiter, .start = ident.len, .end = ident.len + 1, .line = 1, .col = ident.len },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
             for (result) |event| {
                 try testing.expect(event.start <= event.end);
                 try testing.expect(event.end <= source.len);
@@ -1159,7 +1171,7 @@ test "property: position constraint enforcement" {
                 .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = col + 3 },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
             if (col == 0) {
                 try testing.expectEqual(@as(usize, 1), result.len);
             } else {
@@ -1201,7 +1213,7 @@ test "property: exclusion pattern discards matches" {
                 .{ .kind = .delimiter, .start = id_end, .end = id_end + 1, .line = 1, .col = id_end },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
             // Should be discarded because lookback contains the exclude token
             try testing.expectEqual(@as(usize, 0), result.len);
         }
@@ -1269,7 +1281,7 @@ test "property: block stack annotates events correctly" {
                     .{ .kind = .identifier, .start = 2, .end = 5, .line = 1, .col = 2 },
                     .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
                 };
-                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, alloc);
+                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
                 try testing.expectEqual(@as(usize, 1), result.len);
                 try testing.expectEqual(@as(?usize, 0), result[0].block_start);
             } else {
@@ -1279,7 +1291,7 @@ test "property: block stack annotates events correctly" {
                     .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 },
                     .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
                 };
-                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, alloc);
+                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
                 try testing.expectEqual(@as(usize, 1), result.len);
                 try testing.expectEqual(@as(?usize, null), result[0].block_start);
             }
@@ -1310,7 +1322,7 @@ test "parse: not_preceded_by rejects match when preceding token matches" {
         .{ .kind = .delimiter, .start = 7, .end = 8, .line = 1, .col = 7 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
@@ -1335,7 +1347,7 @@ test "parse: not_preceded_by allows match when preceding token does not match" {
         .{ .kind = .delimiter, .start = 10, .end = 11, .line = 1, .col = 10 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
 }
@@ -1360,7 +1372,7 @@ test "parse: not_preceded_by passes at start of stream (no preceding token)" {
         .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
 }
@@ -1389,7 +1401,7 @@ test "parse: combined position, exclude, and not_preceded_by constraints" {
             .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 },
             .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
         };
-        const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
         try testing.expectEqual(@as(usize, 1), result.len);
     }
 
@@ -1401,7 +1413,7 @@ test "parse: combined position, exclude, and not_preceded_by constraints" {
             .{ .kind = .identifier, .start = 2, .end = 5, .line = 1, .col = 2 },
             .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
         };
-        const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
         try testing.expectEqual(@as(usize, 0), result.len);
     }
 
@@ -1413,7 +1425,7 @@ test "parse: combined position, exclude, and not_preceded_by constraints" {
             .{ .kind = .identifier, .start = 6, .end = 9, .line = 1, .col = 6 },
             .{ .kind = .delimiter, .start = 9, .end = 10, .line = 1, .col = 9 },
         };
-        const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
         try testing.expectEqual(@as(usize, 0), result.len);
     }
 }
@@ -1455,7 +1467,7 @@ test "property: engine not_preceded_by constraint enforcement" {
                     .{ .kind = .delimiter, .start = id_end, .end = id_end + 1, .line = 1, .col = id_end },
                 };
 
-                const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+                const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
                 try testing.expectEqual(@as(usize, 0), result.len);
             }
 
@@ -1475,7 +1487,7 @@ test "property: engine not_preceded_by constraint enforcement" {
                     .{ .kind = .delimiter, .start = id_end2, .end = id_end2 + 1, .line = 1, .col = id_end2 },
                 };
 
-                const result2 = try parse(automaton, tokens2, source2, patterns, .{}, alloc);
+                const result2 = try parse(automaton, tokens2, source2, patterns, .{}, .{}, alloc);
                 try testing.expectEqual(@as(usize, 1), result2.len);
             }
         }
@@ -1519,7 +1531,7 @@ test "property: engine checks only most recent preceding non-skip token" {
                     .{ .kind = .delimiter, .start = id_end, .end = id_end + 1, .line = 1, .col = id_end },
                 };
 
-                const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+                const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
                 // "ok" is the immediately preceding token, not npb_entry → should emit
                 try testing.expectEqual(@as(usize, 1), result.len);
             }
@@ -1541,7 +1553,7 @@ test "property: engine checks only most recent preceding non-skip token" {
                     .{ .kind = .delimiter, .start = id_end2, .end = id_end2 + 1, .line = 1, .col = id_end2 },
                 };
 
-                const result2 = try parse(automaton, tokens2, source2, patterns, .{}, alloc);
+                const result2 = try parse(automaton, tokens2, source2, patterns, .{}, .{}, alloc);
                 // npb_entry is the immediately preceding token → should reject
                 try testing.expectEqual(@as(usize, 0), result2.len);
             }
@@ -1583,7 +1595,7 @@ test "property: engine evaluates exclude and not_preceded_by independently" {
                     .{ .kind = .identifier, .start = 5, .end = 8, .line = 1, .col = 5 },
                     .{ .kind = .delimiter, .start = 8, .end = 9, .line = 1, .col = 8 },
                 };
-                const result = try parse(automaton, tokens, source, patterns_both, .{}, alloc);
+                const result = try parse(automaton, tokens, source, patterns_both, .{}, .{}, alloc);
                 // "safe" doesn't match exclude or npb → event emitted
                 if (!std.mem.eql(u8, token_text, "safe")) {
                     try testing.expectEqual(@as(usize, 1), result.len);
@@ -1603,7 +1615,7 @@ test "property: engine evaluates exclude and not_preceded_by independently" {
                     .{ .kind = .identifier, .start = id_start, .end = id_end, .line = 1, .col = id_start },
                     .{ .kind = .delimiter, .start = id_end, .end = id_end + 1, .line = 1, .col = id_end },
                 };
-                const result = try parse(automaton, tokens, source, patterns_both, .{}, alloc);
+                const result = try parse(automaton, tokens, source, patterns_both, .{}, .{}, alloc);
                 // token_text matches both → rejected
                 try testing.expectEqual(@as(usize, 0), result.len);
             }
@@ -1628,7 +1640,7 @@ test "e2e: Erlang grammar rejects fun(Entry) as function definition" {
     // Erlang source: fun(Entry) -> ... is a lambda, not a function definition
     const source = "fun(Entry) ->\n    Entry\nend";
     const tokens = try tokenizer.tokenize(source, grammar.keyword_table, alloc);
-    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, alloc);
+    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, alloc);
 
     // "fun" should NOT be detected as a function definition
     // because not_preceded_by doesn't apply here — the issue is that "fun" itself
@@ -1662,7 +1674,7 @@ test "e2e: Erlang grammar rejects function after = operator" {
     // Erlang source: Config = get_env(app) — "get_env" preceded by "=" should not be a function def
     const source = "Config = get_env(app)";
     const tokens = try tokenizer.tokenize(source, grammar.keyword_table, alloc);
-    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, alloc);
+    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, alloc);
 
     // "get_env" should NOT be detected as a function definition because "=" precedes it
     for (events) |ev| {
@@ -1691,7 +1703,7 @@ test "e2e: Erlang grammar still detects real function definitions" {
     // Erlang source: a real function definition at column 0
     const source = "handle_call(Request, From, State) ->\n    {reply, ok, State}.";
     const tokens = try tokenizer.tokenize(source, grammar.keyword_table, alloc);
-    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, alloc);
+    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, alloc);
 
     // "handle_call" SHOULD be detected as a function definition
     var found_function = false;
@@ -1766,8 +1778,8 @@ test "property: relaxed match produces lower confidence than full match" {
             pos += 1;
             const source = buf[0..pos];
 
-            const full_result = try parse(automaton, full_tokens.items, source, patterns, .{}, alloc);
-            const relaxed_result = try parse(automaton, relaxed_tokens.items, source, patterns, .{}, alloc);
+            const full_result = try parse(automaton, full_tokens.items, source, patterns, .{}, .{}, alloc);
+            const relaxed_result = try parse(automaton, relaxed_tokens.items, source, patterns, .{}, .{}, alloc);
 
             try testing.expectEqual(@as(usize, 1), full_result.len);
             try testing.expectEqual(@as(usize, 1), relaxed_result.len);
@@ -1815,7 +1827,7 @@ test "property: backward compatibility full keyword match produces confidence 1.
             }
             const source = buf[0..offset];
 
-            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, alloc);
+            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, .{}, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
         }
@@ -1877,7 +1889,7 @@ test "property: perfect match produces confidence 1.0" {
             }};
 
             const automaton = try compiler.compile(patterns, alloc);
-            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, alloc);
+            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, .{}, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
         }
@@ -1911,7 +1923,7 @@ test "parse: keyword as identifier token produces confidence < 1.0 (relaxed matc
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // relaxed_keyword(0.1) + identifier(0.2) + symbol(0.2) = 0.5 / 0.9 ≈ 0.556
     try testing.expect(result[0].confidence < 1.0);
@@ -1942,7 +1954,7 @@ test "parse: full keyword match produces confidence = 1.0" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
 }
@@ -1972,7 +1984,7 @@ test "parse: mixed relaxed and full matches in same pattern" {
         .{ .kind = .identifier, .start = 7, .end = 10, .line = 1, .col = 7 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // full(0.5) + relaxed(0.1) + identifier(0.2) = 0.8 / (0.5+0.5+0.2) = 0.8/1.2 ≈ 0.667
     try testing.expect(result[0].confidence < 1.0);
@@ -2024,7 +2036,7 @@ test "property: optional elements affect confidence monotonically" {
                 try full_tokens.append(alloc, .{ .kind = .delimiter, .start = 7, .end = 8, .line = 1, .col = 7 });
             }
 
-            const full_result = try parse(automaton, full_tokens.items, full_source, patterns, .{}, alloc);
+            const full_result = try parse(automaton, full_tokens.items, full_source, patterns, .{}, .{}, alloc);
             try testing.expectEqual(@as(usize, 1), full_result.len);
 
             // All-present confidence should be 1.0
@@ -2039,7 +2051,7 @@ test "property: optional elements affect confidence monotonically" {
                 .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
             };
 
-            const partial_result = try parse(automaton, partial_tokens, partial_source, patterns, .{}, alloc);
+            const partial_result = try parse(automaton, partial_tokens, partial_source, patterns, .{}, .{}, alloc);
             try testing.expectEqual(@as(usize, 1), partial_result.len);
 
             // Partial confidence should be < 1.0
@@ -2077,7 +2089,7 @@ test "parse: optional element present produces confidence = 1.0" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
 }
@@ -2107,7 +2119,7 @@ test "parse: optional element absent produces confidence < 1.0 but event still e
         .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // Confidence should be < 1.0 because optional element is absent
     // matched: keyword(0.5) + identifier(0.2) = 0.7
@@ -2141,7 +2153,7 @@ test "parse: all-optional pattern with none matching emits no event (Minimum_Evi
         .{ .kind = .identifier, .start = 4, .end = 5, .line = 1, .col = 4 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     // No event should be emitted — Minimum_Evidence rule: at least one required element must match
     try testing.expectEqual(@as(usize, 0), result.len);
 }
@@ -2176,7 +2188,7 @@ test "parse: mix of required and optional, optional absent produces confidence <
         .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // matched: keyword(0.5) + identifier(0.2) = 0.7
     // max: keyword(0.5) + identifier(0.2) + symbol(0.2) + symbol(0.2) = 1.1
@@ -2343,7 +2355,7 @@ test "parse: single pattern emitted normally with buffered emission (no regressi
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
     try testing.expectEqualStrings("add", result[0].captures[0].value);
@@ -2388,7 +2400,7 @@ test "parse: competing patterns with shared prefix, longer match wins" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     // Should emit only one event — the longer/higher-confidence match
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("fn_call", result[0].type_name);
@@ -2430,7 +2442,7 @@ test "parse: competing patterns, shorter match emitted when longer doesn't compl
         .{ .kind = .symbol, .start = 7, .end = 8, .line = 1, .col = 7 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     // ";" doesn't match "(" so the longer pattern fails.
     // The shorter pattern (fn_decl) should be emitted from the buffer.
     try testing.expectEqual(@as(usize, 1), result.len);
@@ -2472,7 +2484,7 @@ test "parse: competing patterns, end of stream flushes buffered candidate" {
         .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
     // End of stream should flush the buffered fn_decl candidate
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("fn_decl", result[0].type_name);
@@ -2655,4 +2667,141 @@ test "computeConfidence: noise cannot produce negative confidence" {
 test "computeConfidence: zero max_score returns 0.0 regardless of noise" {
     const confidence = events_mod.computeConfidence(0.5, 0.0, 3, 0.1, 0.5);
     try testing.expectApproxEqRel(@as(f32, 0.0), confidence, 0.001);
+}
+
+// --- Phase 5: Configurable Weights Tests ---
+
+// Feature: probabilistic-confidence-scoring, Property 14: Custom weights flow through to confidence
+// **Validates: Requirements 5.4**
+test "property: custom weights flow through to confidence" {
+    // Generate a random percentage (1-100) for the keyword weight
+    const pct_gen = gen.intRange(u8, 1, 100);
+
+    try minish.check(testing.allocator, pct_gen, struct {
+        fn prop(pct: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const custom_keyword_weight: f32 = @as(f32, @floatFromInt(pct)) / 100.0;
+
+            // Skip if custom weight equals default (0.5) — confidence would be the same
+            const default_keyword: f32 = 0.5;
+            if (@abs(custom_keyword_weight - default_keyword) < 0.01) return;
+
+            // Pattern: keyword + identifier + symbol
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .identifier = {} } },
+                    .{ .matcher = .{ .symbol_literal = "(" } },
+                },
+                .captures = &.{},
+            }};
+
+            const automaton = try compiler.compile(patterns, alloc);
+            const source = "fn add(";
+            const tokens = &[_]Token{
+                .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+                .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+                .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+            };
+
+            // Run with default weights
+            const default_weights = loader.EvidenceWeights{};
+            const default_result = try parse(automaton, tokens, source, patterns, .{}, default_weights, alloc);
+
+            // Run with custom weights (only keyword changed)
+            const custom_weights = loader.EvidenceWeights{
+                .keyword = custom_keyword_weight,
+                .identifier = 0.2,
+                .symbol = 0.2,
+                .block = 0.3,
+                .relaxed_keyword = 0.1,
+            };
+            const custom_result = try parse(automaton, tokens, source, patterns, .{}, custom_weights, alloc);
+
+            // Both should produce exactly 1 event (full match → confidence = 1.0 in both cases
+            // since matched_weights == max_score for full matches)
+            try testing.expectEqual(@as(usize, 1), default_result.len);
+            try testing.expectEqual(@as(usize, 1), custom_result.len);
+
+            // For a full match, confidence is always 1.0 regardless of weights.
+            // To see the difference, we need a relaxed match.
+            // Use identifier kind for "fn" to get a relaxed match.
+            const relaxed_tokens = &[_]Token{
+                .{ .kind = .identifier, .start = 0, .end = 2, .line = 1, .col = 0 },
+                .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+                .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+            };
+
+            const default_relaxed = try parse(automaton, relaxed_tokens, source, patterns, .{}, default_weights, alloc);
+            const custom_relaxed = try parse(automaton, relaxed_tokens, source, patterns, .{}, custom_weights, alloc);
+
+            try testing.expectEqual(@as(usize, 1), default_relaxed.len);
+            try testing.expectEqual(@as(usize, 1), custom_relaxed.len);
+
+            // With relaxed match, the keyword contributes relaxed_keyword weight (0.1) instead of keyword weight.
+            // Default: matched = 0.1 + 0.2 + 0.2 = 0.5, max = 0.5 + 0.2 + 0.2 = 0.9, conf = 0.5/0.9
+            // Custom:  matched = 0.1 + 0.2 + 0.2 = 0.5, max = custom_kw + 0.2 + 0.2, conf = 0.5/(custom_kw + 0.4)
+            // Since custom_kw != 0.5, the max_score differs, so confidence differs.
+            try testing.expect(default_relaxed[0].confidence != custom_relaxed[0].confidence);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 5: Configurable Weights Unit Test (engine) ---
+
+test "parse: custom weights produce different confidence than defaults for same pattern" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern: keyword + identifier + symbol
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .identifier = {} } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add(";
+
+    // Use relaxed match (identifier kind for "fn") so weights affect confidence
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    // Default weights: keyword=0.5, identifier=0.2, symbol=0.2, relaxed_keyword=0.1
+    // Relaxed match: matched = 0.1 + 0.2 + 0.2 = 0.5, max = 0.5 + 0.2 + 0.2 = 0.9
+    // confidence = 0.5 / 0.9 ≈ 0.556
+    const default_result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), default_result.len);
+
+    // Custom weights: keyword=0.8 (higher), rest same
+    // Relaxed match: matched = 0.1 + 0.2 + 0.2 = 0.5, max = 0.8 + 0.2 + 0.2 = 1.2
+    // confidence = 0.5 / 1.2 ≈ 0.417
+    const custom_weights = loader.EvidenceWeights{
+        .keyword = 0.8,
+        .identifier = 0.2,
+        .symbol = 0.2,
+        .block = 0.3,
+        .relaxed_keyword = 0.1,
+    };
+    const custom_result = try parse(automaton, tokens, source, patterns, .{}, custom_weights, alloc);
+    try testing.expectEqual(@as(usize, 1), custom_result.len);
+
+    // Confidence should differ
+    try testing.expect(default_result[0].confidence != custom_result[0].confidence);
+
+    // With higher keyword weight, the max_score is higher but matched stays the same,
+    // so confidence should be lower with custom weights
+    try testing.expect(custom_result[0].confidence < default_result[0].confidence);
 }
