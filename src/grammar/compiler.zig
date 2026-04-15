@@ -14,6 +14,7 @@ pub const Transition = struct {
     matcher: TokenMatcher,
     next_state: usize,
     capture: ?Capture = null,
+    is_optional: bool = false,
 };
 
 pub const EventInfo = struct {
@@ -83,6 +84,7 @@ const MutableTransition = struct {
     matcher: TokenMatcher,
     next_state: usize,
     capture: ?Capture,
+    is_optional: bool,
 };
 
 const MutableState = struct {
@@ -106,7 +108,8 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
         var current: usize = 0;
 
         // Walk/create path through trie
-        for (pattern.sequence, 0..) |matcher, seq_idx| {
+        for (pattern.sequence, 0..) |elem, seq_idx| {
+            const matcher = elem.matcher;
             const existing = findTransition(builder.items[current].transitions.items, matcher);
             if (existing) |next_state| {
                 current = next_state;
@@ -122,6 +125,7 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
                     .matcher = matcher,
                     .next_state = new_state,
                     .capture = cap,
+                    .is_optional = elem.is_optional,
                 });
                 current = new_state;
             }
@@ -197,6 +201,7 @@ fn freezeTransitions(mutable: []const MutableTransition, allocator: std.mem.Allo
             .matcher = mt.matcher,
             .next_state = mt.next_state,
             .capture = mt.capture,
+            .is_optional = mt.is_optional,
         });
     }
     return result.toOwnedSlice(allocator);
@@ -215,9 +220,9 @@ test "compile: single pattern produces correct state count" {
     const patterns = &[_]Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .keyword_literal = "fn" },
-            .{ .identifier = {} },
-            .{ .symbol_literal = "(" },
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .identifier = {} } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
         },
         .captures = &.{},
     }};
@@ -243,18 +248,18 @@ test "compile: shared prefix" {
         .{
             .type_name = "function",
             .sequence = &.{
-                .{ .keyword_literal = "fn" },
-                .{ .identifier = {} },
-                .{ .symbol_literal = "(" },
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
             },
             .captures = &.{},
         },
         .{
             .type_name = "fn_block",
             .sequence = &.{
-                .{ .keyword_literal = "fn" },
-                .{ .identifier = {} },
-                .{ .symbol_literal = "{" },
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .symbol_literal = "{" } },
             },
             .captures = &.{},
         },
@@ -286,7 +291,7 @@ test "step: matching token returns next state" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
         .captures = &.{},
     }};
 
@@ -305,7 +310,7 @@ test "step: matching identifier_literal returns next state" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "test",
-        .sequence = &.{.{ .identifier_literal = "Config" }},
+        .sequence = &.{.{ .matcher = .{ .identifier_literal = "Config" } }},
         .captures = &.{},
     }};
 
@@ -329,7 +334,7 @@ test "step: non-matching token returns null" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
         .captures = &.{},
     }};
 
@@ -348,8 +353,8 @@ test "step: capture returns value" {
     const patterns = &[_]Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .keyword_literal = "fn" },
-            .{ .capture = .{ .field_name = "name", .position = 1 } },
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -387,12 +392,12 @@ test "property: automaton structural invariants" {
             const alloc = arena.allocator();
 
             // Build a pattern of the given length with alternating keyword/identifier
-            var seq: std.ArrayList(TokenMatcher) = .empty;
+            var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..pattern_len) |i| {
                 if (i % 2 == 0) {
-                    try seq.append(alloc, .{ .keyword_literal = "kw" });
+                    try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
                 } else {
-                    try seq.append(alloc, .{ .identifier = {} });
+                    try seq.append(alloc, .{ .matcher = .{ .identifier = {} } });
                 }
             }
 
@@ -429,9 +434,9 @@ test "property: pattern path correctness" {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            var seq: std.ArrayList(TokenMatcher) = .empty;
+            var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..pattern_len) |_| {
-                try seq.append(alloc, .{ .keyword_literal = "x" });
+                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "x" } });
             }
 
             const patterns = &[_]Pattern{.{
@@ -466,14 +471,14 @@ test "property: prefix sharing" {
             const alloc = arena.allocator();
 
             // Two patterns sharing a prefix of prefix_len keywords, then diverging
-            var seq1: std.ArrayList(TokenMatcher) = .empty;
-            var seq2: std.ArrayList(TokenMatcher) = .empty;
+            var seq1: std.ArrayList(loader.SequenceElement) = .empty;
+            var seq2: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..prefix_len) |_| {
-                try seq1.append(alloc, .{ .keyword_literal = "shared" });
-                try seq2.append(alloc, .{ .keyword_literal = "shared" });
+                try seq1.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
+                try seq2.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
             }
-            try seq1.append(alloc, .{ .symbol_literal = "(" });
-            try seq2.append(alloc, .{ .symbol_literal = "{" });
+            try seq1.append(alloc, .{ .matcher = .{ .symbol_literal = "(" } });
+            try seq2.append(alloc, .{ .matcher = .{ .symbol_literal = "{" } });
 
             const patterns = &[_]Pattern{
                 .{ .type_name = "a", .sequence = seq1.items, .captures = &.{} },
@@ -529,7 +534,7 @@ test "step: keyword match returns full_match quality" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
         .captures = &.{},
     }};
 
@@ -548,7 +553,7 @@ test "step: identifier matching keyword_literal returns relaxed_match quality" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
         .captures = &.{},
     }};
 
@@ -568,7 +573,7 @@ test "step: non-keyword non-identifier token does not match keyword_literal" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
         .captures = &.{},
     }};
 

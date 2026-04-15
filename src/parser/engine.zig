@@ -72,10 +72,10 @@ fn shouldSkip(kind: TokenKind) bool {
 }
 
 /// Computes the max possible confidence score for a pattern's matchers.
-fn patternMaxScore(sequence: []const TokenMatcher) f32 {
+fn patternMaxScore(sequence: []const loader.SequenceElement) f32 {
     var total: f32 = 0.0;
-    for (sequence) |m| {
-        total += switch (m) {
+    for (sequence) |elem| {
+        total += switch (elem.matcher) {
             .keyword_literal => events_mod.evidence_weights.keyword,
             .symbol_literal => events_mod.evidence_weights.symbol,
             .identifier, .capture, .identifier_literal => events_mod.evidence_weights.identifier,
@@ -276,11 +276,211 @@ pub fn parse(
                 matched_qualities.clearRetainingCapacity();
             }
         } else {
-            state = 0;
-            pending_captures.clearRetainingCapacity();
-            matched_kinds.clearRetainingCapacity();
-            matched_texts.clearRetainingCapacity();
-            matched_qualities.clearRetainingCapacity();
+            // No match from current state — check for optional transitions to skip
+            var skipped = false;
+            if (state > 0) {
+                // Try skipping optional transitions from the current state
+                var skip_state = state;
+                while (true) {
+                    const current_transitions = automaton.states[skip_state].transitions;
+                    var found_optional = false;
+                    for (current_transitions) |tr| {
+                        if (tr.is_optional) {
+                            // Skip this optional element (record nothing for it)
+                            skip_state = tr.next_state;
+                            found_optional = true;
+                            break;
+                        }
+                    }
+                    if (!found_optional) break;
+
+                    // Check if the new state is a terminal state
+                    if (automaton.states[skip_state].event != null) {
+                        // We've reached a terminal state by skipping optionals
+                        state = skip_state;
+                        skipped = true;
+                        break;
+                    }
+
+                    // Try matching the current token from the new state
+                    if (automaton.step(skip_state, token, source)) |skip_step_result| {
+                        state = skip_step_result.next;
+                        try matched_kinds.append(allocator, token.kind);
+                        try matched_texts.append(allocator, text);
+                        try matched_qualities.append(allocator, skip_step_result.match_quality);
+
+                        if (skip_step_result.capture) |cap| {
+                            try pending_captures.append(allocator, .{
+                                .field_name = cap.field_name,
+                                .value = cap.value,
+                            });
+                        }
+                        skipped = true;
+                        break;
+                    }
+                    // Token still doesn't match — continue skipping if more optionals
+                }
+            }
+
+            if (!skipped) {
+                state = 0;
+                pending_captures.clearRetainingCapacity();
+                matched_kinds.clearRetainingCapacity();
+                matched_texts.clearRetainingCapacity();
+                matched_qualities.clearRetainingCapacity();
+            } else {
+                // After skipping, check if we landed on a terminal state
+                if (automaton.states[state].event) |event_info| {
+                    const pattern = findPattern(patterns, event_info.type_name);
+
+                    // Position constraint check
+                    if (pattern) |p| {
+                        if (p.position) |pos| {
+                            switch (pos) {
+                                .start => {
+                                    if (pattern_col != 0) {
+                                        state = 0;
+                                        pending_captures.clearRetainingCapacity();
+                                        matched_kinds.clearRetainingCapacity();
+                                        matched_texts.clearRetainingCapacity();
+                                        matched_qualities.clearRetainingCapacity();
+                                        continue;
+                                    }
+                                },
+                            }
+                        }
+                    }
+
+                    // Exclusion check
+                    if (pattern) |p| {
+                        if (p.exclude.len > 0) {
+                            var excluded = false;
+                            for (p.exclude) |exc| {
+                                if (lookback.contains(exc)) {
+                                    excluded = true;
+                                    break;
+                                }
+                            }
+                            if (excluded) {
+                                state = 0;
+                                pending_captures.clearRetainingCapacity();
+                                matched_kinds.clearRetainingCapacity();
+                                matched_texts.clearRetainingCapacity();
+                                matched_qualities.clearRetainingCapacity();
+                                continue;
+                            }
+                        }
+                    }
+
+                    // not_preceded_by check
+                    if (pattern) |p| {
+                        if (p.not_preceded_by.len > 0) {
+                            if (match_start_prev_token) |prev_text_val| {
+                                var rejected = false;
+                                for (p.not_preceded_by) |npb| {
+                                    if (std.mem.eql(u8, prev_text_val, npb)) {
+                                        rejected = true;
+                                        break;
+                                    }
+                                }
+                                if (rejected) {
+                                    state = 0;
+                                    pending_captures.clearRetainingCapacity();
+                                    matched_kinds.clearRetainingCapacity();
+                                    matched_texts.clearRetainingCapacity();
+                                    matched_qualities.clearRetainingCapacity();
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Minimum_Evidence: at least one required element must have matched
+                    var has_required_match = false;
+                    if (pattern) |p| {
+                        // Check if any matched element corresponds to a required element
+                        // matched_kinds tracks what we actually matched; if we matched anything, check
+                        // if the pattern has required elements that were matched
+                        if (matched_kinds.items.len > 0) {
+                            // We matched at least one token — check if any required element was matched
+                            // Since we only record matched tokens (not skipped optionals), any match
+                            // against a non-optional element counts
+                            for (p.sequence) |seq_elem| {
+                                if (!seq_elem.is_optional) {
+                                    // There's a required element in the pattern
+                                    // If we have any matches at all, at least one required element matched
+                                    // (because optional elements that matched would also be recorded)
+                                    has_required_match = matched_kinds.items.len > 0;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        has_required_match = matched_kinds.items.len > 0;
+                    }
+
+                    if (!has_required_match) {
+                        state = 0;
+                        pending_captures.clearRetainingCapacity();
+                        matched_kinds.clearRetainingCapacity();
+                        matched_texts.clearRetainingCapacity();
+                        matched_qualities.clearRetainingCapacity();
+                        continue;
+                    }
+
+                    // Compute confidence
+                    const max_score = if (pattern) |p| patternMaxScore(p.sequence) else 1.0;
+                    var matched_weights: f32 = 0.0;
+                    for (matched_kinds.items, matched_qualities.items) |kind, quality| {
+                        if (quality == .relaxed_match) {
+                            matched_weights += events_mod.evidence_weights.relaxed_keyword;
+                        } else {
+                            matched_weights += events_mod.weightForKind(kind);
+                        }
+                    }
+                    const confidence = events_mod.computeConfidence(matched_weights, max_score);
+
+                    if (confidence >= 0.3) {
+                        var pattern_line: usize = 1;
+                        for (tokens) |t| {
+                            if (t.start == pattern_start) {
+                                pattern_line = t.line;
+                                break;
+                            }
+                        }
+
+                        pending_captures.clearRetainingCapacity();
+                        if (pattern) |p| {
+                            for (p.captures) |cap| {
+                                if (cap.position < matched_texts.items.len) {
+                                    try pending_captures.append(allocator, .{
+                                        .field_name = cap.field_name,
+                                        .value = matched_texts.items[cap.position],
+                                    });
+                                }
+                            }
+                        }
+
+                        try result.append(allocator, .{
+                            .type_name = event_info.type_name,
+                            .captures = try pending_captures.toOwnedSlice(allocator),
+                            .start = pattern_start,
+                            .end = token.end,
+                            .line = pattern_line,
+                            .col = pattern_col,
+                            .confidence = confidence,
+                            .block_start = block_stack.top(),
+                        });
+                    } else {
+                        pending_captures.clearRetainingCapacity();
+                    }
+
+                    state = 0;
+                    matched_kinds.clearRetainingCapacity();
+                    matched_texts.clearRetainingCapacity();
+                    matched_qualities.clearRetainingCapacity();
+                }
+            }
         }
     }
 
@@ -311,9 +511,9 @@ test "parse: single pattern match emits event" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .keyword_literal = "fn" },
-            .{ .capture = .{ .field_name = "name", .position = 1 } },
-            .{ .symbol_literal = "(" },
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -345,8 +545,8 @@ test "parse: identifier_literal matching pattern emits event" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "test_literal",
         .sequence = &.{
-            .{ .identifier_literal = "Config" },
-            .{ .symbol_literal = "(" },
+            .{ .matcher = .{ .identifier_literal = "Config" } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
         },
         .captures = &.{},
     }};
@@ -373,7 +573,7 @@ test "parse: no matching pattern emits nothing" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .keyword_literal = "fn" }, .{ .identifier = {} } },
+        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
         .captures = &.{},
     }};
 
@@ -395,7 +595,7 @@ test "parse: skip tokens between structural tokens" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .keyword_literal = "fn" }, .{ .identifier = {} } },
+        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
         .captures = &.{},
     }};
 
@@ -423,9 +623,9 @@ test "parse: confidence computation for known tokens" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .keyword_literal = "fn" },
-            .{ .identifier = {} },
-            .{ .symbol_literal = "(" },
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .identifier = {} } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
         },
         .captures = &.{},
     }};
@@ -451,7 +651,7 @@ test "parse: multiple pattern matches" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
     }};
 
@@ -525,7 +725,7 @@ test "parse: position = start at col 0 emits event" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .keyword_literal = "fn" }, .{ .identifier = {} } },
+        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
         .captures = &.{},
         .position = .start,
     }};
@@ -549,7 +749,7 @@ test "parse: position = start at col > 0 discards event" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .keyword_literal = "fn" }, .{ .identifier = {} } },
+        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
         .captures = &.{},
         .position = .start,
     }};
@@ -572,7 +772,7 @@ test "parse: exclude with matching lookback discards event" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
         .exclude = &.{"-spec"},
     }};
@@ -597,7 +797,7 @@ test "parse: exclude with no matching lookback emits event" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
         .exclude = &.{"-spec"},
     }};
@@ -620,7 +820,7 @@ test "parse: block delimiters set block_start on events" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
     }};
 
@@ -645,7 +845,7 @@ test "parse: no blocks section means block_start is null" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
     }};
 
@@ -668,7 +868,7 @@ test "parse: unmatched close delimiter does not crash" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
     }};
 
@@ -704,8 +904,8 @@ test "property: engine pattern match correctness" {
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .keyword_literal = "fn" },
-                    .{ .capture = .{ .field_name = "name", .position = 1 } },
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
                 },
                 .captures = &.{.{ .field_name = "name", .position = 1 }},
             }};
@@ -742,7 +942,7 @@ test "property: engine skip token transparency" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "function",
-                .sequence = &.{ .{ .keyword_literal = "fn" }, .{ .identifier = {} } },
+                .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
                 .captures = &.{},
             }};
 
@@ -777,7 +977,7 @@ test "property: event field invariants" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
                 .captures = &.{},
             }};
 
@@ -838,7 +1038,7 @@ test "property: position constraint enforcement" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "function",
-                .sequence = &.{ .{ .keyword_literal = "fn" }, .{ .identifier = {} } },
+                .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
                 .captures = &.{},
                 .position = .start,
             }};
@@ -872,7 +1072,7 @@ test "property: exclusion pattern discards matches" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
                 .captures = &.{},
                 .exclude = &.{exc_token},
             }};
@@ -946,7 +1146,7 @@ test "property: block stack annotates events correctly" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
                 .captures = &.{},
             }};
 
@@ -987,7 +1187,7 @@ test "parse: not_preceded_by rejects match when preceding token matches" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
         .not_preceded_by = &.{"fun"},
     }};
@@ -1012,7 +1212,7 @@ test "parse: not_preceded_by allows match when preceding token does not match" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
         .not_preceded_by = &.{"fun"},
     }};
@@ -1038,7 +1238,7 @@ test "parse: not_preceded_by passes at start of stream (no preceding token)" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
         .not_preceded_by = &.{"fun"},
     }};
@@ -1064,7 +1264,7 @@ test "parse: combined position, exclude, and not_preceded_by constraints" {
     // Pattern with all three constraints
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
         .captures = &.{},
         .position = .start,
         .exclude = &.{"-spec"},
@@ -1125,7 +1325,7 @@ test "property: engine not_preceded_by constraint enforcement" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
                 .captures = &.{},
                 .not_preceded_by = &.{npb_entry},
             }};
@@ -1186,7 +1386,7 @@ test "property: engine checks only most recent preceding non-skip token" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
                 .captures = &.{},
                 .not_preceded_by = &.{npb_entry},
             }};
@@ -1258,7 +1458,7 @@ test "property: engine evaluates exclude and not_preceded_by independently" {
 
             const patterns_both = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .identifier = {} }, .{ .symbol_literal = "(" } },
+                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
                 .captures = &.{},
                 .exclude = &.{exc_entry},
                 .not_preceded_by = &.{npb_entry},
@@ -1412,11 +1612,11 @@ test "property: relaxed match produces lower confidence than full match" {
             const alloc = arena.allocator();
 
             // Build a pattern with num_keywords keyword_literals + 1 symbol
-            var seq: std.ArrayList(TokenMatcher) = .empty;
+            var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..num_keywords) |_| {
-                try seq.append(alloc, .{ .keyword_literal = "kw" });
+                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
             }
-            try seq.append(alloc, .{ .symbol_literal = "(" });
+            try seq.append(alloc, .{ .matcher = .{ .symbol_literal = "(" } });
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "test",
@@ -1481,9 +1681,9 @@ test "property: backward compatibility full keyword match produces confidence 1.
             const alloc = arena.allocator();
 
             // Build a pattern of all keyword_literals
-            var seq: std.ArrayList(TokenMatcher) = .empty;
+            var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..num_keywords) |_| {
-                try seq.append(alloc, .{ .keyword_literal = "kw" });
+                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
             }
 
             const patterns = &[_]loader.Pattern{.{
@@ -1541,18 +1741,18 @@ test "property: perfect match produces confidence 1.0" {
             const alloc = arena.allocator();
 
             // Build a mixed pattern: keyword + identifier alternating
-            var seq: std.ArrayList(TokenMatcher) = .empty;
+            var seq: std.ArrayList(loader.SequenceElement) = .empty;
             var tokens_list: std.ArrayList(Token) = .empty;
             var buf: [256]u8 = undefined;
             var offset: usize = 0;
 
             for (0..pattern_len) |i| {
                 if (i % 2 == 0) {
-                    try seq.append(alloc, .{ .keyword_literal = "kw" });
+                    try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
                     @memcpy(buf[offset .. offset + 2], "kw");
                     try tokens_list.append(alloc, .{ .kind = .keyword, .start = offset, .end = offset + 2, .line = 1, .col = offset });
                 } else {
-                    try seq.append(alloc, .{ .identifier = {} });
+                    try seq.append(alloc, .{ .matcher = .{ .identifier = {} } });
                     @memcpy(buf[offset .. offset + 2], "id");
                     try tokens_list.append(alloc, .{ .kind = .identifier, .start = offset, .end = offset + 2, .line = 1, .col = offset });
                 }
@@ -1586,9 +1786,9 @@ test "parse: keyword as identifier token produces confidence < 1.0 (relaxed matc
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .keyword_literal = "fn" },
-            .{ .identifier = {} },
-            .{ .symbol_literal = "(" },
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .identifier = {} } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
         },
         .captures = &.{},
     }};
@@ -1617,9 +1817,9 @@ test "parse: full keyword match produces confidence = 1.0" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .keyword_literal = "fn" },
-            .{ .identifier = {} },
-            .{ .symbol_literal = "(" },
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .identifier = {} } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
         },
         .captures = &.{},
     }};
@@ -1647,9 +1847,9 @@ test "parse: mixed relaxed and full matches in same pattern" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "pub_function",
         .sequence = &.{
-            .{ .keyword_literal = "pub" },
-            .{ .keyword_literal = "fn" },
-            .{ .identifier = {} },
+            .{ .matcher = .{ .keyword_literal = "pub" } },
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .identifier = {} } },
         },
         .captures = &.{},
     }};
@@ -1666,6 +1866,212 @@ test "parse: mixed relaxed and full matches in same pattern" {
     const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // full(0.5) + relaxed(0.1) + identifier(0.2) = 0.8 / (0.5+0.5+0.2) = 0.8/1.2 ≈ 0.667
+    try testing.expect(result[0].confidence < 1.0);
+    try testing.expect(result[0].confidence > 0.3);
+}
+
+// --- Phase 2: Optional Element Tests ---
+
+// Feature: probabilistic-confidence-scoring, Property 5: Optional elements affect confidence monotonically
+// **Validates: Requirements 2.2, 2.3, 7.4**
+test "property: optional elements affect confidence monotonically" {
+    // Generate a boolean to decide if we include 1 or 2 optional elements
+    const opt_gen = gen.boolean();
+
+    try minish.check(testing.allocator, opt_gen, struct {
+        fn prop(two_optionals: bool) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Pattern: "fn" "$name:IDENTIFIER" "("? or "fn" "$name:IDENTIFIER" "("? "{"?
+            // Required: fn, $name:IDENTIFIER
+            // Optional: ( and optionally {
+            var seq: std.ArrayList(loader.SequenceElement) = .empty;
+            try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "fn" } });
+            try seq.append(alloc, .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } });
+            try seq.append(alloc, .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true });
+            if (two_optionals) {
+                try seq.append(alloc, .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = true });
+            }
+
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "function",
+                .sequence = seq.items,
+                .captures = &.{.{ .field_name = "name", .position = 1 }},
+            }};
+
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // Full match: all tokens present (fn as .keyword, identifier, ( as .delimiter, optionally { as .delimiter)
+            // "fn add(" = f(0)n(1) (2)a(3)d(4)d(5)((6) → len 7
+            // "fn add( {" = ...((6) (7){(8) → len 9 — but we use "fn add({" = ...((6){(7) → len 8
+            const full_source = if (two_optionals) "fn add({" else "fn add(";
+            var full_tokens: std.ArrayList(Token) = .empty;
+            try full_tokens.append(alloc, .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 });
+            try full_tokens.append(alloc, .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 });
+            try full_tokens.append(alloc, .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 });
+            if (two_optionals) {
+                try full_tokens.append(alloc, .{ .kind = .delimiter, .start = 7, .end = 8, .line = 1, .col = 7 });
+            }
+
+            const full_result = try parse(automaton, full_tokens.items, full_source, patterns, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), full_result.len);
+
+            // All-present confidence should be 1.0
+            try testing.expectApproxEqRel(@as(f32, 1.0), full_result[0].confidence, 0.01);
+
+            // Partial match: required tokens present (fn, identifier), then a non-matching token
+            // triggers the optional skip logic. The ";" doesn't match "(" so the engine skips the optional.
+            const partial_source = "fn add;";
+            const partial_tokens = &[_]Token{
+                .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+                .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+                .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
+            };
+
+            const partial_result = try parse(automaton, partial_tokens, partial_source, patterns, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), partial_result.len);
+
+            // Partial confidence should be < 1.0
+            try testing.expect(partial_result[0].confidence < 1.0);
+
+            // Monotonicity: all-present > some-absent
+            try testing.expect(full_result[0].confidence > partial_result[0].confidence);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 2: Optional Element Unit Tests (engine) ---
+
+test "parse: optional element present produces confidence = 1.0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern: "fn" "$name:IDENTIFIER" "("?
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 1 }},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add(";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
+}
+
+test "parse: optional element absent produces confidence < 1.0 but event still emitted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern: "fn" "$name:IDENTIFIER" "("?
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 1 }},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    // "fn add;" — no "(" present, ";" triggers optional skip
+    const source = "fn add;";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    // Confidence should be < 1.0 because optional element is absent
+    // matched: keyword(0.5) + identifier(0.2) = 0.7
+    // max: keyword(0.5) + identifier(0.2) + symbol(0.2) = 0.9
+    // confidence = 0.7 / 0.9 ≈ 0.778
+    try testing.expect(result[0].confidence < 1.0);
+    try testing.expect(result[0].confidence > 0.3);
+    try testing.expectEqualStrings("function", result[0].type_name);
+}
+
+test "parse: all-optional pattern with none matching emits no event (Minimum_Evidence)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern with only optional elements
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "test",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" }, .is_optional = true },
+            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    // Tokens that don't match any element in the pattern
+    const source = "let x";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 3, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 4, .end = 5, .line = 1, .col = 4 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    // No event should be emitted — Minimum_Evidence rule: at least one required element must match
+    try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "parse: mix of required and optional, optional absent produces confidence < 1.0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern: "fn" "$name:IDENTIFIER" "("? "{"?
+    // Required: fn, $name:IDENTIFIER
+    // Optional: (, {
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
+            .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = true },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 1 }},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // Only required elements present, both optionals absent
+    // ";" triggers the optional skip logic
+    const source = "fn add;";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    // matched: keyword(0.5) + identifier(0.2) = 0.7
+    // max: keyword(0.5) + identifier(0.2) + symbol(0.2) + symbol(0.2) = 1.1
+    // confidence = 0.7 / 1.1 ≈ 0.636
     try testing.expect(result[0].confidence < 1.0);
     try testing.expect(result[0].confidence > 0.3);
 }

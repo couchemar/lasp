@@ -20,9 +20,14 @@ pub const PositionConstraint = enum {
     start, // column 0
 };
 
+pub const SequenceElement = struct {
+    matcher: TokenMatcher,
+    is_optional: bool = false,
+};
+
 pub const Pattern = struct {
     type_name: []const u8,
-    sequence: []const TokenMatcher,
+    sequence: []const SequenceElement,
     captures: []const Capture,
     position: ?PositionConstraint = null,
     exclude: []const []const u8 = &.{},
@@ -69,8 +74,17 @@ fn isSymbolOrDelimiter(s: []const u8) bool {
     return false;
 }
 
-/// Parses a single pattern sequence string into a TokenMatcher.
-fn parseSequenceElement(s: []const u8, position: usize, allocator: std.mem.Allocator) GrammarError!struct { matcher: TokenMatcher, capture: ?Capture } {
+/// Parses a single pattern sequence string into a SequenceElement.
+/// Handles trailing `?` suffix for optional elements.
+fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.Allocator) GrammarError!struct { element: SequenceElement, capture: ?Capture } {
+    // Check for trailing `?` suffix (optional element)
+    var s = raw;
+    var optional = false;
+    if (s.len > 1 and s[s.len - 1] == '?') {
+        optional = true;
+        s = s[0 .. s.len - 1];
+    }
+
     // Capture: $name:IDENTIFIER
     if (s.len > 0 and s[0] == '$') {
         const colon_idx = std.mem.indexOf(u8, s, ":") orelse return error.InvalidCaptureFormat;
@@ -79,23 +93,23 @@ fn parseSequenceElement(s: []const u8, position: usize, allocator: std.mem.Alloc
         if (!std.mem.eql(u8, suffix, "IDENTIFIER")) return error.InvalidCaptureFormat;
         const field_name = try allocator.dupe(u8, s[1..colon_idx]);
         const cap = Capture{ .field_name = field_name, .position = position };
-        return .{ .matcher = .{ .capture = cap }, .capture = cap };
+        return .{ .element = .{ .matcher = .{ .capture = cap }, .is_optional = optional }, .capture = cap };
     }
     // Identifier wildcard
     if (std.mem.eql(u8, s, "identifier")) {
-        return .{ .matcher = .{ .identifier = {} }, .capture = null };
+        return .{ .element = .{ .matcher = .{ .identifier = {} }, .is_optional = optional }, .capture = null };
     }
     // EXACT IDENTIFIER matching (Config:IDENTIFIER)
     if (std.mem.endsWith(u8, s, ":IDENTIFIER") and s.len > 11 and s[0] != '$') {
         const exact_text = try allocator.dupe(u8, s[0 .. s.len - 11]);
-        return .{ .matcher = .{ .identifier_literal = exact_text }, .capture = null };
+        return .{ .element = .{ .matcher = .{ .identifier_literal = exact_text }, .is_optional = optional }, .capture = null };
     }
     // Symbol/delimiter literal (single char)
     if (isSymbolOrDelimiter(s)) {
-        return .{ .matcher = .{ .symbol_literal = try allocator.dupe(u8, s) }, .capture = null };
+        return .{ .element = .{ .matcher = .{ .symbol_literal = try allocator.dupe(u8, s) }, .is_optional = optional }, .capture = null };
     }
     // Keyword literal
-    return .{ .matcher = .{ .keyword_literal = try allocator.dupe(u8, s) }, .capture = null };
+    return .{ .element = .{ .matcher = .{ .keyword_literal = try allocator.dupe(u8, s) }, .is_optional = optional }, .capture = null };
 }
 
 /// Parses a TOML grammar file from bytes into a Grammar struct.
@@ -148,12 +162,12 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         const seq_val = pattern_table.get("sequence") orelse return error.EmptyPatternSequence;
         if (seq_val.array.items.len == 0) return error.EmptyPatternSequence;
 
-        var matchers: std.ArrayList(TokenMatcher) = .empty;
+        var matchers: std.ArrayList(SequenceElement) = .empty;
         var captures: std.ArrayList(Capture) = .empty;
 
         for (seq_val.array.items, 0..) |item, idx| {
             const result = try parseSequenceElement(item.string, idx, allocator);
-            try matchers.append(allocator, result.matcher);
+            try matchers.append(allocator, result.element);
             if (result.capture) |cap| {
                 try captures.append(allocator, cap);
             }
@@ -254,10 +268,10 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
         try w.writeAll("[[patterns]]\ntype = \"");
         try w.writeAll(pattern.type_name);
         try w.writeAll("\"\nsequence = [");
-        for (pattern.sequence, 0..) |matcher, i| {
+        for (pattern.sequence, 0..) |elem, i| {
             if (i > 0) try w.writeAll(", ");
             try w.writeAll("\"");
-            switch (matcher) {
+            switch (elem.matcher) {
                 .keyword_literal => |kw| try w.writeAll(kw),
                 .symbol_literal => |sym| try w.writeAll(sym),
                 .identifier => try w.writeAll("identifier"),
@@ -271,6 +285,7 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                     try w.writeAll(":IDENTIFIER");
                 },
             }
+            if (elem.is_optional) try w.writeAll("?");
             try w.writeAll("\"");
         }
         try w.writeAll("]\n");
@@ -404,11 +419,11 @@ test "parseGrammar: capture parsing" {
 
     const seq = grammar.patterns[0].sequence;
     try testing.expectEqual(@as(usize, 3), seq.len);
-    try testing.expect(seq[0] == .keyword_literal);
-    try testing.expect(seq[1] == .capture);
-    try testing.expectEqualStrings("name", seq[1].capture.field_name);
-    try testing.expectEqual(@as(usize, 1), seq[1].capture.position);
-    try testing.expect(seq[2] == .symbol_literal);
+    try testing.expect(seq[0].matcher == .keyword_literal);
+    try testing.expect(seq[1].matcher == .capture);
+    try testing.expectEqualStrings("name", seq[1].matcher.capture.field_name);
+    try testing.expectEqual(@as(usize, 1), seq[1].matcher.capture.position);
+    try testing.expect(seq[2].matcher == .symbol_literal);
 }
 
 test "parseGrammar: identifier_literal parsing" {
@@ -424,9 +439,9 @@ test "parseGrammar: identifier_literal parsing" {
 
     const seq = grammar.patterns[0].sequence;
     try testing.expectEqual(@as(usize, 2), seq.len);
-    try testing.expect(seq[0] == .identifier_literal);
-    try testing.expectEqualStrings("Config", seq[0].identifier_literal);
-    try testing.expect(seq[1] == .identifier);
+    try testing.expect(seq[0].matcher == .identifier_literal);
+    try testing.expectEqualStrings("Config", seq[0].matcher.identifier_literal);
+    try testing.expect(seq[1].matcher == .identifier);
 }
 
 test "parseGrammar: missing patterns returns error" {
@@ -622,8 +637,8 @@ test "formatGrammar: serializes non-empty not_preceded_by, omits when empty" {
             .{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .capture = .{ .field_name = "name", .position = 0 } },
-                    .{ .symbol_literal = "(" },
+                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .symbol_literal = "(" } },
                 },
                 .captures = &.{
                     .{ .field_name = "name", .position = 0 },
@@ -646,8 +661,8 @@ test "formatGrammar: serializes non-empty not_preceded_by, omits when empty" {
             .{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .capture = .{ .field_name = "name", .position = 0 } },
-                    .{ .symbol_literal = "(" },
+                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .symbol_literal = "(" } },
                 },
                 .captures = &.{
                     .{ .field_name = "name", .position = 0 },
@@ -718,9 +733,9 @@ test "property: grammar TOML round-trip" {
                     .{
                         .type_name = "function",
                         .sequence = &.{
-                            .{ .keyword_literal = "fn" },
-                            .{ .capture = .{ .field_name = "name", .position = 1 } },
-                            .{ .symbol_literal = "(" },
+                            .{ .matcher = .{ .keyword_literal = "fn" } },
+                            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                            .{ .matcher = .{ .symbol_literal = "(" } },
                         },
                         .captures = &.{
                             .{ .field_name = "name", .position = 1 },
@@ -776,9 +791,9 @@ test "property: grammar TOML round-trip with position and exclude" {
                     .{
                         .type_name = "function",
                         .sequence = &.{
-                            .{ .keyword_literal = "fn" },
-                            .{ .capture = .{ .field_name = "name", .position = 1 } },
-                            .{ .symbol_literal = "(" },
+                            .{ .matcher = .{ .keyword_literal = "fn" } },
+                            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                            .{ .matcher = .{ .symbol_literal = "(" } },
                         },
                         .captures = &.{
                             .{ .field_name = "name", .position = 1 },
@@ -840,9 +855,9 @@ test "property: grammar TOML round-trip with not_preceded_by" {
                     .{
                         .type_name = "function",
                         .sequence = &.{
-                            .{ .keyword_literal = "fn" },
-                            .{ .capture = .{ .field_name = "name", .position = 1 } },
-                            .{ .symbol_literal = "(" },
+                            .{ .matcher = .{ .keyword_literal = "fn" } },
+                            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                            .{ .matcher = .{ .symbol_literal = "(" } },
                         },
                         .captures = &.{
                             .{ .field_name = "name", .position = 1 },
@@ -1278,4 +1293,184 @@ test "property: non-empty block delimiters preserved" {
             try testing.expectEqualStrings(close_delim, grammar.blocks.close.?);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 2: Optional Element Tests ---
+
+// Feature: probabilistic-confidence-scoring, Property 4: Optional element parsing round-trip
+// **Validates: Requirements 2.1, 2.5, 2.6**
+test "property: optional element parsing round-trip" {
+    // Generate a random boolean for is_optional and a random matcher type (0-3)
+    // 0 = keyword_literal, 1 = symbol_literal, 2 = identifier, 3 = identifier_literal
+    const pair_gen = comptime gen.tuple2(
+        bool,
+        u8,
+        gen.boolean(),
+        gen.intRange(u8, 0, 3),
+    );
+
+    try minish.check(testing.allocator, pair_gen, struct {
+        fn prop(vals: struct { bool, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const is_optional = vals[0];
+            const matcher_type = vals[1];
+
+            // Build a Grammar with a single pattern containing one element
+            const elem: SequenceElement = switch (matcher_type) {
+                0 => .{ .matcher = .{ .keyword_literal = "fn" }, .is_optional = is_optional },
+                1 => .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = is_optional },
+                2 => .{ .matcher = .{ .identifier = {} }, .is_optional = is_optional },
+                3 => .{ .matcher = .{ .identifier_literal = "Config" }, .is_optional = is_optional },
+                else => unreachable,
+            };
+
+            // We need at least one required element for a valid pattern,
+            // so add a required keyword before the test element
+            const original = Grammar{
+                .language_name = "test",
+                .keyword_categories = &.{},
+                .keyword_table = &.{},
+                .patterns = &.{
+                    .{
+                        .type_name = "test_pattern",
+                        .sequence = &.{
+                            .{ .matcher = .{ .keyword_literal = "def" } },
+                            elem,
+                        },
+                        .captures = &.{},
+                    },
+                },
+                .blocks = .{},
+            };
+
+            // Round-trip: format → parse
+            const toml_str = try formatGrammar(original, alloc);
+            const parsed = try parseGrammar(toml_str, alloc);
+
+            // Verify the second element's is_optional flag is preserved
+            try testing.expectEqual(@as(usize, 1), parsed.patterns.len);
+            try testing.expectEqual(@as(usize, 2), parsed.patterns[0].sequence.len);
+
+            const parsed_elem = parsed.patterns[0].sequence[1];
+            try testing.expectEqual(is_optional, parsed_elem.is_optional);
+
+            // Verify the matcher type is preserved
+            const orig_tag: u3 = switch (elem.matcher) {
+                .keyword_literal => 0,
+                .symbol_literal => 1,
+                .identifier => 2,
+                .capture => 3,
+                .identifier_literal => 4,
+            };
+            const parsed_tag: u3 = switch (parsed_elem.matcher) {
+                .keyword_literal => 0,
+                .symbol_literal => 1,
+                .identifier => 2,
+                .capture => 3,
+                .identifier_literal => 4,
+            };
+            try testing.expectEqual(orig_tag, parsed_tag);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 2: Optional Element Unit Tests (loader) ---
+
+test "parseGrammar: optional symbol_literal with ? suffix" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "{?"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    const seq = grammar.patterns[0].sequence;
+    try testing.expectEqual(@as(usize, 3), seq.len);
+    // "{?" → symbol_literal "{" with is_optional = true
+    try testing.expect(seq[2].matcher == .symbol_literal);
+    try testing.expectEqualStrings("{", seq[2].matcher.symbol_literal);
+    try testing.expect(seq[2].is_optional);
+    // First two elements should NOT be optional
+    try testing.expect(!seq[0].is_optional);
+    try testing.expect(!seq[1].is_optional);
+}
+
+test "parseGrammar: optional keyword_literal with ? suffix" {
+    const source =
+        \\[[patterns]]
+        \\type = "test"
+        \\sequence = ["fn?", "identifier"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    const seq = grammar.patterns[0].sequence;
+    try testing.expectEqual(@as(usize, 2), seq.len);
+    // "fn?" → keyword_literal "fn" with is_optional = true
+    try testing.expect(seq[0].matcher == .keyword_literal);
+    try testing.expectEqualStrings("fn", seq[0].matcher.keyword_literal);
+    try testing.expect(seq[0].is_optional);
+    // "identifier" → identifier with is_optional = false
+    try testing.expect(seq[1].matcher == .identifier);
+    try testing.expect(!seq[1].is_optional);
+}
+
+test "parseGrammar: optional identifier with ? suffix" {
+    const source =
+        \\[[patterns]]
+        \\type = "test"
+        \\sequence = ["fn", "identifier?"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    const seq = grammar.patterns[0].sequence;
+    try testing.expectEqual(@as(usize, 2), seq.len);
+    // "identifier?" → identifier with is_optional = true
+    try testing.expect(seq[1].matcher == .identifier);
+    try testing.expect(seq[1].is_optional);
+}
+
+test "formatGrammar: round-trip preserves optional elements" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const original = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .identifier = {} } },
+                    .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = true },
+                },
+                .captures = &.{},
+            },
+        },
+        .blocks = .{},
+    };
+
+    const toml_str = try formatGrammar(original, alloc);
+    const parsed = try parseGrammar(toml_str, alloc);
+
+    try testing.expectEqual(@as(usize, 3), parsed.patterns[0].sequence.len);
+    try testing.expect(!parsed.patterns[0].sequence[0].is_optional);
+    try testing.expect(!parsed.patterns[0].sequence[1].is_optional);
+    try testing.expect(parsed.patterns[0].sequence[2].is_optional);
+    try testing.expect(parsed.patterns[0].sequence[2].matcher == .symbol_literal);
+    try testing.expectEqualStrings("{", parsed.patterns[0].sequence[2].matcher.symbol_literal);
 }
