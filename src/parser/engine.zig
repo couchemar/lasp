@@ -151,6 +151,10 @@ pub fn parse(
     var pattern_start: usize = 0;
     var pattern_col: usize = 0;
 
+    // Phase 4: Noise penalty infrastructure
+    var noise_count: u32 = 0;
+    var delim_depth: u32 = 0;
+
     for (tokens) |token| {
         const text = source[token.start..token.end];
 
@@ -163,6 +167,19 @@ pub fn parse(
         if (blocks.close) |close| {
             if (std.mem.eql(u8, text, close)) {
                 block_stack.pop();
+            }
+        }
+
+        // Balanced delimiter depth tracking for noise exclusion (Phase 4)
+        if (token.kind == .delimiter) {
+            if (text.len == 1) {
+                switch (text[0]) {
+                    '(', '{', '[' => delim_depth += 1,
+                    ')', '}', ']' => {
+                        if (delim_depth > 0) delim_depth -= 1;
+                    },
+                    else => {},
+                }
             }
         }
 
@@ -187,6 +204,7 @@ pub fn parse(
                 pattern_start = token.start;
                 pattern_col = token.col;
                 match_start_prev_token = saved_prev;
+                noise_count = 0;
             }
             state = step_result.next;
             try matched_kinds.append(allocator, token.kind);
@@ -230,6 +248,7 @@ pub fn parse(
                         candidates.clearRetainingCapacity();
                     }
                     state = 0;
+                    noise_count = 0;
                     pending_captures.clearRetainingCapacity();
                     matched_kinds.clearRetainingCapacity();
                     matched_texts.clearRetainingCapacity();
@@ -298,6 +317,7 @@ pub fn parse(
                     candidates.clearRetainingCapacity();
                 }
                 state = 0;
+                noise_count = 0;
                 pending_captures.clearRetainingCapacity();
                 matched_kinds.clearRetainingCapacity();
                 matched_texts.clearRetainingCapacity();
@@ -308,6 +328,7 @@ pub fn parse(
                     pattern_start = token.start;
                     pattern_col = token.col;
                     match_start_prev_token = saved_prev;
+                    noise_count = 0;
                     state = retry_result.next;
                     try matched_kinds.append(allocator, token.kind);
                     try matched_texts.append(allocator, text);
@@ -342,6 +363,7 @@ pub fn parse(
 
                         if (!buffered) {
                             state = 0;
+                            noise_count = 0;
                             pending_captures.clearRetainingCapacity();
                             matched_kinds.clearRetainingCapacity();
                             matched_texts.clearRetainingCapacity();
@@ -379,6 +401,7 @@ pub fn parse(
                             candidates.clearRetainingCapacity();
                         }
                         state = 0;
+                        noise_count = 0;
                         pending_captures.clearRetainingCapacity();
                         matched_kinds.clearRetainingCapacity();
                         matched_texts.clearRetainingCapacity();
@@ -467,7 +490,7 @@ fn bufferCandidate(
             matched_weights += events_mod.weightForKind(kind);
         }
     }
-    const confidence = events_mod.computeConfidence(matched_weights, max_score);
+    const confidence = events_mod.computeConfidence(matched_weights, max_score, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
 
     if (confidence < 0.3) {
         pending_captures.clearRetainingCapacity();
@@ -1103,7 +1126,7 @@ test "property: confidence computation correctness" {
                 matched_weights += events_mod.evidence_weights.keyword;
             }
 
-            const confidence = events_mod.computeConfidence(matched_weights, max);
+            const confidence = events_mod.computeConfidence(matched_weights, max, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
             try testing.expectApproxEqRel(expected_score, confidence, 0.01);
         }
     }.prop, .{ .num_runs = 100 });
@@ -1808,7 +1831,7 @@ test "property: confidence always in 0.0 to 1.0" {
         fn prop(raw_val: u16) !void {
             const matched_weights: f32 = @as(f32, @floatFromInt(raw_val)) / 100.0;
             const pattern_max_score: f32 = 1.0;
-            const confidence = events_mod.computeConfidence(matched_weights, pattern_max_score);
+            const confidence = events_mod.computeConfidence(matched_weights, pattern_max_score, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
             try testing.expect(confidence >= 0.0);
             try testing.expect(confidence <= 1.0);
         }
@@ -2514,4 +2537,122 @@ test "property: competing patterns — highest confidence wins" {
             }
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 4: Noise Penalty Tests ---
+
+// Feature: probabilistic-confidence-scoring, Property 7: Noise penalty is bounded and monotonic
+// **Validates: Requirements 4.1, 4.2, 4.3, 7.5**
+test "property: noise penalty is bounded and monotonic" {
+    const noise_gen = gen.intRange(u32, 0, 20);
+
+    try minish.check(testing.allocator, noise_gen, struct {
+        fn prop(noise_count: u32) !void {
+            const matched_weights: f32 = 0.9; // typical full match
+            const pattern_max_score: f32 = 0.9;
+            const penalty_per_token: f32 = events_mod.default_noise_penalty_per_token;
+            const max_penalty: f32 = events_mod.default_max_noise_penalty;
+
+            // Verify penalty formula: capped_penalty = min(N * 0.1, 0.5)
+            const expected_penalty = @min(@as(f32, @floatFromInt(noise_count)) * penalty_per_token, max_penalty);
+            const expected_raw = @max(@as(f32, 0.0), matched_weights - expected_penalty);
+            const expected_confidence = @min(expected_raw / pattern_max_score, 1.0);
+
+            const confidence = events_mod.computeConfidence(matched_weights, pattern_max_score, noise_count, penalty_per_token, max_penalty);
+            try testing.expectApproxEqRel(expected_confidence, confidence, 0.001);
+
+            // Verify bounded: confidence in [0.0, 1.0]
+            try testing.expect(confidence >= 0.0);
+            try testing.expect(confidence <= 1.0);
+
+            // Verify monotonicity: more noise → lower or equal confidence
+            if (noise_count > 0) {
+                const prev_confidence = events_mod.computeConfidence(matched_weights, pattern_max_score, noise_count - 1, penalty_per_token, max_penalty);
+                try testing.expect(prev_confidence >= confidence);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring, Property 8: Noise exclusion in balanced delimiters
+// **Validates: Requirements 4.5**
+// NOTE: This tests the computeConfidence formula with noise_count parameter.
+// Balanced delimiter depth tracking is infrastructure in the engine (delim_depth variable).
+// When mismatch tolerance is added, tokens inside balanced delimiters will not increment noise_count.
+// For now, we verify that the formula correctly handles noise_count = 0 (as if excluded).
+test "property: noise exclusion in balanced delimiters (formula infrastructure)" {
+    const weight_gen = gen.intRange(u16, 1, 100);
+
+    try minish.check(testing.allocator, weight_gen, struct {
+        fn prop(raw_weight: u16) !void {
+            const matched_weights: f32 = @as(f32, @floatFromInt(raw_weight)) / 10.0;
+            const pattern_max_score: f32 = matched_weights; // perfect match scenario
+
+            // With noise_count = 0 (tokens inside balanced delimiters excluded), confidence = 1.0
+            const confidence_no_noise = events_mod.computeConfidence(matched_weights, pattern_max_score, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
+            try testing.expectApproxEqRel(@as(f32, 1.0), confidence_no_noise, 0.001);
+
+            // With noise_count > 0 (tokens outside delimiters counted), confidence < 1.0
+            const confidence_with_noise = events_mod.computeConfidence(matched_weights, pattern_max_score, 3, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
+            try testing.expect(confidence_with_noise <= confidence_no_noise);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 4: Noise Penalty Unit Tests ---
+
+test "computeConfidence: no noise produces same result as pre-noise formula" {
+    // matched_weights = 0.9, max_score = 0.9, noise = 0 → confidence = 1.0
+    const confidence = events_mod.computeConfidence(0.9, 0.9, 0, 0.1, 0.5);
+    try testing.expectApproxEqRel(@as(f32, 1.0), confidence, 0.001);
+}
+
+test "computeConfidence: 1 noise token reduces confidence" {
+    // matched_weights = 0.9, max_score = 0.9, noise = 1
+    // penalty = min(1 * 0.1, 0.5) = 0.1
+    // raw = max(0, 0.9 - 0.1) = 0.8
+    // confidence = 0.8 / 0.9 ≈ 0.889
+    const confidence = events_mod.computeConfidence(0.9, 0.9, 1, 0.1, 0.5);
+    try testing.expect(confidence < 1.0);
+    try testing.expectApproxEqRel(@as(f32, 0.8 / 0.9), confidence, 0.001);
+}
+
+test "computeConfidence: 5+ noise tokens penalty capped at 0.5" {
+    // matched_weights = 0.9, max_score = 0.9, noise = 5
+    // penalty = min(5 * 0.1, 0.5) = 0.5
+    // raw = max(0, 0.9 - 0.5) = 0.4
+    // confidence = 0.4 / 0.9 ≈ 0.444
+    const conf_5 = events_mod.computeConfidence(0.9, 0.9, 5, 0.1, 0.5);
+    try testing.expectApproxEqRel(@as(f32, 0.4 / 0.9), conf_5, 0.001);
+
+    // noise = 10 → penalty still capped at 0.5
+    const conf_10 = events_mod.computeConfidence(0.9, 0.9, 10, 0.1, 0.5);
+    try testing.expectApproxEqRel(conf_5, conf_10, 0.001);
+
+    // noise = 100 → same cap
+    const conf_100 = events_mod.computeConfidence(0.9, 0.9, 100, 0.1, 0.5);
+    try testing.expectApproxEqRel(conf_5, conf_100, 0.001);
+}
+
+test "computeConfidence: noise can push confidence below threshold" {
+    // matched_weights = 0.4, max_score = 0.9, noise = 3
+    // penalty = min(3 * 0.1, 0.5) = 0.3
+    // raw = max(0, 0.4 - 0.3) = 0.1
+    // confidence = 0.1 / 0.9 ≈ 0.111 — below 0.3 threshold
+    const confidence = events_mod.computeConfidence(0.4, 0.9, 3, 0.1, 0.5);
+    try testing.expect(confidence < 0.3);
+}
+
+test "computeConfidence: noise cannot produce negative confidence" {
+    // matched_weights = 0.2, max_score = 0.9, noise = 10
+    // penalty = min(10 * 0.1, 0.5) = 0.5
+    // raw = max(0, 0.2 - 0.5) = 0.0
+    // confidence = 0.0 / 0.9 = 0.0
+    const confidence = events_mod.computeConfidence(0.2, 0.9, 10, 0.1, 0.5);
+    try testing.expectApproxEqRel(@as(f32, 0.0), confidence, 0.001);
+}
+
+test "computeConfidence: zero max_score returns 0.0 regardless of noise" {
+    const confidence = events_mod.computeConfidence(0.5, 0.0, 3, 0.1, 0.5);
+    try testing.expectApproxEqRel(@as(f32, 0.0), confidence, 0.001);
 }
