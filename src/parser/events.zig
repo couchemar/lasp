@@ -28,6 +28,7 @@ pub const evidence_weights = struct {
     pub const identifier: f32 = 0.2;
     pub const symbol: f32 = 0.2;
     pub const block: f32 = 0.3;
+    pub const relaxed_keyword: f32 = 0.1;
 };
 
 /// Returns the evidence weight for a given token kind.
@@ -41,13 +42,8 @@ pub fn weightForKind(kind: TokenKind) f32 {
 }
 
 /// Computes confidence score for a pattern match.
-/// Sums evidence weights for each matched token, normalizes to 0.0–1.0.
-pub fn computeConfidence(matched_kinds: []const TokenKind, pattern_max_score: f32) f32 {
+/// Takes pre-computed matched_weights and normalizes to 0.0–1.0.
+pub fn computeConfidence(matched_weights: f32, pattern_max_score: f32) f32 {
     if (pattern_max_score <= 0.0) return 0.0;
-    var raw: f32 = 0.0;
-    for (matched_kinds) |kind| {
-        raw += weightForKind(kind);
-    }
-    const normalized = raw / pattern_max_score;
-    return @min(normalized, 1.0);
+    return @min(matched_weights / pattern_max_score, 1.0);
 }

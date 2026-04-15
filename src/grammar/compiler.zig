@@ -31,34 +31,49 @@ pub const CaptureValue = struct {
     value: []const u8,
 };
 
+pub const MatchResult = enum {
+    no_match,
+    full_match,
+    relaxed_match,
+};
+
 pub const Automaton = struct {
     states: []const State,
 
     /// Check if a token matches a transition from the given state.
-    pub fn step(self: Automaton, state_idx: usize, token: Token, source: []const u8) ?struct { next: usize, capture: ?CaptureValue } {
+    pub fn step(self: Automaton, state_idx: usize, token: Token, source: []const u8) ?struct {
+        next: usize,
+        capture: ?CaptureValue,
+        match_quality: MatchResult,
+    } {
         const state = self.states[state_idx];
         const text = source[token.start..token.end];
 
         for (state.transitions) |tr| {
-            if (matchesTransition(tr.matcher, token.kind, text)) {
+            const quality = matchesTransition(tr.matcher, token.kind, text);
+            if (quality != .no_match) {
                 const cap: ?CaptureValue = if (tr.capture) |c|
                     .{ .field_name = c.field_name, .value = text }
                 else
                     null;
-                return .{ .next = tr.next_state, .capture = cap };
+                return .{ .next = tr.next_state, .capture = cap, .match_quality = quality };
             }
         }
         return null;
     }
 };
 
-fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) bool {
+fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) MatchResult {
     return switch (matcher) {
-        .keyword_literal => |kw| kind == .keyword and std.mem.eql(u8, text, kw),
-        .symbol_literal => |sym| (kind == .delimiter or kind == .symbol) and std.mem.eql(u8, text, sym),
-        .identifier => kind == .identifier,
-        .capture => kind == .identifier,
-        .identifier_literal => |id| kind == .identifier and std.mem.eql(u8, text, id),
+        .keyword_literal => |kw| {
+            if (kind == .keyword and std.mem.eql(u8, text, kw)) return .full_match;
+            if (kind == .identifier and std.mem.eql(u8, text, kw)) return .relaxed_match;
+            return .no_match;
+        },
+        .symbol_literal => |sym| if ((kind == .delimiter or kind == .symbol) and std.mem.eql(u8, text, sym)) .full_match else .no_match,
+        .identifier => if (kind == .identifier) .full_match else .no_match,
+        .capture => if (kind == .identifier) .full_match else .no_match,
+        .identifier_literal => |id| if (kind == .identifier and std.mem.eql(u8, text, id)) .full_match else .no_match,
     };
 }
 
@@ -477,4 +492,91 @@ test "property: prefix sharing" {
             try testing.expectEqual(@as(usize, 2), automaton.states[state].transitions.len);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring, Property 1: matchesTransition correctness
+// **Validates: Requirements 1.1, 1.2, 1.3, 1.4**
+test "property: matchesTransition correctness for keyword_literal" {
+    const text_gen = gen.string(.{ .min_len = 1, .max_len = 12, .charset = .alpha });
+
+    try minish.check(testing.allocator, text_gen, struct {
+        fn prop(keyword_text: []const u8) !void {
+            const matcher: TokenMatcher = .{ .keyword_literal = keyword_text };
+
+            // Case 1: kind=.keyword, text matches → full_match
+            try testing.expectEqual(MatchResult.full_match, matchesTransition(matcher, .keyword, keyword_text));
+
+            // Case 2: kind=.identifier, text matches → relaxed_match
+            try testing.expectEqual(MatchResult.relaxed_match, matchesTransition(matcher, .identifier, keyword_text));
+
+            // Case 3: kind=.identifier, text does NOT match → no_match
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .identifier, "ZZZZZ_NOMATCH"));
+
+            // Case 4: other kinds → no_match
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .delimiter, keyword_text));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .symbol, keyword_text));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .string, keyword_text));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .number, keyword_text));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .operator, keyword_text));
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring: step returns match_quality
+test "step: keyword match returns full_match quality" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, arena.allocator());
+    const source = "fn";
+    const token = Token{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 };
+
+    const result = automaton.step(0, token, source);
+    try testing.expect(result != null);
+    try testing.expectEqual(MatchResult.full_match, result.?.match_quality);
+}
+
+test "step: identifier matching keyword_literal returns relaxed_match quality" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, arena.allocator());
+    const source = "fn";
+    // Token kind is .identifier but text matches "fn"
+    const token = Token{ .kind = .identifier, .start = 0, .end = 2, .line = 1, .col = 0 };
+
+    const result = automaton.step(0, token, source);
+    try testing.expect(result != null);
+    try testing.expectEqual(MatchResult.relaxed_match, result.?.match_quality);
+}
+
+test "step: non-keyword non-identifier token does not match keyword_literal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{.{ .keyword_literal = "fn" }},
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, arena.allocator());
+    const source = "fn";
+    // Token kind is .delimiter — should not match keyword_literal
+    const token = Token{ .kind = .delimiter, .start = 0, .end = 2, .line = 1, .col = 0 };
+
+    const result = automaton.step(0, token, source);
+    try testing.expect(result == null);
 }

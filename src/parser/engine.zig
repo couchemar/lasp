@@ -8,6 +8,7 @@ const Token = tokenizer.Token;
 const TokenKind = tokenizer.TokenKind;
 const Automaton = compiler.Automaton;
 const CaptureValue = compiler.CaptureValue;
+const MatchResult = compiler.MatchResult;
 const StructuralEvent = events_mod.StructuralEvent;
 const CaptureEntry = events_mod.CaptureEntry;
 const TokenMatcher = loader.TokenMatcher;
@@ -98,6 +99,7 @@ pub fn parse(
     var pending_captures: std.ArrayList(CaptureEntry) = .empty;
     var matched_kinds: std.ArrayList(TokenKind) = .empty;
     var matched_texts: std.ArrayList([]const u8) = .empty;
+    var matched_qualities: std.ArrayList(MatchResult) = .empty;
 
     var lookback = LookbackBuffer{};
     var block_stack = BlockStack{};
@@ -141,6 +143,7 @@ pub fn parse(
             state = step_result.next;
             try matched_kinds.append(allocator, token.kind);
             try matched_texts.append(allocator, text);
+            try matched_qualities.append(allocator, step_result.match_quality);
 
             if (step_result.capture) |cap| {
                 try pending_captures.append(allocator, .{
@@ -164,6 +167,7 @@ pub fn parse(
                                     pending_captures.clearRetainingCapacity();
                                     matched_kinds.clearRetainingCapacity();
                                     matched_texts.clearRetainingCapacity();
+                                    matched_qualities.clearRetainingCapacity();
                                     continue;
                                 }
                             },
@@ -186,6 +190,7 @@ pub fn parse(
                             pending_captures.clearRetainingCapacity();
                             matched_kinds.clearRetainingCapacity();
                             matched_texts.clearRetainingCapacity();
+                            matched_qualities.clearRetainingCapacity();
                             continue;
                         }
                     }
@@ -207,6 +212,7 @@ pub fn parse(
                                 pending_captures.clearRetainingCapacity();
                                 matched_kinds.clearRetainingCapacity();
                                 matched_texts.clearRetainingCapacity();
+                                matched_qualities.clearRetainingCapacity();
                                 continue;
                             }
                         }
@@ -216,7 +222,15 @@ pub fn parse(
 
                 // Compute confidence
                 const max_score = if (pattern) |p| patternMaxScore(p.sequence) else 1.0;
-                const confidence = events_mod.computeConfidence(matched_kinds.items, max_score);
+                var matched_weights: f32 = 0.0;
+                for (matched_kinds.items, matched_qualities.items) |kind, quality| {
+                    if (quality == .relaxed_match) {
+                        matched_weights += events_mod.evidence_weights.relaxed_keyword;
+                    } else {
+                        matched_weights += events_mod.weightForKind(kind);
+                    }
+                }
+                const confidence = events_mod.computeConfidence(matched_weights, max_score);
 
                 if (confidence >= 0.3) {
                     // Find the line number from the first token in the pattern
@@ -259,12 +273,14 @@ pub fn parse(
                 state = 0;
                 matched_kinds.clearRetainingCapacity();
                 matched_texts.clearRetainingCapacity();
+                matched_qualities.clearRetainingCapacity();
             }
         } else {
             state = 0;
             pending_captures.clearRetainingCapacity();
             matched_kinds.clearRetainingCapacity();
             matched_texts.clearRetainingCapacity();
+            matched_qualities.clearRetainingCapacity();
         }
     }
 
@@ -794,15 +810,14 @@ test "property: confidence computation correctness" {
             // Build a pattern of all keywords → each contributes 0.5
             const expected_score: f32 = 1.0; // all match perfectly
 
-            var kinds: std.ArrayList(TokenKind) = .empty;
-            defer kinds.deinit(testing.allocator);
             var max: f32 = 0.0;
+            var matched_weights: f32 = 0.0;
             for (0..pattern_len) |_| {
-                try kinds.append(testing.allocator, .keyword);
                 max += events_mod.evidence_weights.keyword;
+                matched_weights += events_mod.evidence_weights.keyword;
             }
 
-            const confidence = events_mod.computeConfidence(kinds.items, max);
+            const confidence = events_mod.computeConfidence(matched_weights, max);
             try testing.expectApproxEqRel(expected_score, confidence, 0.01);
         }
     }.prop, .{ .num_runs = 100 });
@@ -1381,4 +1396,276 @@ test "e2e: Erlang grammar still detects real function definitions" {
         }
     }
     try testing.expect(found_function);
+}
+
+// --- Phase 1: Probabilistic Confidence Scoring Tests ---
+
+// Feature: probabilistic-confidence-scoring, Property 2: Relaxed match produces lower confidence than full match
+// **Validates: Requirements 1.5, 7.3**
+test "property: relaxed match produces lower confidence than full match" {
+    const len_gen = gen.intRange(u8, 1, 3);
+
+    try minish.check(testing.allocator, len_gen, struct {
+        fn prop(num_keywords: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Build a pattern with num_keywords keyword_literals + 1 symbol
+            var seq: std.ArrayList(TokenMatcher) = .empty;
+            for (0..num_keywords) |_| {
+                try seq.append(alloc, .{ .keyword_literal = "kw" });
+            }
+            try seq.append(alloc, .{ .symbol_literal = "(" });
+
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "test",
+                .sequence = seq.items,
+                .captures = &.{},
+            }};
+
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // Build tokens for full match (all keywords as .keyword kind)
+            var full_tokens: std.ArrayList(Token) = .empty;
+            var offset: usize = 0;
+            for (0..num_keywords) |_| {
+                try full_tokens.append(alloc, .{ .kind = .keyword, .start = offset, .end = offset + 2, .line = 1, .col = offset });
+                offset += 3;
+            }
+            try full_tokens.append(alloc, .{ .kind = .delimiter, .start = offset, .end = offset + 1, .line = 1, .col = offset });
+
+            // Build tokens for relaxed match (first keyword as .identifier kind)
+            var relaxed_tokens: std.ArrayList(Token) = .empty;
+            offset = 0;
+            for (0..num_keywords) |i| {
+                const kind: TokenKind = if (i == 0) .identifier else .keyword;
+                try relaxed_tokens.append(alloc, .{ .kind = kind, .start = offset, .end = offset + 2, .line = 1, .col = offset });
+                offset += 3;
+            }
+            try relaxed_tokens.append(alloc, .{ .kind = .delimiter, .start = offset, .end = offset + 1, .line = 1, .col = offset });
+
+            // Build source string
+            var buf: [256]u8 = undefined;
+            var pos: usize = 0;
+            for (0..num_keywords) |_| {
+                @memcpy(buf[pos .. pos + 2], "kw");
+                buf[pos + 2] = ' ';
+                pos += 3;
+            }
+            buf[pos] = '(';
+            pos += 1;
+            const source = buf[0..pos];
+
+            const full_result = try parse(automaton, full_tokens.items, source, patterns, .{}, alloc);
+            const relaxed_result = try parse(automaton, relaxed_tokens.items, source, patterns, .{}, alloc);
+
+            try testing.expectEqual(@as(usize, 1), full_result.len);
+            try testing.expectEqual(@as(usize, 1), relaxed_result.len);
+
+            // Relaxed confidence must be strictly less than full confidence
+            try testing.expect(relaxed_result[0].confidence < full_result[0].confidence);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring, Property 3: Backward compatibility for existing grammars
+// **Validates: Requirements 1.6, 8.1, 8.2**
+test "property: backward compatibility full keyword match produces confidence 1.0" {
+    const len_gen = gen.intRange(u8, 1, 4);
+
+    try minish.check(testing.allocator, len_gen, struct {
+        fn prop(num_keywords: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Build a pattern of all keyword_literals
+            var seq: std.ArrayList(TokenMatcher) = .empty;
+            for (0..num_keywords) |_| {
+                try seq.append(alloc, .{ .keyword_literal = "kw" });
+            }
+
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "test",
+                .sequence = seq.items,
+                .captures = &.{},
+            }};
+
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // All tokens as .keyword kind (full match)
+            var tokens_list: std.ArrayList(Token) = .empty;
+            var buf: [256]u8 = undefined;
+            var offset: usize = 0;
+            for (0..num_keywords) |_| {
+                @memcpy(buf[offset .. offset + 2], "kw");
+                if (offset + 3 < buf.len) buf[offset + 2] = ' ';
+                try tokens_list.append(alloc, .{ .kind = .keyword, .start = offset, .end = offset + 2, .line = 1, .col = offset });
+                offset += 3;
+            }
+            const source = buf[0..offset];
+
+            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring, Property 12: Confidence always in [0.0, 1.0]
+// **Validates: Requirements 7.1**
+test "property: confidence always in 0.0 to 1.0" {
+    const weight_gen = gen.intRange(u16, 0, 1000);
+
+    try minish.check(testing.allocator, weight_gen, struct {
+        fn prop(raw_val: u16) !void {
+            const matched_weights: f32 = @as(f32, @floatFromInt(raw_val)) / 100.0;
+            const pattern_max_score: f32 = 1.0;
+            const confidence = events_mod.computeConfidence(matched_weights, pattern_max_score);
+            try testing.expect(confidence >= 0.0);
+            try testing.expect(confidence <= 1.0);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: probabilistic-confidence-scoring, Property 13: Perfect match produces confidence = 1.0
+// **Validates: Requirements 7.2**
+test "property: perfect match produces confidence 1.0" {
+    const len_gen = gen.intRange(u8, 1, 4);
+
+    try minish.check(testing.allocator, len_gen, struct {
+        fn prop(pattern_len: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Build a mixed pattern: keyword + identifier alternating
+            var seq: std.ArrayList(TokenMatcher) = .empty;
+            var tokens_list: std.ArrayList(Token) = .empty;
+            var buf: [256]u8 = undefined;
+            var offset: usize = 0;
+
+            for (0..pattern_len) |i| {
+                if (i % 2 == 0) {
+                    try seq.append(alloc, .{ .keyword_literal = "kw" });
+                    @memcpy(buf[offset .. offset + 2], "kw");
+                    try tokens_list.append(alloc, .{ .kind = .keyword, .start = offset, .end = offset + 2, .line = 1, .col = offset });
+                } else {
+                    try seq.append(alloc, .{ .identifier = {} });
+                    @memcpy(buf[offset .. offset + 2], "id");
+                    try tokens_list.append(alloc, .{ .kind = .identifier, .start = offset, .end = offset + 2, .line = 1, .col = offset });
+                }
+                if (offset + 3 < buf.len) buf[offset + 2] = ' ';
+                offset += 3;
+            }
+            const source = buf[0..offset];
+
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "test",
+                .sequence = seq.items,
+                .captures = &.{},
+            }};
+
+            const automaton = try compiler.compile(patterns, alloc);
+            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 1 Unit Tests ---
+
+test "parse: keyword as identifier token produces confidence < 1.0 (relaxed match)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern: "fn" identifier "(" — max = 0.5 + 0.2 + 0.2 = 0.9
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .keyword_literal = "fn" },
+            .{ .identifier = {} },
+            .{ .symbol_literal = "(" },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add(";
+    // "fn" tokenized as .identifier (missing keywords section)
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    // relaxed_keyword(0.1) + identifier(0.2) + symbol(0.2) = 0.5 / 0.9 ≈ 0.556
+    try testing.expect(result[0].confidence < 1.0);
+    try testing.expect(result[0].confidence > 0.3);
+}
+
+test "parse: full keyword match produces confidence = 1.0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .keyword_literal = "fn" },
+            .{ .identifier = {} },
+            .{ .symbol_literal = "(" },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add(";
+    // "fn" tokenized as .keyword (complete keywords section)
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
+}
+
+test "parse: mixed relaxed and full matches in same pattern" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern: "fn" "pub" identifier — two keywords + identifier
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "pub_function",
+        .sequence = &.{
+            .{ .keyword_literal = "pub" },
+            .{ .keyword_literal = "fn" },
+            .{ .identifier = {} },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "pub fn add";
+    // "pub" as .keyword (full), "fn" as .identifier (relaxed)
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 3, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 4, .end = 6, .line = 1, .col = 4 },
+        .{ .kind = .identifier, .start = 7, .end = 10, .line = 1, .col = 7 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    // full(0.5) + relaxed(0.1) + identifier(0.2) = 0.8 / (0.5+0.5+0.2) = 0.8/1.2 ≈ 0.667
+    try testing.expect(result[0].confidence < 1.0);
+    try testing.expect(result[0].confidence > 0.3);
 }
