@@ -84,9 +84,49 @@ fn patternMaxScore(sequence: []const loader.SequenceElement) f32 {
     return total;
 }
 
+// --- Competing Pattern Evaluation ---
+
+const CandidateEvent = struct {
+    event: StructuralEvent,
+    match_length: usize,
+    pattern_index: usize,
+};
+
+/// Selects the best candidate from a list of competing pattern matches.
+/// Tiebreaker order: highest confidence → longest match → lowest pattern_index (grammar order).
+fn selectBestCandidate(candidates: []const CandidateEvent) ?CandidateEvent {
+    if (candidates.len == 0) return null;
+    var best = candidates[0];
+    for (candidates[1..]) |c| {
+        if (c.event.confidence > best.event.confidence) {
+            best = c;
+        } else if (c.event.confidence == best.event.confidence) {
+            if (c.match_length > best.match_length) {
+                best = c;
+            } else if (c.match_length == best.match_length) {
+                if (c.pattern_index < best.pattern_index) {
+                    best = c;
+                }
+            }
+        }
+    }
+    return best;
+}
+
+/// Maps a type_name back to its index in the patterns array.
+fn findPatternIndex(patterns: []const loader.Pattern, type_name: []const u8) usize {
+    for (patterns, 0..) |p, i| {
+        if (std.mem.eql(u8, p.type_name, type_name)) return i;
+    }
+    return std.math.maxInt(usize);
+}
+
 /// Runs the automaton against the token stream, emitting structural events.
 /// Skips tokens with kind: newline, indent, comment, string.
 /// Processes each non-skipped token exactly once (O(N), no backtracking).
+/// Uses buffered emission for competing pattern evaluation: when a terminal
+/// state is reached, the candidate is buffered and matching continues to find
+/// longer matches. The best candidate is emitted when the automaton resets.
 pub fn parse(
     automaton: Automaton,
     tokens: []const Token,
@@ -100,6 +140,7 @@ pub fn parse(
     var matched_kinds: std.ArrayList(TokenKind) = .empty;
     var matched_texts: std.ArrayList([]const u8) = .empty;
     var matched_qualities: std.ArrayList(MatchResult) = .empty;
+    var candidates: std.ArrayList(CandidateEvent) = .empty;
 
     var lookback = LookbackBuffer{};
     var block_stack = BlockStack{};
@@ -136,6 +177,13 @@ pub fn parse(
 
         if (automaton.step(state, token, source)) |step_result| {
             if (state == 0) {
+                // Starting a new match — flush any buffered candidates from previous region
+                if (candidates.items.len > 0) {
+                    if (selectBestCandidate(candidates.items)) |winner| {
+                        try result.append(allocator, winner.event);
+                    }
+                    candidates.clearRetainingCapacity();
+                }
                 pattern_start = token.start;
                 pattern_col = token.col;
                 match_start_prev_token = saved_prev;
@@ -154,126 +202,45 @@ pub fn parse(
 
             // Check terminal state
             if (automaton.states[state].event) |event_info| {
-                const pattern = findPattern(patterns, event_info.type_name);
+                // Try to buffer this candidate (constraint checks may reject it)
+                const buffered = try bufferCandidate(
+                    &candidates,
+                    event_info,
+                    patterns,
+                    &pending_captures,
+                    &matched_kinds,
+                    &matched_texts,
+                    &matched_qualities,
+                    pattern_start,
+                    pattern_col,
+                    match_start_prev_token,
+                    lookback,
+                    block_stack,
+                    tokens,
+                    token,
+                    allocator,
+                );
 
-                // Position constraint check
-                if (pattern) |p| {
-                    if (p.position) |pos| {
-                        switch (pos) {
-                            .start => {
-                                if (pattern_col != 0) {
-                                    // Discard match
-                                    state = 0;
-                                    pending_captures.clearRetainingCapacity();
-                                    matched_kinds.clearRetainingCapacity();
-                                    matched_texts.clearRetainingCapacity();
-                                    matched_qualities.clearRetainingCapacity();
-                                    continue;
-                                }
-                            },
+                if (!buffered) {
+                    // Constraint check failed — flush any existing candidates and reset
+                    if (candidates.items.len > 0) {
+                        if (selectBestCandidate(candidates.items)) |winner| {
+                            try result.append(allocator, winner.event);
                         }
+                        candidates.clearRetainingCapacity();
                     }
-                }
-
-                // Exclusion check
-                if (pattern) |p| {
-                    if (p.exclude.len > 0) {
-                        var excluded = false;
-                        for (p.exclude) |exc| {
-                            if (lookback.contains(exc)) {
-                                excluded = true;
-                                break;
-                            }
-                        }
-                        if (excluded) {
-                            state = 0;
-                            pending_captures.clearRetainingCapacity();
-                            matched_kinds.clearRetainingCapacity();
-                            matched_texts.clearRetainingCapacity();
-                            matched_qualities.clearRetainingCapacity();
-                            continue;
-                        }
-                    }
-                }
-
-                // not_preceded_by check
-                if (pattern) |p| {
-                    if (p.not_preceded_by.len > 0) {
-                        if (match_start_prev_token) |prev_text| {
-                            var rejected = false;
-                            for (p.not_preceded_by) |npb| {
-                                if (std.mem.eql(u8, prev_text, npb)) {
-                                    rejected = true;
-                                    break;
-                                }
-                            }
-                            if (rejected) {
-                                state = 0;
-                                pending_captures.clearRetainingCapacity();
-                                matched_kinds.clearRetainingCapacity();
-                                matched_texts.clearRetainingCapacity();
-                                matched_qualities.clearRetainingCapacity();
-                                continue;
-                            }
-                        }
-                        // match_start_prev_token == null means start of stream → pass
-                    }
-                }
-
-                // Compute confidence
-                const max_score = if (pattern) |p| patternMaxScore(p.sequence) else 1.0;
-                var matched_weights: f32 = 0.0;
-                for (matched_kinds.items, matched_qualities.items) |kind, quality| {
-                    if (quality == .relaxed_match) {
-                        matched_weights += events_mod.evidence_weights.relaxed_keyword;
-                    } else {
-                        matched_weights += events_mod.weightForKind(kind);
-                    }
-                }
-                const confidence = events_mod.computeConfidence(matched_weights, max_score);
-
-                if (confidence >= 0.3) {
-                    // Find the line number from the first token in the pattern
-                    var pattern_line: usize = 1;
-                    for (tokens) |t| {
-                        if (t.start == pattern_start) {
-                            pattern_line = t.line;
-                            break;
-                        }
-                    }
-
-                    // Rebuild captures from pattern definitions using matched token texts
-                    // This avoids the shared-prefix capture field name bug in the automaton
+                    state = 0;
                     pending_captures.clearRetainingCapacity();
-                    if (pattern) |p| {
-                        for (p.captures) |cap| {
-                            if (cap.position < matched_texts.items.len) {
-                                try pending_captures.append(allocator, .{
-                                    .field_name = cap.field_name,
-                                    .value = matched_texts.items[cap.position],
-                                });
-                            }
-                        }
-                    }
-
-                    try result.append(allocator, .{
-                        .type_name = event_info.type_name,
-                        .captures = try pending_captures.toOwnedSlice(allocator),
-                        .start = pattern_start,
-                        .end = token.end,
-                        .line = pattern_line,
-                        .col = pattern_col,
-                        .confidence = confidence,
-                        .block_start = block_stack.top(),
-                    });
-                } else {
-                    pending_captures.clearRetainingCapacity();
+                    matched_kinds.clearRetainingCapacity();
+                    matched_texts.clearRetainingCapacity();
+                    matched_qualities.clearRetainingCapacity();
+                    continue;
                 }
 
-                state = 0;
-                matched_kinds.clearRetainingCapacity();
-                matched_texts.clearRetainingCapacity();
-                matched_qualities.clearRetainingCapacity();
+                // Candidate buffered — DON'T reset state. Continue matching
+                // to see if a longer pattern also matches from this terminal state.
+                // If the terminal state has no outgoing transitions, the next token
+                // will fail to match and we'll flush then.
             }
         } else {
             // No match from current state — check for optional transitions to skip
@@ -323,103 +290,94 @@ pub fn parse(
             }
 
             if (!skipped) {
+                // Automaton truly resets — flush any buffered candidates
+                if (candidates.items.len > 0) {
+                    if (selectBestCandidate(candidates.items)) |winner| {
+                        try result.append(allocator, winner.event);
+                    }
+                    candidates.clearRetainingCapacity();
+                }
                 state = 0;
                 pending_captures.clearRetainingCapacity();
                 matched_kinds.clearRetainingCapacity();
                 matched_texts.clearRetainingCapacity();
                 matched_qualities.clearRetainingCapacity();
+
+                // Re-try the current token from state 0 — it might start a new match
+                if (automaton.step(0, token, source)) |retry_result| {
+                    pattern_start = token.start;
+                    pattern_col = token.col;
+                    match_start_prev_token = saved_prev;
+                    state = retry_result.next;
+                    try matched_kinds.append(allocator, token.kind);
+                    try matched_texts.append(allocator, text);
+                    try matched_qualities.append(allocator, retry_result.match_quality);
+
+                    if (retry_result.capture) |cap| {
+                        try pending_captures.append(allocator, .{
+                            .field_name = cap.field_name,
+                            .value = cap.value,
+                        });
+                    }
+
+                    // Check if this immediately reaches a terminal state
+                    if (automaton.states[state].event) |event_info| {
+                        const buffered = try bufferCandidate(
+                            &candidates,
+                            event_info,
+                            patterns,
+                            &pending_captures,
+                            &matched_kinds,
+                            &matched_texts,
+                            &matched_qualities,
+                            pattern_start,
+                            pattern_col,
+                            match_start_prev_token,
+                            lookback,
+                            block_stack,
+                            tokens,
+                            token,
+                            allocator,
+                        );
+
+                        if (!buffered) {
+                            state = 0;
+                            pending_captures.clearRetainingCapacity();
+                            matched_kinds.clearRetainingCapacity();
+                            matched_texts.clearRetainingCapacity();
+                            matched_qualities.clearRetainingCapacity();
+                        }
+                    }
+                }
             } else {
                 // After skipping, check if we landed on a terminal state
                 if (automaton.states[state].event) |event_info| {
-                    const pattern = findPattern(patterns, event_info.type_name);
+                    const buffered = try bufferCandidateWithMinEvidence(
+                        &candidates,
+                        event_info,
+                        patterns,
+                        &pending_captures,
+                        &matched_kinds,
+                        &matched_texts,
+                        &matched_qualities,
+                        pattern_start,
+                        pattern_col,
+                        match_start_prev_token,
+                        lookback,
+                        block_stack,
+                        tokens,
+                        token,
+                        allocator,
+                    );
 
-                    // Position constraint check
-                    if (pattern) |p| {
-                        if (p.position) |pos| {
-                            switch (pos) {
-                                .start => {
-                                    if (pattern_col != 0) {
-                                        state = 0;
-                                        pending_captures.clearRetainingCapacity();
-                                        matched_kinds.clearRetainingCapacity();
-                                        matched_texts.clearRetainingCapacity();
-                                        matched_qualities.clearRetainingCapacity();
-                                        continue;
-                                    }
-                                },
+                    if (!buffered) {
+                        // Constraint or minimum evidence check failed — flush and reset
+                        if (candidates.items.len > 0) {
+                            if (selectBestCandidate(candidates.items)) |winner| {
+                                try result.append(allocator, winner.event);
                             }
+                            candidates.clearRetainingCapacity();
                         }
-                    }
-
-                    // Exclusion check
-                    if (pattern) |p| {
-                        if (p.exclude.len > 0) {
-                            var excluded = false;
-                            for (p.exclude) |exc| {
-                                if (lookback.contains(exc)) {
-                                    excluded = true;
-                                    break;
-                                }
-                            }
-                            if (excluded) {
-                                state = 0;
-                                pending_captures.clearRetainingCapacity();
-                                matched_kinds.clearRetainingCapacity();
-                                matched_texts.clearRetainingCapacity();
-                                matched_qualities.clearRetainingCapacity();
-                                continue;
-                            }
-                        }
-                    }
-
-                    // not_preceded_by check
-                    if (pattern) |p| {
-                        if (p.not_preceded_by.len > 0) {
-                            if (match_start_prev_token) |prev_text_val| {
-                                var rejected = false;
-                                for (p.not_preceded_by) |npb| {
-                                    if (std.mem.eql(u8, prev_text_val, npb)) {
-                                        rejected = true;
-                                        break;
-                                    }
-                                }
-                                if (rejected) {
-                                    state = 0;
-                                    pending_captures.clearRetainingCapacity();
-                                    matched_kinds.clearRetainingCapacity();
-                                    matched_texts.clearRetainingCapacity();
-                                    matched_qualities.clearRetainingCapacity();
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    // Minimum_Evidence: at least one required element must have matched
-                    var has_required_match = false;
-                    if (pattern) |p| {
-                        // Check if any matched element corresponds to a required element
-                        // matched_kinds tracks what we actually matched; if we matched anything, check
-                        // if the pattern has required elements that were matched
-                        if (matched_kinds.items.len > 0) {
-                            // We matched at least one token — check if any required element was matched
-                            // Since we only record matched tokens (not skipped optionals), any match
-                            // against a non-optional element counts
-                            for (p.sequence) |seq_elem| {
-                                if (!seq_elem.is_optional) {
-                                    // There's a required element in the pattern
-                                    // If we have any matches at all, at least one required element matched
-                                    // (because optional elements that matched would also be recorded)
-                                    has_required_match = matched_kinds.items.len > 0;
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        has_required_match = matched_kinds.items.len > 0;
-                    }
-
-                    if (!has_required_match) {
                         state = 0;
                         pending_captures.clearRetainingCapacity();
                         matched_kinds.clearRetainingCapacity();
@@ -428,63 +386,191 @@ pub fn parse(
                         continue;
                     }
 
-                    // Compute confidence
-                    const max_score = if (pattern) |p| patternMaxScore(p.sequence) else 1.0;
-                    var matched_weights: f32 = 0.0;
-                    for (matched_kinds.items, matched_qualities.items) |kind, quality| {
-                        if (quality == .relaxed_match) {
-                            matched_weights += events_mod.evidence_weights.relaxed_keyword;
-                        } else {
-                            matched_weights += events_mod.weightForKind(kind);
-                        }
-                    }
-                    const confidence = events_mod.computeConfidence(matched_weights, max_score);
-
-                    if (confidence >= 0.3) {
-                        var pattern_line: usize = 1;
-                        for (tokens) |t| {
-                            if (t.start == pattern_start) {
-                                pattern_line = t.line;
-                                break;
-                            }
-                        }
-
-                        pending_captures.clearRetainingCapacity();
-                        if (pattern) |p| {
-                            for (p.captures) |cap| {
-                                if (cap.position < matched_texts.items.len) {
-                                    try pending_captures.append(allocator, .{
-                                        .field_name = cap.field_name,
-                                        .value = matched_texts.items[cap.position],
-                                    });
-                                }
-                            }
-                        }
-
-                        try result.append(allocator, .{
-                            .type_name = event_info.type_name,
-                            .captures = try pending_captures.toOwnedSlice(allocator),
-                            .start = pattern_start,
-                            .end = token.end,
-                            .line = pattern_line,
-                            .col = pattern_col,
-                            .confidence = confidence,
-                            .block_start = block_stack.top(),
-                        });
-                    } else {
-                        pending_captures.clearRetainingCapacity();
-                    }
-
-                    state = 0;
-                    matched_kinds.clearRetainingCapacity();
-                    matched_texts.clearRetainingCapacity();
-                    matched_qualities.clearRetainingCapacity();
+                    // Candidate buffered — continue matching for longer patterns
                 }
             }
         }
     }
 
+    // Flush any remaining candidates at end of token stream
+    if (candidates.items.len > 0) {
+        if (selectBestCandidate(candidates.items)) |winner| {
+            try result.append(allocator, winner.event);
+        }
+        candidates.clearRetainingCapacity();
+    }
+
     return result.toOwnedSlice(allocator);
+}
+
+/// Checks constraints (position, exclude, not_preceded_by) and confidence,
+/// then buffers a candidate event if all checks pass. Used for the normal
+/// (non-optional-skip) code path.
+/// Returns true if the candidate was buffered, false if rejected.
+fn bufferCandidate(
+    candidates: *std.ArrayList(CandidateEvent),
+    event_info: compiler.EventInfo,
+    patterns: []const loader.Pattern,
+    pending_captures: *std.ArrayList(CaptureEntry),
+    matched_kinds: *std.ArrayList(TokenKind),
+    matched_texts: *std.ArrayList([]const u8),
+    matched_qualities: *std.ArrayList(MatchResult),
+    pattern_start: usize,
+    pattern_col: usize,
+    match_start_prev_token: ?[]const u8,
+    lookback: LookbackBuffer,
+    block_stack: BlockStack,
+    tokens: []const Token,
+    token: Token,
+    allocator: std.mem.Allocator,
+) !bool {
+    const pattern = findPattern(patterns, event_info.type_name);
+
+    // Position constraint check
+    if (pattern) |p| {
+        if (p.position) |pos| {
+            switch (pos) {
+                .start => {
+                    if (pattern_col != 0) return false;
+                },
+            }
+        }
+    }
+
+    // Exclusion check
+    if (pattern) |p| {
+        if (p.exclude.len > 0) {
+            for (p.exclude) |exc| {
+                if (lookback.contains(exc)) return false;
+            }
+        }
+    }
+
+    // not_preceded_by check
+    if (pattern) |p| {
+        if (p.not_preceded_by.len > 0) {
+            if (match_start_prev_token) |prev_text| {
+                for (p.not_preceded_by) |npb| {
+                    if (std.mem.eql(u8, prev_text, npb)) return false;
+                }
+            }
+        }
+    }
+
+    // Compute confidence
+    const max_score = if (pattern) |p| patternMaxScore(p.sequence) else 1.0;
+    var matched_weights: f32 = 0.0;
+    for (matched_kinds.items, matched_qualities.items) |kind, quality| {
+        if (quality == .relaxed_match) {
+            matched_weights += events_mod.evidence_weights.relaxed_keyword;
+        } else {
+            matched_weights += events_mod.weightForKind(kind);
+        }
+    }
+    const confidence = events_mod.computeConfidence(matched_weights, max_score);
+
+    if (confidence < 0.3) {
+        pending_captures.clearRetainingCapacity();
+        return false;
+    }
+
+    // Find the line number from the first token in the pattern
+    var pattern_line: usize = 1;
+    for (tokens) |t| {
+        if (t.start == pattern_start) {
+            pattern_line = t.line;
+            break;
+        }
+    }
+
+    // Rebuild captures from pattern definitions using matched token texts
+    pending_captures.clearRetainingCapacity();
+    if (pattern) |p| {
+        for (p.captures) |cap| {
+            if (cap.position < matched_texts.items.len) {
+                try pending_captures.append(allocator, .{
+                    .field_name = cap.field_name,
+                    .value = matched_texts.items[cap.position],
+                });
+            }
+        }
+    }
+
+    const event = StructuralEvent{
+        .type_name = event_info.type_name,
+        .captures = try pending_captures.toOwnedSlice(allocator),
+        .start = pattern_start,
+        .end = token.end,
+        .line = pattern_line,
+        .col = pattern_col,
+        .confidence = confidence,
+        .block_start = block_stack.top(),
+    };
+
+    try candidates.append(allocator, .{
+        .event = event,
+        .match_length = matched_kinds.items.len,
+        .pattern_index = findPatternIndex(patterns, event_info.type_name),
+    });
+
+    return true;
+}
+
+/// Like bufferCandidate but also checks Minimum_Evidence rule (at least one
+/// required element must have matched). Used for the optional-skip code path.
+fn bufferCandidateWithMinEvidence(
+    candidates: *std.ArrayList(CandidateEvent),
+    event_info: compiler.EventInfo,
+    patterns: []const loader.Pattern,
+    pending_captures: *std.ArrayList(CaptureEntry),
+    matched_kinds: *std.ArrayList(TokenKind),
+    matched_texts: *std.ArrayList([]const u8),
+    matched_qualities: *std.ArrayList(MatchResult),
+    pattern_start: usize,
+    pattern_col: usize,
+    match_start_prev_token: ?[]const u8,
+    lookback: LookbackBuffer,
+    block_stack: BlockStack,
+    tokens: []const Token,
+    token: Token,
+    allocator: std.mem.Allocator,
+) !bool {
+    const pattern = findPattern(patterns, event_info.type_name);
+
+    // Minimum_Evidence: at least one required element must have matched
+    var has_required_match = false;
+    if (pattern) |p| {
+        if (matched_kinds.items.len > 0) {
+            for (p.sequence) |seq_elem| {
+                if (!seq_elem.is_optional) {
+                    has_required_match = matched_kinds.items.len > 0;
+                    break;
+                }
+            }
+        }
+    } else {
+        has_required_match = matched_kinds.items.len > 0;
+    }
+
+    if (!has_required_match) return false;
+
+    return bufferCandidate(
+        candidates,
+        event_info,
+        patterns,
+        pending_captures,
+        matched_kinds,
+        matched_texts,
+        matched_qualities,
+        pattern_start,
+        pattern_col,
+        match_start_prev_token,
+        lookback,
+        block_stack,
+        tokens,
+        token,
+        allocator,
+    );
 }
 
 fn findPattern(patterns: []const loader.Pattern, type_name: []const u8) ?loader.Pattern {
@@ -2074,4 +2160,358 @@ test "parse: mix of required and optional, optional absent produces confidence <
     // confidence = 0.7 / 1.1 ≈ 0.636
     try testing.expect(result[0].confidence < 1.0);
     try testing.expect(result[0].confidence > 0.3);
+}
+
+// --- Competing Pattern Evaluation Tests (Phase 3) ---
+
+// Feature: probabilistic-confidence-scoring, Phase 3: Competing Pattern Evaluation
+// Unit tests for selectBestCandidate
+
+test "selectBestCandidate: empty candidates returns null" {
+    const candidates: []const CandidateEvent = &.{};
+    try testing.expect(selectBestCandidate(candidates) == null);
+}
+
+test "selectBestCandidate: single candidate returned" {
+    const candidates = &[_]CandidateEvent{.{
+        .event = .{
+            .type_name = "call",
+            .captures = &.{},
+            .start = 0,
+            .end = 4,
+            .line = 1,
+            .col = 0,
+            .confidence = 0.8,
+        },
+        .match_length = 2,
+        .pattern_index = 0,
+    }};
+    const best = selectBestCandidate(candidates);
+    try testing.expect(best != null);
+    try testing.expectEqualStrings("call", best.?.event.type_name);
+}
+
+test "selectBestCandidate: higher confidence wins" {
+    const candidates = &[_]CandidateEvent{
+        .{
+            .event = .{
+                .type_name = "call",
+                .captures = &.{},
+                .start = 0,
+                .end = 4,
+                .line = 1,
+                .col = 0,
+                .confidence = 0.6,
+            },
+            .match_length = 2,
+            .pattern_index = 0,
+        },
+        .{
+            .event = .{
+                .type_name = "function",
+                .captures = &.{},
+                .start = 0,
+                .end = 7,
+                .line = 1,
+                .col = 0,
+                .confidence = 0.9,
+            },
+            .match_length = 3,
+            .pattern_index = 1,
+        },
+    };
+    const best = selectBestCandidate(candidates);
+    try testing.expect(best != null);
+    try testing.expectEqualStrings("function", best.?.event.type_name);
+    try testing.expectApproxEqRel(@as(f32, 0.9), best.?.event.confidence, 0.01);
+}
+
+test "selectBestCandidate: equal confidence, longer match wins" {
+    const candidates = &[_]CandidateEvent{
+        .{
+            .event = .{
+                .type_name = "short",
+                .captures = &.{},
+                .start = 0,
+                .end = 4,
+                .line = 1,
+                .col = 0,
+                .confidence = 0.8,
+            },
+            .match_length = 2,
+            .pattern_index = 0,
+        },
+        .{
+            .event = .{
+                .type_name = "long",
+                .captures = &.{},
+                .start = 0,
+                .end = 7,
+                .line = 1,
+                .col = 0,
+                .confidence = 0.8,
+            },
+            .match_length = 3,
+            .pattern_index = 1,
+        },
+    };
+    const best = selectBestCandidate(candidates);
+    try testing.expect(best != null);
+    try testing.expectEqualStrings("long", best.?.event.type_name);
+}
+
+test "selectBestCandidate: equal confidence and length, grammar order wins" {
+    const candidates = &[_]CandidateEvent{
+        .{
+            .event = .{
+                .type_name = "second",
+                .captures = &.{},
+                .start = 0,
+                .end = 4,
+                .line = 1,
+                .col = 0,
+                .confidence = 0.8,
+            },
+            .match_length = 2,
+            .pattern_index = 1,
+        },
+        .{
+            .event = .{
+                .type_name = "first",
+                .captures = &.{},
+                .start = 0,
+                .end = 4,
+                .line = 1,
+                .col = 0,
+                .confidence = 0.8,
+            },
+            .match_length = 2,
+            .pattern_index = 0,
+        },
+    };
+    const best = selectBestCandidate(candidates);
+    try testing.expect(best != null);
+    try testing.expectEqualStrings("first", best.?.event.type_name);
+    try testing.expectEqual(@as(usize, 0), best.?.pattern_index);
+}
+
+// Integration tests: competing patterns through the full parse pipeline
+
+test "parse: single pattern emitted normally with buffered emission (no regression)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 1 }},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add(";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("function", result[0].type_name);
+    try testing.expectEqualStrings("add", result[0].captures[0].value);
+    try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
+}
+
+test "parse: competing patterns with shared prefix, longer match wins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern A: "fn" identifier → shorter (2 tokens)
+    // Pattern B: "fn" identifier "(" → longer (3 tokens)
+    // Both share prefix "fn" identifier. After matching "fn identifier",
+    // Pattern A reaches terminal. With buffered emission, we continue
+    // and Pattern B also reaches terminal after "(". The longer/higher-confidence wins.
+    const patterns = &[_]loader.Pattern{
+        .{
+            .type_name = "fn_decl",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+            },
+            .captures = &.{},
+        },
+        .{
+            .type_name = "fn_call",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{},
+        },
+    };
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add(";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    // Should emit only one event — the longer/higher-confidence match
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("fn_call", result[0].type_name);
+}
+
+test "parse: competing patterns, shorter match emitted when longer doesn't complete" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern A: "fn" identifier → shorter
+    // Pattern B: "fn" identifier "(" → longer
+    // Input: "fn add ;" — only Pattern A matches
+    const patterns = &[_]loader.Pattern{
+        .{
+            .type_name = "fn_decl",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+            },
+            .captures = &.{},
+        },
+        .{
+            .type_name = "fn_call",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{},
+        },
+    };
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add ;";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+        .{ .kind = .symbol, .start = 7, .end = 8, .line = 1, .col = 7 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    // ";" doesn't match "(" so the longer pattern fails.
+    // The shorter pattern (fn_decl) should be emitted from the buffer.
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("fn_decl", result[0].type_name);
+}
+
+test "parse: competing patterns, end of stream flushes buffered candidate" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pattern A: "fn" identifier → terminal after 2 tokens
+    // Pattern B: "fn" identifier "(" → needs 3 tokens
+    // Input: "fn add" — only 2 tokens, stream ends at terminal for A
+    const patterns = &[_]loader.Pattern{
+        .{
+            .type_name = "fn_decl",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+            },
+            .captures = &.{},
+        },
+        .{
+            .type_name = "fn_call",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{},
+        },
+    };
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn add";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, alloc);
+    // End of stream should flush the buffered fn_decl candidate
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("fn_decl", result[0].type_name);
+}
+
+// Feature: probabilistic-confidence-scoring, Property 6: Competing patterns — highest confidence wins
+// **Validates: Requirements 3.1, 3.2, 3.3**
+test "property: competing patterns — highest confidence wins" {
+    // Test that selectBestCandidate always picks the highest confidence,
+    // with correct tiebreakers for equal confidence.
+    const conf_gen = gen.intRange(u8, 30, 100);
+
+    try minish.check(testing.allocator, conf_gen, struct {
+        fn prop(conf_pct: u8) !void {
+            const conf_a: f32 = @as(f32, @floatFromInt(conf_pct)) / 100.0;
+            // conf_b is always slightly lower than conf_a (unless conf_a is at minimum)
+            const conf_b: f32 = if (conf_pct > 30) conf_a - 0.01 else conf_a;
+
+            const candidates = &[_]CandidateEvent{
+                .{
+                    .event = .{
+                        .type_name = "pattern_a",
+                        .captures = &.{},
+                        .start = 0,
+                        .end = 4,
+                        .line = 1,
+                        .col = 0,
+                        .confidence = conf_a,
+                    },
+                    .match_length = 2,
+                    .pattern_index = 0,
+                },
+                .{
+                    .event = .{
+                        .type_name = "pattern_b",
+                        .captures = &.{},
+                        .start = 0,
+                        .end = 4,
+                        .line = 1,
+                        .col = 0,
+                        .confidence = conf_b,
+                    },
+                    .match_length = 2,
+                    .pattern_index = 1,
+                },
+            };
+
+            const best = selectBestCandidate(candidates);
+            try testing.expect(best != null);
+
+            if (conf_a > conf_b) {
+                // Higher confidence wins
+                try testing.expectEqualStrings("pattern_a", best.?.event.type_name);
+            } else {
+                // Equal confidence — same length — lower pattern_index wins
+                try testing.expectEqual(@as(usize, 0), best.?.pattern_index);
+            }
+
+            // Verify the winner's confidence is >= all candidates
+            for (candidates) |c| {
+                try testing.expect(best.?.event.confidence >= c.event.confidence);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
 }
