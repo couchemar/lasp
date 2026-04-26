@@ -10,6 +10,8 @@ pub const ParsedArgs = struct {
     target_path: []const u8,
     grammar_path: ?[]const u8 = null,
     grammar_dir: ?[]const u8 = null,
+    node_filter: ?[]const u8 = null,
+    names_only: bool = false,
 };
 
 pub const CliError = error{
@@ -55,6 +57,8 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     // Parse optional flags
     var grammar_path: ?[]const u8 = null;
     var grammar_dir: ?[]const u8 = null;
+    var node_filter: ?[]const u8 = null;
+    var names_only: bool = false;
 
     var i: usize = 2;
     while (i < args.len) {
@@ -68,6 +72,12 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             grammar_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--node") or std.mem.eql(u8, arg, "-n")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            node_filter = args[i];
+        } else if (std.mem.eql(u8, arg, "--names-only")) {
+            names_only = true;
         } else {
             return error.UnrecognizedFlag;
         }
@@ -80,6 +90,8 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
         .target_path = target_path,
         .grammar_path = grammar_path,
         .grammar_dir = grammar_dir,
+        .node_filter = node_filter,
+        .names_only = names_only,
     };
 }
 
@@ -163,6 +175,52 @@ test "missing flag value returns MissingFlagValue" {
     try testing.expectError(error.MissingFlagValue, result);
 }
 
+// Tests for new --node/-n and --names-only flags
+
+test "parse with --node flag stores in node_filter" {
+    const args = &[_][]const u8{ "parse", "file.zig", "--node", "function" };
+    const result = try parseArgs(args);
+    try testing.expectEqualStrings(result.node_filter.?, "function");
+}
+
+test "parse with -n short flag stores in node_filter" {
+    const args = &[_][]const u8{ "parse", "file.zig", "-n", "call" };
+    const result = try parseArgs(args);
+    try testing.expectEqualStrings(result.node_filter.?, "call");
+}
+
+test "parse with --names-only flag sets names_only true" {
+    const args = &[_][]const u8{ "parse", "file.zig", "--names-only" };
+    const result = try parseArgs(args);
+    try testing.expect(result.names_only == true);
+}
+
+test "--node as last arg returns MissingFlagValue" {
+    const args = &[_][]const u8{ "parse", "file.zig", "--node" };
+    const result = parseArgs(args);
+    try testing.expectError(error.MissingFlagValue, result);
+}
+
+test "-n as last arg returns MissingFlagValue" {
+    const args = &[_][]const u8{ "parse", "file.zig", "-n" };
+    const result = parseArgs(args);
+    try testing.expectError(error.MissingFlagValue, result);
+}
+
+test "\"-\" accepted as valid target_path" {
+    const args = &[_][]const u8{ "parse", "-" };
+    const result = try parseArgs(args);
+    try testing.expectEqualStrings(result.target_path, "-");
+}
+
+test "new flags combined with existing --grammar/-g flags" {
+    const args = &[_][]const u8{ "parse", "file.zig", "-g", "grammars/zig.toml", "--node", "function", "--names-only" };
+    const result = try parseArgs(args);
+    try testing.expectEqualStrings(result.grammar_path.?, "grammars/zig.toml");
+    try testing.expectEqualStrings(result.node_filter.?, "function");
+    try testing.expect(result.names_only == true);
+}
+
 // --- Property Tests ---
 
 const minish = @import("minish");
@@ -241,4 +299,89 @@ test "property: invalid CLI input rejection" {
             try testing.expectError(error.UnrecognizedCommand, result);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: composable-cli-primitives, Property 1: New flag parsing round-trip
+test "property: new flag parsing round-trip" {
+    const node_filter_gen = gen.string(.{ .min_len = 1, .max_len = 32, .charset = .alphanumeric });
+
+    // Test --node flag with random node filter values
+    try minish.check(testing.allocator, node_filter_gen, struct {
+        fn prop(node_filter: []const u8) !void {
+            const args = &[_][]const u8{ "parse", "file.zig", "--node", node_filter };
+            const result = try parseArgs(args);
+            try testing.expectEqualStrings(result.node_filter.?, node_filter);
+            try testing.expect(result.names_only == false);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Test -n short flag produces identical results to --node
+    try minish.check(testing.allocator, node_filter_gen, struct {
+        fn prop(node_filter: []const u8) !void {
+            const args_long = &[_][]const u8{ "parse", "file.zig", "--node", node_filter };
+            const args_short = &[_][]const u8{ "parse", "file.zig", "-n", node_filter };
+            const result_long = try parseArgs(args_long);
+            const result_short = try parseArgs(args_short);
+            try testing.expectEqualStrings(result_long.node_filter.?, result_short.node_filter.?);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Test --names-only flag (always true when present, so just verify it works)
+    {
+        const args = &[_][]const u8{ "parse", "file.zig", "--names-only" };
+        const result = try parseArgs(args);
+        try testing.expect(result.names_only == true);
+        try testing.expect(result.node_filter == null);
+    }
+
+    // Test combined --node and --names-only
+    try minish.check(testing.allocator, node_filter_gen, struct {
+        fn prop(node_filter: []const u8) !void {
+            const args = &[_][]const u8{ "parse", "file.zig", "--node", node_filter, "--names-only" };
+            const result = try parseArgs(args);
+            try testing.expectEqualStrings(result.node_filter.?, node_filter);
+            try testing.expect(result.names_only == true);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: composable-cli-primitives, Property 2: Flag order independence
+test "property: flag order independence" {
+    // Test that --grammar, --node, --names-only can appear in any order
+    const grammar_path = "grammars/zig.toml";
+    const node_filter = "function";
+
+    // All permutations of flags
+    const perm1 = &[_][]const u8{ "parse", "file.zig", "--grammar", grammar_path, "--node", node_filter, "--names-only" };
+    const perm2 = &[_][]const u8{ "parse", "file.zig", "--node", node_filter, "--grammar", grammar_path, "--names-only" };
+    const perm3 = &[_][]const u8{ "parse", "file.zig", "--names-only", "--grammar", grammar_path, "--node", node_filter };
+    const perm4 = &[_][]const u8{ "parse", "file.zig", "--node", node_filter, "--names-only", "--grammar", grammar_path };
+    const perm5 = &[_][]const u8{ "parse", "file.zig", "--names-only", "--node", node_filter, "--grammar", grammar_path };
+    const perm6 = &[_][]const u8{ "parse", "file.zig", "--grammar", grammar_path, "--names-only", "--node", node_filter };
+
+    const r1 = try parseArgs(perm1);
+    const r2 = try parseArgs(perm2);
+    const r3 = try parseArgs(perm3);
+    const r4 = try parseArgs(perm4);
+    const r5 = try parseArgs(perm5);
+    const r6 = try parseArgs(perm6);
+
+    // All should have identical values
+    try testing.expectEqualStrings(r1.grammar_path.?, r2.grammar_path.?);
+    try testing.expectEqualStrings(r1.grammar_path.?, r3.grammar_path.?);
+    try testing.expectEqualStrings(r1.grammar_path.?, r4.grammar_path.?);
+    try testing.expectEqualStrings(r1.grammar_path.?, r5.grammar_path.?);
+    try testing.expectEqualStrings(r1.grammar_path.?, r6.grammar_path.?);
+
+    try testing.expectEqualStrings(r1.node_filter.?, r2.node_filter.?);
+    try testing.expectEqualStrings(r1.node_filter.?, r3.node_filter.?);
+    try testing.expectEqualStrings(r1.node_filter.?, r4.node_filter.?);
+    try testing.expectEqualStrings(r1.node_filter.?, r5.node_filter.?);
+    try testing.expectEqualStrings(r1.node_filter.?, r6.node_filter.?);
+
+    try testing.expect(r1.names_only == r2.names_only);
+    try testing.expect(r1.names_only == r3.names_only);
+    try testing.expect(r1.names_only == r4.names_only);
+    try testing.expect(r1.names_only == r5.names_only);
+    try testing.expect(r1.names_only == r6.names_only);
 }
