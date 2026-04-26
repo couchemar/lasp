@@ -48,9 +48,17 @@ pub fn main() !void {
         std.process.fatal("{s}", .{cli.formatCliError(err)});
     };
 
-    // 4. Read source file
-    const source = readSourceFile(allocator, parsed.target_path) catch {
-        std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+    // 4. Read source file or stdin
+    const source = blk: {
+        if (std.mem.eql(u8, parsed.target_path, "-")) {
+            var stdin_buffer: [4096]u8 = undefined;
+            var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
+            break :blk try stdin_reader.interface.readAlloc(allocator, std.math.maxInt(usize));
+        } else {
+            break :blk readSourceFile(allocator, parsed.target_path) catch {
+                std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+            };
+        }
     };
 
     // 5. Stdout setup
