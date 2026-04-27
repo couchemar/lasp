@@ -380,8 +380,21 @@ The parser functions as a CLI that generates JSON Event Streams, enabling simple
 
 **Commands:**
 ```bash
-code-parser parse file.rs --grammar grammars/rust.toml
-code-parser parse-dir ./repo --grammar-dir grammars/
+lasp parse file.rs --grammar grammars/rust.toml
+lasp parse-dir ./repo --grammar-dir grammars/
+
+# Stdin pipe support
+echo 'fn add() {}' | lasp parse - --grammar grammars/rust.toml
+
+# Node type filtering
+lasp parse file.rs --grammar grammars/rust.toml --node function
+lasp parse file.rs --grammar grammars/rust.toml -n call
+
+# Names-only output (plain text, one per line)
+lasp parse file.rs --grammar grammars/rust.toml --names-only
+
+# Composable pipeline
+echo 'fn add() {}' | lasp parse - -g grammars/rust.toml --node function --names-only
 ```
 
 **Output JSON Code snippet Events:**

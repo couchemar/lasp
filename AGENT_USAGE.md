@@ -27,6 +27,18 @@ Returns every token with type, byte offsets, line number, and column:
 
 Use this to explore a file's token structure before writing a grammar.
 
+### Stdin pipe support
+
+Use `"-"` as the file path to read source from stdin instead of a file:
+
+```bash
+echo 'fn add(a: i32, b: i32) i32 { return a + b; }' | .bin/lasp parse -
+echo 'fn add(a: i32, b: i32) i32 { return a + b; }' | .bin/lasp parse - -g examples/grammars/zig.toml
+cat src/main.zig | .bin/lasp parse - -g examples/grammars/zig.toml
+```
+
+When `"-"` is the target path, LASP reads all bytes from stdin until EOF and processes them identically to file input. Empty stdin produces an empty events array.
+
 ### Structural parsing (with grammar)
 
 ```bash
@@ -41,6 +53,60 @@ Returns structural events with captures, confidence scores, and position info:
 { "events": [
   { "type": "function", "start": 0, "end": 15, "line": 1, "confidence": 1.00, "col": 0, "name": "add" }
 ] }
+```
+
+### Node type filtering (`--node` / `-n`)
+
+Emit only structural events matching a specific type name:
+
+```bash
+.bin/lasp parse file.zig -g examples/grammars/zig.toml --node function
+.bin/lasp parse file.zig -g examples/grammars/zig.toml -n call
+```
+
+The comparison is case-insensitive. When the filter matches zero events, the output is a valid JSON object with an empty events array. When no grammar is specified, `--node` is silently ignored and raw token JSON is emitted.
+
+### Names-only output (`--names-only`)
+
+Emit just the first capture value per event, one per line — plain text, no JSON:
+
+```bash
+.bin/lasp parse file.zig -g examples/grammars/zig.toml --names-only
+```
+
+Output:
+
+```
+add
+subtract
+multiply
+```
+
+Events with no captures are skipped. When no grammar is specified, `--names-only` is silently ignored and raw token JSON is emitted.
+
+### Composable pipelines
+
+All three features compose together. Combine stdin, node filtering, and names-only output for powerful one-liners:
+
+```bash
+# Pipe source, filter to functions, get just names
+echo 'fn add() void {} fn sub() void {}' | .bin/lasp parse - -g examples/grammars/zig.toml --node function --names-only
+
+# List all function names in a file
+.bin/lasp parse src/main.zig -g examples/grammars/zig.toml --node function --names-only
+
+# Pipe source and filter to calls, JSON output
+cat src/main.zig | .bin/lasp parse - -g examples/grammars/zig.toml --node call
+
+# Count functions in a file
+.bin/lasp parse src/main.zig -g examples/grammars/zig.toml --node function --names-only | wc -l
+
+# Find a specific function
+.bin/lasp parse src/main.zig -g examples/grammars/zig.toml --node function --names-only | grep parseArgs
+
+# Diff function lists between files
+diff <(.bin/lasp parse a.zig -g examples/grammars/zig.toml --node function --names-only) \
+     <(.bin/lasp parse b.zig -g examples/grammars/zig.toml --node function --names-only)
 ```
 
 ## Writing a Grammar
@@ -211,4 +277,5 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | Missing `[[patterns]]` | stderr message, non-zero exit |
 | Invalid `position` value | stderr message, non-zero exit |
 | Negative weight value | stderr message, non-zero exit |
+| `--node` without value | stderr message, non-zero exit |
 | No args | Usage message on stderr, non-zero exit |
