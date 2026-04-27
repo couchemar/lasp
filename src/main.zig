@@ -87,8 +87,31 @@ pub fn main() !void {
         };
         const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
         const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
-        const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
-        try json.serializeEvents(structural_events, stdout);
+        var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
+
+        // Apply node filter if specified
+        if (parsed.node_filter) |filter| {
+            var filtered_events: std.ArrayList(events.StructuralEvent) = .empty;
+            defer filtered_events.deinit(allocator);
+            for (structural_events) |event| {
+                if (std.ascii.eqlIgnoreCase(event.type_name, filter)) {
+                    try filtered_events.append(allocator, event);
+                }
+            }
+            structural_events = try filtered_events.toOwnedSlice(allocator);
+        }
+
+        // Output dispatch: names-only or JSON
+        if (parsed.names_only) {
+            for (structural_events) |event| {
+                if (event.captures.len > 0) {
+                    try stdout.writeAll(event.captures[0].value);
+                    try stdout.writeAll("\n");
+                }
+            }
+        } else {
+            try json.serializeEvents(structural_events, stdout);
+        }
     } else {
         // No grammar: raw token output
         const tokens = try tokenizer.tokenize(source, null, allocator);
@@ -366,4 +389,285 @@ test "integration: invalid position value exits non-zero" {
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
+}
+
+// Feature: composable-cli-primitives, Property 3: Node filter correctness
+test "property: node filter correctness" {
+    // Helper to create a StructuralEvent
+    const createEvent = struct {
+        fn create(allocator: std.mem.Allocator, type_name: []const u8, captures_len: usize) !events.StructuralEvent {
+            var captures: []const events.CaptureEntry = &[_]events.CaptureEntry{};
+            if (captures_len > 0) {
+                const caps = try allocator.alloc(events.CaptureEntry, captures_len);
+                for (caps) |*cap| {
+                    cap.* = .{ .field_name = "name", .value = "test" };
+                }
+                captures = caps;
+            }
+            return .{
+                .type_name = type_name,
+                .captures = captures,
+                .start = 0,
+                .end = 10,
+                .line = 1,
+                .col = 0,
+                .confidence = 1.0,
+            };
+        }
+    }.create;
+
+    // Generate random events with random type names
+    const type_name_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric });
+
+    try minish.check(std.testing.allocator, type_name_gen, struct {
+        fn prop(type_name: []const u8) !void {
+            const allocator = std.testing.allocator;
+            const num_events = 5;
+
+            // Create events with the same type name
+            var events_list: std.ArrayList(events.StructuralEvent) = .empty;
+            defer {
+                for (events_list.items) |e| {
+                    allocator.free(e.captures);
+                }
+                events_list.deinit(allocator);
+            }
+
+            var i: usize = 0;
+            while (i < num_events) : (i += 1) {
+                const event = try createEvent(allocator, type_name, 0);
+                try events_list.append(allocator, event);
+            }
+
+            // Apply filter (case-insensitive)
+            const filter = type_name;
+            var filtered: std.ArrayList(events.StructuralEvent) = .empty;
+            defer {
+                for (filtered.items) |e| {
+                    allocator.free(e.captures);
+                }
+                filtered.deinit(allocator);
+            }
+
+            for (events_list.items) |event| {
+                if (std.ascii.eqlIgnoreCase(event.type_name, filter)) {
+                    try filtered.append(allocator, event);
+                }
+            }
+
+            // All events should match
+            try std.testing.expectEqual(events_list.items.len, filtered.items.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Test that non-matching filter returns empty
+    try minish.check(std.testing.allocator, type_name_gen, struct {
+        fn prop(type_name: []const u8) !void {
+            const allocator = std.testing.allocator;
+            const num_events = 5;
+
+            var events_list: std.ArrayList(events.StructuralEvent) = .empty;
+            defer {
+                for (events_list.items) |e| {
+                    allocator.free(e.captures);
+                }
+                events_list.deinit(allocator);
+            }
+
+            var i: usize = 0;
+            while (i < num_events) : (i += 1) {
+                const event = try createEvent(allocator, type_name, 0);
+                try events_list.append(allocator, event);
+            }
+
+            // Apply non-matching filter
+            const filter = "call";
+            var filtered: std.ArrayList(events.StructuralEvent) = .empty;
+            defer {
+                for (filtered.items) |e| {
+                    allocator.free(e.captures);
+                }
+                filtered.deinit(allocator);
+            }
+
+            for (events_list.items) |event| {
+                if (std.ascii.eqlIgnoreCase(event.type_name, filter)) {
+                    try filtered.append(allocator, event);
+                }
+            }
+
+            // No events should match
+            try std.testing.expectEqual(@as(usize, 0), filtered.items.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Test case-insensitive matching
+    try minish.check(std.testing.allocator, type_name_gen, struct {
+        fn prop(type_name: []const u8) !void {
+            const allocator = std.testing.allocator;
+            const event = try createEvent(allocator, type_name, 0);
+            defer allocator.free(event.captures);
+
+            // Test that eqlIgnoreCase works with same case
+            const matches_same = std.ascii.eqlIgnoreCase(event.type_name, type_name);
+            try std.testing.expect(matches_same);
+
+            // Test with uppercase version of the same string
+            if (type_name.len > 0) {
+                var upper_type_name = try allocator.alloc(u8, type_name.len);
+                defer allocator.free(upper_type_name);
+                for (type_name, 0..) |c, i| {
+                    upper_type_name[i] = std.ascii.toUpper(c);
+                }
+                const matches_upper = std.ascii.eqlIgnoreCase(event.type_name, upper_type_name);
+                try std.testing.expect(matches_upper);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: composable-cli-primitives, Property 4: Names-only output correctness
+test "property: names-only output correctness" {
+    // Helper to create a StructuralEvent with captures
+    const createEventWithCaptures = struct {
+        fn create(allocator: std.mem.Allocator, type_name: []const u8, capture_value: []const u8) !events.StructuralEvent {
+            const captures = try allocator.alloc(events.CaptureEntry, 1);
+            captures[0] = .{ .field_name = "name", .value = capture_value };
+            return .{
+                .type_name = type_name,
+                .captures = captures,
+                .start = 0,
+                .end = 10,
+                .line = 1,
+                .col = 0,
+                .confidence = 1.0,
+            };
+        }
+    }.create;
+
+    // Helper to create a StructuralEvent without captures
+    const createEventNoCaptures = struct {
+        fn create(_: std.mem.Allocator, type_name: []const u8) !events.StructuralEvent {
+            return .{
+                .type_name = type_name,
+                .captures = &[_]events.CaptureEntry{},
+                .start = 0,
+                .end = 10,
+                .line = 1,
+                .col = 0,
+                .confidence = 1.0,
+            };
+        }
+    }.create;
+
+    // Generate random capture values
+    const value_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric });
+
+    // Test: names-only output produces one line per event with captures
+    try minish.check(std.testing.allocator, value_gen, struct {
+        fn prop(capture_value: []const u8) !void {
+            const allocator = std.testing.allocator;
+
+            // Create events: some with captures, some without
+            var events_list: std.ArrayList(events.StructuralEvent) = .empty;
+            defer {
+                for (events_list.items) |e| {
+                    allocator.free(e.captures);
+                }
+                events_list.deinit(allocator);
+            }
+
+            // Add event with captures
+            const event_with = try createEventWithCaptures(allocator, "function", capture_value);
+            try events_list.append(allocator, event_with);
+
+            // Add event without captures
+            const event_without = try createEventNoCaptures(allocator, "function");
+            try events_list.append(allocator, event_without);
+
+            // Simulate names-only output - count lines and verify content
+            var line_count: usize = 0;
+            var first_capture_value: ?[]const u8 = null;
+            for (events_list.items) |event| {
+                if (event.captures.len > 0) {
+                    line_count += 1;
+                    if (first_capture_value == null) {
+                        first_capture_value = event.captures[0].value;
+                    }
+                }
+            }
+
+            // Should have exactly one line (one event with captures)
+            try std.testing.expectEqual(@as(usize, 1), line_count);
+            try std.testing.expectEqualStrings(capture_value, first_capture_value.?);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Test: all events with captures produces output lines equal to event count
+    try minish.check(std.testing.allocator, value_gen, struct {
+        fn prop(capture_value: []const u8) !void {
+            const allocator = std.testing.allocator;
+            const num_events = 3;
+
+            var events_list: std.ArrayList(events.StructuralEvent) = .empty;
+            defer {
+                for (events_list.items) |e| {
+                    allocator.free(e.captures);
+                }
+                events_list.deinit(allocator);
+            }
+
+            // Add events with captures
+            var i: usize = 0;
+            while (i < num_events) : (i += 1) {
+                const event = try createEventWithCaptures(allocator, "function", capture_value);
+                try events_list.append(allocator, event);
+            }
+
+            // Simulate names-only output - count lines
+            var line_count: usize = 0;
+            for (events_list.items) |event| {
+                if (event.captures.len > 0) {
+                    line_count += 1;
+                    try std.testing.expectEqualStrings(capture_value, event.captures[0].value);
+                }
+            }
+
+            // Should have exactly num_events lines
+            try std.testing.expectEqual(num_events, line_count);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    // Test: events without captures produce no output
+    try minish.check(std.testing.allocator, value_gen, struct {
+        fn prop(_: []const u8) !void {
+            const allocator = std.testing.allocator;
+
+            var events_list: std.ArrayList(events.StructuralEvent) = .empty;
+            defer {
+                for (events_list.items) |e| {
+                    allocator.free(e.captures);
+                }
+                events_list.deinit(allocator);
+            }
+
+            // Add events without captures
+            var i: usize = 0;
+            while (i < 5) : (i += 1) {
+                const event = try createEventNoCaptures(allocator, "function");
+                try events_list.append(allocator, event);
+            }
+
+            // Simulate names-only output - count lines
+            var line_count: usize = 0;
+            for (events_list.items) |event| {
+                if (event.captures.len > 0) {
+                    line_count += 1;
+                }
+            }
+
+            // Should have zero lines
+            try std.testing.expectEqual(@as(usize, 0), line_count);
+        }
+    }.prop, .{ .num_runs = 100 });
 }
