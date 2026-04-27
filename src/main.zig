@@ -53,7 +53,7 @@ pub fn main() !void {
         if (std.mem.eql(u8, parsed.target_path, "-")) {
             var stdin_buffer: [4096]u8 = undefined;
             var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
-            break :blk try stdin_reader.interface.readAlloc(allocator, std.math.maxInt(usize));
+            break :blk try stdin_reader.interface.allocRemaining(allocator, .unlimited);
         } else {
             break :blk readSourceFile(allocator, parsed.target_path) catch {
                 std.process.fatal("failed to read file: {s}", .{parsed.target_path});
@@ -670,4 +670,233 @@ test "property: names-only output correctness" {
             try std.testing.expectEqual(@as(usize, 0), line_count);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// Helper: run lasp with data piped to stdin
+fn runLaspWithStdin(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: []const u8) !struct { stdout: []u8, stderr: []u8, term: std.process.Child.Term } {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "zig-out/bin/lasp");
+    for (args) |a| try argv.append(allocator, a);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+
+    // Write stdin data and close the pipe
+    if (child.stdin) |*stdin_pipe| {
+        var buf: [4096]u8 = undefined;
+        var writer = stdin_pipe.writer(&buf);
+        try writer.interface.writeAll(stdin_data);
+        try writer.interface.flush();
+        stdin_pipe.close();
+        child.stdin = null;
+    }
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    try child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024);
+    const term = try child.wait();
+
+    const stdout_slice = try allocator.dupe(u8, stdout_buf.items);
+    const stderr_slice = try allocator.dupe(u8, stderr_buf.items);
+    stdout_buf.deinit(allocator);
+    stderr_buf.deinit(allocator);
+
+    return .{ .stdout = stdout_slice, .stderr = stderr_slice, .term = term };
+}
+
+// --- Integration Tests for Composable CLI Primitives ---
+
+test "integration: stdin pipe support" {
+    const allocator = std.testing.allocator;
+    const source = "const std = @import(\"std\");\n\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n";
+
+    const result = try runLaspWithStdin(allocator, &.{ "parse", "-", "--grammar", "tests/fixtures/grammars/zig.toml" }, source);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expect(json_events.array.items.len > 0);
+
+    // Should have at least one function event
+    var has_function = false;
+    for (json_events.array.items) |event| {
+        const typ = event.object.get("type").?.string;
+        if (std.mem.eql(u8, typ, "function")) has_function = true;
+    }
+    try std.testing.expect(has_function);
+}
+
+test "integration: stdin pipe with empty input" {
+    const allocator = std.testing.allocator;
+
+    const result = try runLaspWithStdin(allocator, &.{ "parse", "-", "--grammar", "tests/fixtures/grammars/zig.toml" }, "");
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expectEqual(@as(usize, 0), json_events.array.items.len);
+}
+
+test "integration: --node filter with grammar" {
+    const allocator = std.testing.allocator;
+
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/zig.toml", "--node", "function" });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // All events should be of type "function"
+    for (json_events.array.items) |event| {
+        const typ = event.object.get("type").?.string;
+        try std.testing.expect(std.mem.eql(u8, typ, "function"));
+    }
+
+    // Should have at least one function event
+    try std.testing.expect(json_events.array.items.len > 0);
+}
+
+test "integration: --node filter with no grammar (flag ignored)" {
+    const allocator = std.testing.allocator;
+
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--node", "function" });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // Should have raw token events (not filtered)
+    try std.testing.expect(json_events.array.items.len > 0);
+
+    // Raw tokens don't have "confidence" field
+    const first = json_events.array.items[0].object;
+    try std.testing.expect(first.get("confidence") == null);
+}
+
+test "integration: --names-only with grammar" {
+    const allocator = std.testing.allocator;
+
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/zig.toml", "--names-only" });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    // Should be plain text output, not JSON (should not start with '{')
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(result.stdout[0] != '{');
+
+    // Collect non-empty lines
+    var line_count: usize = 0;
+    var has_add = false;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0) {
+            line_count += 1;
+            if (std.mem.eql(u8, line, "add")) has_add = true;
+        }
+    }
+
+    // Should have at least one line and include "add" from the function event
+    try std.testing.expect(line_count > 0);
+    try std.testing.expect(has_add);
+}
+
+test "integration: --names-only with no grammar (flag ignored)" {
+    const allocator = std.testing.allocator;
+
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--names-only" });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    // Should be JSON output (flag ignored)
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // Should have raw token events
+    try std.testing.expect(json_events.array.items.len > 0);
+}
+
+test "integration: combined stdin + --node + --names-only" {
+    const allocator = std.testing.allocator;
+    const source = "const std = @import(\"std\");\n\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n\npub fn sub(x: i32, y: i32) i32 {\n    return x - y;\n}\n";
+
+    const result = try runLaspWithStdin(allocator, &.{ "parse", "-", "--grammar", "tests/fixtures/grammars/zig.toml", "--node", "function", "--names-only" }, source);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    // Should be plain text output with function names
+    try std.testing.expect(result.stdout.len > 0);
+
+    // Count lines and verify they contain function names
+    var line_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0) {
+            line_count += 1;
+            // Should be either "add" or "sub"
+            try std.testing.expect(std.mem.eql(u8, line, "add") or std.mem.eql(u8, line, "sub"));
+        }
+    }
+
+    // Should have 2 function names
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+}
+
+test "integration: --node filter matching zero events" {
+    const allocator = std.testing.allocator;
+
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/zig.toml", "--node", "nonexistent" });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // Should have empty events array
+    try std.testing.expectEqual(@as(usize, 0), json_events.array.items.len);
 }
