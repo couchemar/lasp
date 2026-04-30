@@ -13,30 +13,54 @@ const StructuralEvent = events_mod.StructuralEvent;
 const CaptureEntry = events_mod.CaptureEntry;
 const TokenMatcher = loader.TokenMatcher;
 
-// --- LookbackBuffer: fixed-size circular buffer of capacity 4 ---
-
-const lookback_capacity = 4;
+// --- LookbackBuffer: dynamically-sized circular buffer ---
 
 const LookbackBuffer = struct {
-    entries: [lookback_capacity][]const u8 = .{&.{}} ** lookback_capacity,
+    entries: [][]const u8,
+    capacity: usize,
     count: usize = 0,
     write_pos: usize = 0,
 
+    fn init(allocator: std.mem.Allocator, requested_capacity: usize) !LookbackBuffer {
+        const cap = @max(requested_capacity, 4);
+        const entries = try allocator.alloc([]const u8, cap);
+        @memset(entries, &.{});
+        return .{ .entries = entries, .capacity = cap };
+    }
+
     fn push(self: *LookbackBuffer, text: []const u8) void {
         self.entries[self.write_pos] = text;
-        self.write_pos = (self.write_pos + 1) % lookback_capacity;
-        if (self.count < lookback_capacity) self.count += 1;
+        self.write_pos = (self.write_pos + 1) % self.capacity;
+        if (self.count < self.capacity) self.count += 1;
     }
 
     fn contains(self: LookbackBuffer, text: []const u8) bool {
-        const valid = @min(self.count, lookback_capacity);
+        const valid = @min(self.count, self.capacity);
         for (0..valid) |i| {
             // Read from oldest to newest
-            const idx = if (self.count >= lookback_capacity)
-                (self.write_pos + i) % lookback_capacity
+            const idx = if (self.count >= self.capacity)
+                (self.write_pos + i) % self.capacity
             else
                 i;
             if (std.mem.eql(u8, self.entries[idx], text)) return true;
+        }
+        return false;
+    }
+
+    /// Check if any of the last `window` entries matches any value in `values`.
+    fn containsAny(self: LookbackBuffer, values: []const []const u8, window: usize) bool {
+        const valid = @min(self.count, @min(window, self.capacity));
+        for (0..valid) |i| {
+            // Read from newest to oldest
+            const idx = if (self.count >= self.capacity)
+                (self.write_pos + self.capacity - 1 - i) % self.capacity
+            else if (self.count > i)
+                self.count - 1 - i
+            else
+                break;
+            for (values) |val| {
+                if (std.mem.eql(u8, self.entries[idx], val)) return true;
+            }
         }
         return false;
     }
@@ -121,6 +145,18 @@ fn findPatternIndex(patterns: []const loader.Pattern, type_name: []const u8) usi
     return std.math.maxInt(usize);
 }
 
+/// Scans all patterns' constraints and returns the maximum depth value.
+/// Used to size the LookbackBuffer dynamically based on grammar needs.
+fn computeMaxConstraintDepth(patterns: []const loader.Pattern) usize {
+    var max_depth: usize = 0;
+    for (patterns) |p| {
+        for (p.constraints) |c| {
+            if (c.depth > max_depth) max_depth = c.depth;
+        }
+    }
+    return max_depth;
+}
+
 /// Runs the automaton against the token stream, emitting structural events.
 /// Skips tokens with kind: newline, indent, comment, string.
 /// Processes each non-skipped token exactly once (O(N), no backtracking).
@@ -143,7 +179,8 @@ pub fn parse(
     var matched_qualities: std.ArrayList(MatchResult) = .empty;
     var candidates: std.ArrayList(CandidateEvent) = .empty;
 
-    var lookback = LookbackBuffer{};
+    const max_depth = computeMaxConstraintDepth(patterns);
+    var lookback = try LookbackBuffer.init(allocator, max_depth);
     var block_stack = BlockStack{};
     var prev_token_text: ?[]const u8 = null;
     var match_start_prev_token: ?[]const u8 = null;
@@ -430,6 +467,47 @@ pub fn parse(
     return result.toOwnedSlice(allocator);
 }
 
+/// Evaluates all constraints on a pattern. Returns true if all pass, false if any rejects.
+fn evaluateConstraints(
+    pattern: loader.Pattern,
+    pending_captures: []const CaptureEntry,
+    match_start_prev_token: ?[]const u8,
+    lookback: LookbackBuffer,
+) bool {
+    for (pattern.constraints) |constraint| {
+        switch (constraint.type) {
+            .not => {
+                if (constraint.depth == 0) {
+                    // Depth 0: check captured field value
+                    if (constraint.field) |field_name| {
+                        for (pending_captures) |cap| {
+                            if (std.mem.eql(u8, cap.field_name, field_name)) {
+                                for (constraint.values) |val| {
+                                    if (std.mem.eql(u8, cap.value, val)) return false;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // Field not found in captures → skip constraint (don't reject)
+                } else if (constraint.depth == 1) {
+                    // Depth 1: check immediately preceding token
+                    if (match_start_prev_token) |prev_text| {
+                        for (constraint.values) |val| {
+                            if (std.mem.eql(u8, prev_text, val)) return false;
+                        }
+                    }
+                    // No preceding token (start of stream) → pass
+                } else {
+                    // Depth 2..N: check lookback window
+                    if (lookback.containsAny(constraint.values, constraint.depth)) return false;
+                }
+            },
+        }
+    }
+    return true;
+}
+
 /// Checks constraints (position) and confidence,
 /// then buffers a candidate event if all checks pass. Used for the normal
 /// (non-optional-skip) code path.
@@ -444,8 +522,8 @@ fn bufferCandidate(
     matched_qualities: *std.ArrayList(MatchResult),
     pattern_start: usize,
     pattern_col: usize,
-    _: ?[]const u8, // match_start_prev_token — reserved for unified constraint evaluation
-    _: LookbackBuffer, // lookback — reserved for unified constraint evaluation
+    match_start_prev_token: ?[]const u8,
+    lookback: LookbackBuffer,
     block_stack: BlockStack,
     tokens: []const Token,
     token: Token,
@@ -462,6 +540,13 @@ fn bufferCandidate(
                     if (pattern_col != 0) return false;
                 },
             }
+        }
+    }
+
+    // Unified constraint evaluation (replaces exclude + not_preceded_by)
+    if (pattern) |p| {
+        if (!evaluateConstraints(p, pending_captures.items, match_start_prev_token, lookback)) {
+            return false;
         }
     }
 
@@ -774,7 +859,8 @@ test "parse: multiple pattern matches" {
 // --- LookbackBuffer Unit Tests ---
 
 test "LookbackBuffer: push/contains with fewer than 4 entries" {
-    var lb = LookbackBuffer{};
+    var lb = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lb.entries);
     lb.push("hello");
     lb.push("world");
     try testing.expect(lb.contains("hello"));
@@ -783,7 +869,8 @@ test "LookbackBuffer: push/contains with fewer than 4 entries" {
 }
 
 test "LookbackBuffer: circular overwrite after 4+ pushes" {
-    var lb = LookbackBuffer{};
+    var lb = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lb.entries);
     lb.push("a");
     lb.push("b");
     lb.push("c");
@@ -795,6 +882,96 @@ test "LookbackBuffer: circular overwrite after 4+ pushes" {
     try testing.expect(!lb.contains("a"));
     try testing.expect(lb.contains("e"));
     try testing.expect(lb.contains("b"));
+}
+
+test "LookbackBuffer: init enforces minimum capacity of 4" {
+    const lb = try LookbackBuffer.init(testing.allocator, 1);
+    defer testing.allocator.free(lb.entries);
+    try testing.expectEqual(@as(usize, 4), lb.capacity);
+
+    const lb2 = try LookbackBuffer.init(testing.allocator, 0);
+    defer testing.allocator.free(lb2.entries);
+    try testing.expectEqual(@as(usize, 4), lb2.capacity);
+}
+
+test "LookbackBuffer: init with capacity > 4" {
+    var lb = try LookbackBuffer.init(testing.allocator, 8);
+    defer testing.allocator.free(lb.entries);
+    try testing.expectEqual(@as(usize, 8), lb.capacity);
+
+    // Push 8 entries — all should be retained
+    lb.push("a");
+    lb.push("b");
+    lb.push("c");
+    lb.push("d");
+    lb.push("e");
+    lb.push("f");
+    lb.push("g");
+    lb.push("h");
+    try testing.expect(lb.contains("a"));
+    try testing.expect(lb.contains("h"));
+
+    // Push one more — "a" should be overwritten
+    lb.push("i");
+    try testing.expect(!lb.contains("a"));
+    try testing.expect(lb.contains("b"));
+    try testing.expect(lb.contains("i"));
+}
+
+test "LookbackBuffer: containsAny checks last window entries" {
+    var lb = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lb.entries);
+    lb.push("a");
+    lb.push("b");
+    lb.push("c");
+    lb.push("d");
+
+    // Window of 2 should check last 2 entries: "c", "d"
+    const values = &[_][]const u8{"a"};
+    try testing.expect(!lb.containsAny(values, 2));
+
+    const values2 = &[_][]const u8{"d"};
+    try testing.expect(lb.containsAny(values2, 2));
+
+    const values3 = &[_][]const u8{"c"};
+    try testing.expect(lb.containsAny(values3, 2));
+
+    // Window of 4 should check all entries
+    try testing.expect(lb.containsAny(values, 4));
+}
+
+test "LookbackBuffer: containsAny with multiple values" {
+    var lb = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lb.entries);
+    lb.push("x");
+    lb.push("y");
+    lb.push("z");
+
+    const values = &[_][]const u8{ "a", "b", "y" };
+    try testing.expect(lb.containsAny(values, 3));
+
+    const values2 = &[_][]const u8{ "a", "b", "c" };
+    try testing.expect(!lb.containsAny(values2, 3));
+}
+
+test "LookbackBuffer: containsAny with window larger than count" {
+    var lb = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lb.entries);
+    lb.push("a");
+    lb.push("b");
+
+    // Window of 10 but only 2 entries — should check both
+    const values = &[_][]const u8{"a"};
+    try testing.expect(lb.containsAny(values, 10));
+}
+
+test "LookbackBuffer: containsAny with window of 0 matches nothing" {
+    var lb = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lb.entries);
+    lb.push("a");
+
+    const values = &[_][]const u8{"a"};
+    try testing.expect(!lb.containsAny(values, 0));
 }
 
 // --- BlockStack Unit Tests ---
@@ -1119,7 +1296,9 @@ test "property: lookback buffer stores last N non-skip tokens" {
 
     try minish.check(testing.allocator, count_gen, struct {
         fn prop(num_tokens: u8) !void {
-            var lb = LookbackBuffer{};
+            const capacity: usize = 4;
+            var lb = try LookbackBuffer.init(testing.allocator, capacity);
+            defer testing.allocator.free(lb.entries);
 
             // Push num_tokens entries
             var expected: std.ArrayList([]const u8) = .empty;
@@ -1131,14 +1310,14 @@ test "property: lookback buffer stores last N non-skip tokens" {
                 try expected.append(testing.allocator, names[i]);
             }
 
-            // The buffer should contain the last min(count, 4) entries
-            const window_start = if (num_tokens > lookback_capacity) num_tokens - lookback_capacity else 0;
+            // The buffer should contain the last min(count, capacity) entries
+            const window_start = if (num_tokens > capacity) num_tokens - capacity else 0;
             for (window_start..num_tokens) |i| {
                 try testing.expect(lb.contains(names[i]));
             }
 
             // Entries before the window should not be present (if overwritten)
-            if (num_tokens > lookback_capacity) {
+            if (num_tokens > capacity) {
                 for (0..window_start) |i| {
                     try testing.expect(!lb.contains(names[i]));
                 }
@@ -2310,4 +2489,451 @@ test "parse: custom weights produce different confidence than defaults for same 
     // With higher keyword weight, the max_score is higher but matched stays the same,
     // so confidence should be lower with custom weights
     try testing.expect(custom_result[0].confidence < default_result[0].confidence);
+}
+
+// Feature: unified-constraint-system, Property 3: Depth-0 capture value filtering
+// **Validates: Requirements 3.1, 3.2, 3.3, 3.5, 10.5**
+test "property: depth-0 capture value filtering" {
+    // Generate a random captured value and a random constraint value, plus a boolean
+    // to decide whether the captured value should be in the constraint values list.
+    const tuple_gen = comptime gen.tuple3(
+        []const u8,
+        []const u8,
+        bool,
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.boolean(),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8, bool }) !void {
+            const captured_value = vals[0];
+            const constraint_value = vals[1];
+            const should_match = vals[2];
+
+            // Build the constraint values list:
+            // If should_match is true, include the captured_value in the constraint values.
+            // If should_match is false, use only constraint_value (which may or may not equal captured_value).
+            const lookback = try LookbackBuffer.init(testing.allocator, 4);
+            defer testing.allocator.free(lookback.entries);
+
+            // Case 1: Captured value IS in constraint values → should reject (return false)
+            if (should_match) {
+                const constraint_values = &[_][]const u8{captured_value};
+                const pattern = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = 0,
+                        .field = "name",
+                        .values = constraint_values,
+                    }},
+                };
+
+                const captures = &[_]CaptureEntry{.{
+                    .field_name = "name",
+                    .value = captured_value,
+                }};
+
+                // Req 3.1, 3.2: captured value matches constraint → reject
+                const result = evaluateConstraints(pattern, captures, null, lookback);
+                try testing.expect(!result);
+            } else {
+                // Case 2: Use constraint_value which may differ from captured_value
+                const constraint_values = &[_][]const u8{constraint_value};
+                const pattern = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = 0,
+                        .field = "name",
+                        .values = constraint_values,
+                    }},
+                };
+
+                const captures = &[_]CaptureEntry{.{
+                    .field_name = "name",
+                    .value = captured_value,
+                }};
+
+                const result = evaluateConstraints(pattern, captures, null, lookback);
+
+                // Req 3.2, 3.3, 3.5: exact byte equality check
+                const values_contain_capture = std.mem.eql(u8, captured_value, constraint_value);
+                if (values_contain_capture) {
+                    try testing.expect(!result); // reject
+                } else {
+                    try testing.expect(result); // allow
+                }
+            }
+
+            // Case 3: Field name doesn't match any capture → skip constraint (allow)
+            // Req 3.4: field not found in captures → skip without rejecting
+            {
+                const constraint_values = &[_][]const u8{captured_value};
+                const pattern_no_field = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = 0,
+                        .field = "other_field",
+                        .values = constraint_values,
+                    }},
+                };
+
+                const captures = &[_]CaptureEntry{.{
+                    .field_name = "name",
+                    .value = captured_value,
+                }};
+
+                const result = evaluateConstraints(pattern_no_field, captures, null, lookback);
+                try testing.expect(result); // should always pass when field doesn't match
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: unified-constraint-system, Property 4: Depth-1 preceding token constraint
+// **Validates: Requirements 4.1, 4.2, 4.3**
+test "property: depth-1 preceding token constraint" {
+    // Generate a random preceding token text and a random constraint value, plus a boolean
+    // to decide whether the preceding token should be in the constraint values list.
+    const tuple_gen = comptime gen.tuple3(
+        []const u8,
+        []const u8,
+        bool,
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.boolean(),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8, bool }) !void {
+            const prev_token_text = vals[0];
+            const constraint_value = vals[1];
+            const should_match = vals[2];
+
+            const lookback = try LookbackBuffer.init(testing.allocator, 4);
+            defer testing.allocator.free(lookback.entries);
+
+            const empty_captures = &[_]CaptureEntry{};
+
+            // Case 1: Preceding token IS in constraint values → should reject (return false)
+            if (should_match) {
+                const constraint_values = &[_][]const u8{prev_token_text};
+                const pattern = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = 1,
+                        .field = null,
+                        .values = constraint_values,
+                    }},
+                };
+
+                // Req 4.1, 4.2: preceding token matches constraint → reject
+                const result = evaluateConstraints(pattern, empty_captures, prev_token_text, lookback);
+                try testing.expect(!result);
+            } else {
+                // Case 2: Use constraint_value which may differ from prev_token_text
+                const constraint_values = &[_][]const u8{constraint_value};
+                const pattern = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = 1,
+                        .field = null,
+                        .values = constraint_values,
+                    }},
+                };
+
+                const result = evaluateConstraints(pattern, empty_captures, prev_token_text, lookback);
+
+                // Req 4.1, 4.2: exact byte equality check
+                const values_contain_prev = std.mem.eql(u8, prev_token_text, constraint_value);
+                if (values_contain_prev) {
+                    try testing.expect(!result); // reject
+                } else {
+                    try testing.expect(result); // allow
+                }
+            }
+
+            // Case 3: No preceding token (null) → match should proceed (start of stream)
+            // Req 4.3: no preceding token → allow
+            {
+                const constraint_values = &[_][]const u8{prev_token_text};
+                const pattern_null_prev = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = 1,
+                        .field = null,
+                        .values = constraint_values,
+                    }},
+                };
+
+                const result = evaluateConstraints(pattern_null_prev, empty_captures, null, lookback);
+                try testing.expect(result); // should always pass when no preceding token
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: unified-constraint-system, Property 5: Depth-N lookback window constraint
+// **Validates: Requirements 5.1, 5.2**
+test "property: depth-N lookback window constraint" {
+    // Generate a random depth (2-8), a random constraint value string, and a boolean
+    // to control whether the constraint value appears within the lookback window.
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        []const u8,
+        bool,
+        gen.intRange(u8, 2, 8),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.boolean(),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, []const u8, bool }) !void {
+            const depth: u8 = vals[0];
+            const constraint_value: []const u8 = vals[1];
+            const value_in_window: bool = vals[2];
+
+            const empty_captures = &[_]CaptureEntry{};
+
+            // Case 1: Constraint value IS within the last N tokens → should reject
+            if (value_in_window) {
+                var lookback = try LookbackBuffer.init(testing.allocator, depth);
+                defer testing.allocator.free(lookback.entries);
+
+                // Push some filler tokens, then push the constraint value within the window
+                // Push (depth - 1) filler tokens first, then the constraint value
+                for (0..@as(usize, depth) - 1) |_| {
+                    lookback.push("filler");
+                }
+                lookback.push(constraint_value);
+
+                const constraint_values = &[_][]const u8{constraint_value};
+                const pattern = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = depth,
+                        .field = null,
+                        .values = constraint_values,
+                    }},
+                };
+
+                // Req 5.1, 5.2: value in last N tokens → reject
+                const result = evaluateConstraints(pattern, empty_captures, null, lookback);
+                try testing.expect(!result);
+            } else {
+                // Case 2: Constraint value is NOT within the last N tokens → should allow
+                var lookback = try LookbackBuffer.init(testing.allocator, depth);
+                defer testing.allocator.free(lookback.entries);
+
+                // Push exactly depth tokens of filler (none matching constraint_value)
+                // Use a filler that is guaranteed different from constraint_value
+                const filler = "zzz_no_match";
+                for (0..@as(usize, depth)) |_| {
+                    lookback.push(filler);
+                }
+
+                const constraint_values = &[_][]const u8{constraint_value};
+                const pattern = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = depth,
+                        .field = null,
+                        .values = constraint_values,
+                    }},
+                };
+
+                // Req 5.1, 5.2: value NOT in last N tokens → allow
+                const result = evaluateConstraints(pattern, empty_captures, null, lookback);
+
+                // The filler is "zzz_no_match" which is guaranteed different from
+                // constraint_value (alpha charset, max 8 chars, min 1 char).
+                // However, if constraint_value happens to equal "zzz_no_match",
+                // the test would be wrong. Since constraint_value is alpha charset
+                // with max 8 chars, and "zzz_no_match" is 12 chars, this can't happen.
+                try testing.expect(result);
+            }
+
+            // Case 3: Value pushed OUTSIDE the window (more than N tokens ago) → should allow
+            {
+                // Use a larger buffer so we can push the value then push enough
+                // filler to push it outside the window
+                const buf_cap = @as(usize, depth) + 4;
+                var lookback_outside = try LookbackBuffer.init(testing.allocator, buf_cap);
+                defer testing.allocator.free(lookback_outside.entries);
+
+                // Push the constraint value first
+                lookback_outside.push(constraint_value);
+
+                // Then push exactly `depth` filler tokens to push it outside the window
+                for (0..@as(usize, depth)) |_| {
+                    lookback_outside.push("other_token");
+                }
+
+                const constraint_values = &[_][]const u8{constraint_value};
+                const pattern_outside = loader.Pattern{
+                    .type_name = "test",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                    .constraints = &.{.{
+                        .type = .not,
+                        .depth = depth,
+                        .field = null,
+                        .values = constraint_values,
+                    }},
+                };
+
+                // Value was pushed depth+1 tokens ago, outside the window of depth tokens
+                // "other_token" is 11 chars, constraint_value is alpha max 8 chars → no collision
+                const result = evaluateConstraints(pattern_outside, empty_captures, null, lookback_outside);
+                try testing.expect(result);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: unified-constraint-system, Property 6: Dynamic LookbackBuffer capacity
+// **Validates: Requirements 5.3, 5.4, 5.5**
+test "property: dynamic LookbackBuffer capacity" {
+    // Generate three random depth values (0-20) representing constraint depths
+    // on 1-3 patterns. We test that computeMaxConstraintDepth returns the max,
+    // and LookbackBuffer.init allocates capacity = @max(max_depth, 4).
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        u8,
+        u8,
+        gen.intRange(u8, 0, 20),
+        gen.intRange(u8, 0, 20),
+        gen.intRange(u8, 0, 20),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8, u8 }) !void {
+            const depth1: u8 = vals[0];
+            const depth2: u8 = vals[1];
+            const depth3: u8 = vals[2];
+
+            const max_depth = @max(depth1, @max(depth2, depth3));
+            const expected_capacity = @max(@as(usize, max_depth), 4);
+
+            // Dummy values slice for constraints
+            const dummy_values = &[_][]const u8{"x"};
+
+            // Build three patterns, each with one constraint at the respective depth.
+            // depth=0 constraints require a field, depth>0 constraints must not have a field.
+            const constraint1 = loader.Constraint{
+                .type = .not,
+                .depth = depth1,
+                .field = if (depth1 == 0) "name" else null,
+                .values = dummy_values,
+            };
+            const constraint2 = loader.Constraint{
+                .type = .not,
+                .depth = depth2,
+                .field = if (depth2 == 0) "name" else null,
+                .values = dummy_values,
+            };
+            const constraint3 = loader.Constraint{
+                .type = .not,
+                .depth = depth3,
+                .field = if (depth3 == 0) "name" else null,
+                .values = dummy_values,
+            };
+
+            const constraints1 = &[_]loader.Constraint{constraint1};
+            const constraints2 = &[_]loader.Constraint{constraint2};
+            const constraints3 = &[_]loader.Constraint{constraint3};
+
+            const dummy_seq = &[_]loader.SequenceElement{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+            };
+
+            const patterns = &[_]loader.Pattern{
+                .{
+                    .type_name = "p1",
+                    .sequence = dummy_seq,
+                    .captures = &.{},
+                    .constraints = constraints1,
+                },
+                .{
+                    .type_name = "p2",
+                    .sequence = dummy_seq,
+                    .captures = &.{},
+                    .constraints = constraints2,
+                },
+                .{
+                    .type_name = "p3",
+                    .sequence = dummy_seq,
+                    .captures = &.{},
+                    .constraints = constraints3,
+                },
+            };
+
+            // Req 5.3: computeMaxConstraintDepth returns the maximum depth across all constraints
+            const computed_max = computeMaxConstraintDepth(patterns);
+            try testing.expectEqual(@as(usize, max_depth), computed_max);
+
+            // Req 5.4, 5.5: LookbackBuffer capacity = @max(max_depth, 4)
+            const lookback = try LookbackBuffer.init(testing.allocator, computed_max);
+            defer testing.allocator.free(lookback.entries);
+            try testing.expectEqual(expected_capacity, lookback.capacity);
+
+            // Verify minimum capacity of 4 when all depths are small
+            if (max_depth < 4) {
+                try testing.expectEqual(@as(usize, 4), lookback.capacity);
+            } else {
+                try testing.expectEqual(@as(usize, max_depth), lookback.capacity);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
 }
