@@ -393,6 +393,12 @@ lasp parse file.rs --grammar grammars/rust.toml -n call
 # Names-only output (plain text, one per line)
 lasp parse file.rs --grammar grammars/rust.toml --names-only
 
+# Structural query (CSS-selector-inspired)
+lasp query 'function' file.rs -g grammars/rust.toml
+lasp query 'function[name="foo"]' file.rs -g grammars/rust.toml
+lasp query '*[confidence>0.8]' file.rs -g grammars/rust.toml
+lasp query 'call[name!="print"]' file.rs -g grammars/rust.toml --names-only
+
 # Composable pipeline
 echo 'fn add() {}' | lasp parse - -g grammars/rust.toml --node function --names-only
 ```
