@@ -2937,3 +2937,269 @@ test "property: dynamic LookbackBuffer capacity" {
         }
     }.prop, .{ .num_runs = 100 });
 }
+
+// --- Unified Constraint System: Engine Unit Tests ---
+// These unit tests complement the property tests (Properties 3-6) with specific
+// examples that directly call evaluateConstraints and exercise the full parse pipeline.
+
+// Requirement 10.2: Engine unit tests for unified constraint checks
+// Requirement 10.5: Depth-0 capture filtering unit test
+
+test "evaluateConstraints: depth-0 rejects when captured value matches" {
+    const lookback = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lookback.entries);
+
+    const pattern = loader.Pattern{
+        .type_name = "method",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 0,
+            .field = "name",
+            .values = &.{ "print", "RegExp" },
+        }},
+    };
+
+    const captures = &[_]CaptureEntry{.{ .field_name = "name", .value = "print" }};
+    const result = evaluateConstraints(pattern, captures, null, lookback);
+    try testing.expect(!result); // rejected because "print" is in values
+}
+
+test "evaluateConstraints: depth-0 allows when captured value does not match" {
+    const lookback = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lookback.entries);
+
+    const pattern = loader.Pattern{
+        .type_name = "method",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 0,
+            .field = "name",
+            .values = &.{ "print", "RegExp" },
+        }},
+    };
+
+    const captures = &[_]CaptureEntry{.{ .field_name = "name", .value = "myFunc" }};
+    const result = evaluateConstraints(pattern, captures, null, lookback);
+    try testing.expect(result); // allowed because "myFunc" is not in values
+}
+
+test "evaluateConstraints: depth-0 skips when field not found in captures" {
+    const lookback = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lookback.entries);
+
+    const pattern = loader.Pattern{
+        .type_name = "method",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 0,
+            .field = "callee", // field "callee" doesn't exist in captures
+            .values = &.{"print"},
+        }},
+    };
+
+    const captures = &[_]CaptureEntry{.{ .field_name = "name", .value = "print" }};
+    const result = evaluateConstraints(pattern, captures, null, lookback);
+    try testing.expect(result); // allowed because field "callee" not found — constraint skipped
+}
+
+test "evaluateConstraints: depth-1 rejects when preceding token matches" {
+    const lookback = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lookback.entries);
+
+    const pattern = loader.Pattern{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 1,
+            .field = null,
+            .values = &.{ "fun", "=" },
+        }},
+    };
+
+    const captures = &[_]CaptureEntry{.{ .field_name = "name", .value = "add" }};
+    const result = evaluateConstraints(pattern, captures, "fun", lookback);
+    try testing.expect(!result); // rejected because preceding token "fun" is in values
+}
+
+test "evaluateConstraints: depth-1 passes at start of stream (null prev token)" {
+    const lookback = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lookback.entries);
+
+    const pattern = loader.Pattern{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 1,
+            .field = null,
+            .values = &.{ "fun", "=" },
+        }},
+    };
+
+    const captures = &[_]CaptureEntry{.{ .field_name = "name", .value = "add" }};
+    const result = evaluateConstraints(pattern, captures, null, lookback);
+    try testing.expect(result); // allowed because no preceding token (start of stream)
+}
+
+test "evaluateConstraints: depth-N rejects when lookback contains matching token" {
+    var lookback = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lookback.entries);
+
+    // Simulate a token history: ["-spec", "foo", "bar"]
+    lookback.push("-spec");
+    lookback.push("foo");
+    lookback.push("bar");
+
+    const pattern = loader.Pattern{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 4,
+            .field = null,
+            .values = &.{ "-spec", "-type" },
+        }},
+    };
+
+    const captures = &[_]CaptureEntry{.{ .field_name = "name", .value = "add" }};
+    const result = evaluateConstraints(pattern, captures, null, lookback);
+    try testing.expect(!result); // rejected because "-spec" is in the lookback window
+}
+
+test "evaluateConstraints: multiple constraints short-circuit on first rejection" {
+    const lookback = try LookbackBuffer.init(testing.allocator, 4);
+    defer testing.allocator.free(lookback.entries);
+
+    // Pattern with two constraints:
+    // 1. depth=0: reject if captured name is "print"
+    // 2. depth=1: reject if preceding token is "fun"
+    // If the first constraint rejects, the second is never evaluated (short-circuit).
+    const pattern = loader.Pattern{
+        .type_name = "method",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .constraints = &.{
+            .{
+                .type = .not,
+                .depth = 0,
+                .field = "name",
+                .values = &.{"print"},
+            },
+            .{
+                .type = .not,
+                .depth = 1,
+                .field = null,
+                .values = &.{"fun"},
+            },
+        },
+    };
+
+    // Captured value "print" matches first constraint → rejected immediately
+    const captures = &[_]CaptureEntry{.{ .field_name = "name", .value = "print" }};
+    const result = evaluateConstraints(pattern, captures, "something_else", lookback);
+    try testing.expect(!result); // rejected by first constraint (depth-0)
+
+    // Now test that both constraints must pass for the match to proceed
+    const captures2 = &[_]CaptureEntry{.{ .field_name = "name", .value = "myFunc" }};
+    const result2 = evaluateConstraints(pattern, captures2, "fun", lookback);
+    try testing.expect(!result2); // first constraint passes, second rejects (preceding "fun")
+
+    // Both constraints pass
+    const captures3 = &[_]CaptureEntry{.{ .field_name = "name", .value = "myFunc" }};
+    const result3 = evaluateConstraints(pattern, captures3, "something_else", lookback);
+    try testing.expect(result3); // both constraints pass → allowed
+}
+
+test "parse: combined position + constraints evaluation order" {
+    // Position is checked BEFORE constraints. A pattern with position = "start"
+    // at col > 0 should be rejected by position check, never reaching constraint evaluation.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+        .position = .start,
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 0,
+            .field = "name",
+            .values = &.{"print"},
+        }},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // Case 1: col > 0, captured value NOT in constraint values
+    // Position check rejects → no event emitted (constraint never evaluated)
+    {
+        const source = "  myFunc(";
+        const tokens = &[_]Token{
+            .{ .kind = .identifier, .start = 2, .end = 8, .line = 1, .col = 2 },
+            .{ .kind = .delimiter, .start = 8, .end = 9, .line = 1, .col = 8 },
+        };
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+        try testing.expectEqual(@as(usize, 0), result.len); // rejected by position
+    }
+
+    // Case 2: col = 0, captured value IS in constraint values
+    // Position check passes, constraint rejects → no event emitted
+    {
+        const source = "print(";
+        const tokens = &[_]Token{
+            .{ .kind = .identifier, .start = 0, .end = 5, .line = 1, .col = 0 },
+            .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
+        };
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+        try testing.expectEqual(@as(usize, 0), result.len); // rejected by constraint
+    }
+
+    // Case 3: col = 0, captured value NOT in constraint values
+    // Both position and constraint pass → event emitted
+    {
+        const source = "myFunc(";
+        const tokens = &[_]Token{
+            .{ .kind = .identifier, .start = 0, .end = 6, .line = 1, .col = 0 },
+            .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
+        };
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len); // both checks pass
+        try testing.expectEqualStrings("function", result[0].type_name);
+    }
+}

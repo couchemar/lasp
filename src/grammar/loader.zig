@@ -1204,11 +1204,27 @@ test "example grammar: erlang.toml parses without errors" {
     try testing.expect(grammar.keyword_table.len > 0);
     try testing.expectEqualStrings("begin", grammar.blocks.open.?);
     try testing.expectEqualStrings("end", grammar.blocks.close.?);
-    // Verify function pattern has position
+    // Verify function pattern has position and constraints
     for (grammar.patterns) |p| {
         if (std.mem.eql(u8, p.type_name, "function")) {
             try testing.expect(p.position != null);
             try testing.expectEqual(PositionConstraint.start, p.position.?);
+            // Verify constraints replaced exclude/not_preceded_by
+            try testing.expectEqual(@as(usize, 2), p.constraints.len);
+            // First constraint: depth=4 lookback (replaces exclude)
+            try testing.expectEqual(ConstraintType.not, p.constraints[0].type);
+            try testing.expectEqual(@as(u8, 4), p.constraints[0].depth);
+            try testing.expect(p.constraints[0].field == null);
+            try testing.expectEqual(@as(usize, 2), p.constraints[0].values.len);
+            try testing.expectEqualStrings("-spec", p.constraints[0].values[0]);
+            try testing.expectEqualStrings("-type", p.constraints[0].values[1]);
+            // Second constraint: depth=1 preceding token (replaces not_preceded_by)
+            try testing.expectEqual(ConstraintType.not, p.constraints[1].type);
+            try testing.expectEqual(@as(u8, 1), p.constraints[1].depth);
+            try testing.expect(p.constraints[1].field == null);
+            try testing.expectEqual(@as(usize, 2), p.constraints[1].values.len);
+            try testing.expectEqualStrings("fun", p.constraints[1].values[0]);
+            try testing.expectEqualStrings("=", p.constraints[1].values[1]);
             break;
         }
     }
