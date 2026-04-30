@@ -150,31 +150,82 @@ sequence = ["$name:IDENTIFIER", "("]
 position = "start"
 ```
 
-### Exclusion patterns
+### Pattern constraints
 
-Discard matches preceded by specific tokens:
+Constraints filter matches after the structural pattern matches. They use a unified `[[patterns.constraints]]` system with a `depth` parameter that determines what gets checked.
+
+#### Capture value filtering (depth=0)
+
+Reject matches where a captured field value is in a blacklist. Requires a `field` key specifying which capture to check:
+
+```toml
+[[patterns]]
+type = "method"
+sequence = ["$name:IDENTIFIER", "("]
+
+[[patterns.constraints]]
+type = "not"
+depth = 0
+field = "name"
+values = ["print", "RegExp", "Future", "Timer"]
+```
+
+#### Preceding token check (depth=1)
+
+Reject matches where the immediately preceding non-skip token matches:
 
 ```toml
 [[patterns]]
 type = "function"
 sequence = ["$name:IDENTIFIER", "("]
 position = "start"
-exclude = ["-spec", "-type"]
+
+[[patterns.constraints]]
+type = "not"
+depth = 1
+values = ["fun", "="]
 ```
 
-### Not-preceded-by constraint
+#### Lookback window check (depth=2..N)
 
-Discard matches where the immediately preceding token matches:
+Reject matches where any of the last N non-skip tokens matches. The window size is configurable via the `depth` value:
 
 ```toml
 [[patterns]]
 type = "function"
 sequence = ["$name:IDENTIFIER", "("]
 position = "start"
-not_preceded_by = ["fun", "="]
+
+[[patterns.constraints]]
+type = "not"
+depth = 4
+values = ["-spec", "-type"]
 ```
 
-Unlike `exclude` (which checks a 4-token lookback buffer), `not_preceded_by` checks only the single immediately preceding non-skip token. Use it for short keywords and operators.
+Multiple constraints can be combined on one pattern. They are evaluated in order after the position check, with short-circuit on first rejection.
+
+```toml
+[[patterns]]
+type = "function"
+sequence = ["$name:IDENTIFIER", "("]
+position = "start"
+
+[[patterns.constraints]]
+type = "not"
+depth = 4
+values = ["-spec", "-type"]
+
+[[patterns.constraints]]
+type = "not"
+depth = 1
+values = ["fun", "="]
+
+[[patterns.constraints]]
+type = "not"
+depth = 0
+field = "name"
+values = ["print", "len"]
+```
 
 ### Optional elements
 
@@ -221,7 +272,7 @@ Omitted keys use defaults. Negative values are rejected.
 2. Identify keyword/symbol patterns that mark structural constructs
 3. Write a `.toml` grammar with those patterns
 4. Run `.bin/lasp parse <file> -g <grammar.toml>` and check the output
-5. Iterate: adjust patterns, add captures, tune position/exclude constraints
+5. Iterate: adjust patterns, add captures, tune position/constraint rules
 
 ## Output Fields
 
@@ -277,5 +328,6 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | Missing `[[patterns]]` | stderr message, non-zero exit |
 | Invalid `position` value | stderr message, non-zero exit |
 | Negative weight value | stderr message, non-zero exit |
+| Deprecated `exclude`/`not_preceded_by` field | stderr message, non-zero exit |
 | `--node` without value | stderr message, non-zero exit |
 | No args | Usage message on stderr, non-zero exit |
