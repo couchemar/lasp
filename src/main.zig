@@ -69,56 +69,122 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    // 6. Dispatch based on grammar
-    if (parsed.grammar_path) |gp| {
-        // Phase 2: TOML grammar → structural events
-        const grammar_source = readSourceFile(allocator, gp) catch {
-            std.process.fatal("failed to read grammar file: {s}", .{gp});
-        };
-        const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
-            const msg: []const u8 = switch (err) {
-                error.InvalidToml => "invalid TOML syntax in grammar file",
-                error.MissingPatterns => "grammar file missing required [[patterns]] section",
-                error.EmptyPatternSequence => "pattern has empty sequence",
-                error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
-                error.InvalidPositionValue => "invalid position value, expected 'start'",
-                error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
-                error.OutOfMemory => "out of memory",
-                else => "unknown grammar error",
+    // 6. Dispatch based on command
+    switch (parsed.command) {
+        .query => {
+            // Query command always requires grammar
+            const gp = parsed.grammar_path orelse {
+                std.process.fatal("error: query command requires --grammar/-g flag", .{});
             };
-            std.process.fatal("error: {s}: {s}", .{ msg, gp });
-        };
-        const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-        const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
-        var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
 
-        // Apply node filter if specified
-        if (parsed.node_filter) |filter| {
-            var filtered_events: std.ArrayList(events.StructuralEvent) = .empty;
-            defer filtered_events.deinit(allocator);
-            for (structural_events) |event| {
-                if (std.ascii.eqlIgnoreCase(event.type_name, filter)) {
-                    try filtered_events.append(allocator, event);
-                }
-            }
-            structural_events = try filtered_events.toOwnedSlice(allocator);
-        }
+            // Parse grammar, compile automaton, tokenize, run engine
+            const grammar_source = readSourceFile(allocator, gp) catch {
+                std.process.fatal("failed to read grammar file: {s}", .{gp});
+            };
+            const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
+                const msg: []const u8 = switch (err) {
+                    error.InvalidToml => "invalid TOML syntax in grammar file",
+                    error.MissingPatterns => "grammar file missing required [[patterns]] section",
+                    error.EmptyPatternSequence => "pattern has empty sequence",
+                    error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
+                    error.InvalidPositionValue => "invalid position value, expected 'start'",
+                    error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+                    error.OutOfMemory => "out of memory",
+                    else => "unknown grammar error",
+                };
+                std.process.fatal("error: {s}: {s}", .{ msg, gp });
+            };
+            const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
+            const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
+            const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
 
-        // Output dispatch: names-only or JSON
-        if (parsed.names_only) {
-            for (structural_events) |event| {
-                if (event.captures.len > 0) {
-                    try stdout.writeAll(event.captures[0].value);
-                    try stdout.writeAll("\n");
+            // Parse selector string into QueryFilter
+            const selector = parsed.query_selector orelse {
+                std.process.fatal("error: query command requires a selector string", .{});
+            };
+            const filter = query_parser.parse(selector, allocator) catch |err| {
+                const msg: []const u8 = switch (err) {
+                    error.EmptySelector => "error: empty selector string",
+                    error.UnclosedBracket => "error: unclosed bracket in selector",
+                    error.MissingFieldName => "error: missing field name in attribute condition",
+                    error.MissingOperator => "error: missing or invalid operator in attribute condition",
+                    error.MissingValue => "error: missing value in attribute condition",
+                    error.UnclosedQuote => "error: unclosed quote in attribute value",
+                    error.InvalidOperator => "error: invalid operator, expected '=', '!=', or '>'",
+                    error.InvalidNumericValue => "error: invalid numeric value for '>' operator",
+                    error.UnexpectedCharacter => "error: unexpected character in selector",
+                    error.OutOfMemory => "error: out of memory",
+                };
+                std.process.fatal("{s}", .{msg});
+            };
+
+            // Evaluate filter against structural events
+            const filtered = try query_evaluator.evaluate(structural_events, filter, allocator);
+
+            // Output: names-only or JSON
+            if (parsed.names_only) {
+                for (filtered) |event| {
+                    if (event.captures.len > 0) {
+                        try stdout.writeAll(event.captures[0].value);
+                        try stdout.writeAll("\n");
+                    }
                 }
+            } else {
+                try json.serializeEvents(filtered, stdout);
             }
-        } else {
-            try json.serializeEvents(structural_events, stdout);
-        }
-    } else {
-        // No grammar: raw token output
-        const tokens = try tokenizer.tokenize(source, null, allocator);
-        try json.serializeTokens(tokens, stdout);
+        },
+        .parse, .parse_dir => {
+            if (parsed.grammar_path) |gp| {
+                // Phase 2: TOML grammar → structural events
+                const grammar_source = readSourceFile(allocator, gp) catch {
+                    std.process.fatal("failed to read grammar file: {s}", .{gp});
+                };
+                const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
+                    const msg: []const u8 = switch (err) {
+                        error.InvalidToml => "invalid TOML syntax in grammar file",
+                        error.MissingPatterns => "grammar file missing required [[patterns]] section",
+                        error.EmptyPatternSequence => "pattern has empty sequence",
+                        error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
+                        error.InvalidPositionValue => "invalid position value, expected 'start'",
+                        error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+                        error.OutOfMemory => "out of memory",
+                        else => "unknown grammar error",
+                    };
+                    std.process.fatal("error: {s}: {s}", .{ msg, gp });
+                };
+                const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
+                const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
+                var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
+
+                // Apply node filter if specified
+                if (parsed.node_filter) |filter| {
+                    var filtered_events: std.ArrayList(events.StructuralEvent) = .empty;
+                    defer filtered_events.deinit(allocator);
+                    for (structural_events) |event| {
+                        if (std.ascii.eqlIgnoreCase(event.type_name, filter)) {
+                            try filtered_events.append(allocator, event);
+                        }
+                    }
+                    structural_events = try filtered_events.toOwnedSlice(allocator);
+                }
+
+                // Output dispatch: names-only or JSON
+                if (parsed.names_only) {
+                    for (structural_events) |event| {
+                        if (event.captures.len > 0) {
+                            try stdout.writeAll(event.captures[0].value);
+                            try stdout.writeAll("\n");
+                        }
+                    }
+                } else {
+                    try json.serializeEvents(structural_events, stdout);
+                }
+            } else {
+                // No grammar: raw token output
+                const tokens = try tokenizer.tokenize(source, null, allocator);
+                try json.serializeTokens(tokens, stdout);
+            }
+        },
     }
 
     try stdout.writeAll("\n");

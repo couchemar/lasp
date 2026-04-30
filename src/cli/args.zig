@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Command = enum {
     parse,
     parse_dir,
+    query,
 };
 
 pub const ParsedArgs = struct {
@@ -12,6 +13,7 @@ pub const ParsedArgs = struct {
     grammar_dir: ?[]const u8 = null,
     node_filter: ?[]const u8 = null,
     names_only: bool = false,
+    query_selector: ?[]const u8 = null,
 };
 
 pub const CliError = error{
@@ -21,17 +23,19 @@ pub const CliError = error{
     MissingFilePath,
     MissingDirectoryPath,
     MissingFlagValue,
+    MissingSelectorString,
 };
 
 /// Returns a human-readable error message for a CliError.
 pub fn formatCliError(err: CliError) []const u8 {
     return switch (err) {
-        error.NoCommand => "error: no command provided. Usage: lasp <parse|parse-dir> <path> [flags]",
+        error.NoCommand => "error: no command provided. Usage: lasp <parse|parse-dir|query> <path> [flags]",
         error.UnrecognizedCommand => "error: unrecognized command",
         error.UnrecognizedFlag => "error: unrecognized flag",
-        error.MissingFilePath => "error: parse command requires a file path",
+        error.MissingFilePath => "error: command requires a file path",
         error.MissingDirectoryPath => "error: parse-dir command requires a directory path",
         error.MissingFlagValue => "error: flag requires a value",
+        error.MissingSelectorString => "error: query command requires a selector string",
     };
 }
 
@@ -44,11 +48,20 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     // Parse command
     const command = parseCommand(args[0]) orelse return error.UnrecognizedCommand;
 
+    // Query command has different positional arg structure:
+    //   query <selector> <file_path> [flags]
+    // Parse/parse-dir:
+    //   parse <file_path> [flags]
+    if (command == .query) {
+        return parseQueryArgs(args);
+    }
+
     // Must have at least a target path after the command
     if (args.len < 2) {
         return switch (command) {
             .parse => error.MissingFilePath,
             .parse_dir => error.MissingDirectoryPath,
+            .query => unreachable,
         };
     }
 
@@ -95,9 +108,53 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     };
 }
 
+/// Parses arguments for the `query` command.
+/// Expected format: query <selector> <file_path> [--grammar/-g <path>] [--names-only]
+fn parseQueryArgs(args: []const []const u8) CliError!ParsedArgs {
+    // args[0] is "query", need at least selector at args[1]
+    if (args.len < 2) return error.MissingSelectorString;
+
+    const query_selector = args[1];
+
+    // Need file path at args[2]
+    if (args.len < 3) return error.MissingFilePath;
+
+    const target_path = args[2];
+
+    // Parse optional flags starting from args[3]
+    var grammar_path: ?[]const u8 = null;
+    var names_only: bool = false;
+
+    var i: usize = 3;
+    while (i < args.len) {
+        const arg = args[i];
+
+        if (std.mem.eql(u8, arg, "--grammar") or std.mem.eql(u8, arg, "-g")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            grammar_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--names-only")) {
+            names_only = true;
+        } else {
+            return error.UnrecognizedFlag;
+        }
+
+        i += 1;
+    }
+
+    return ParsedArgs{
+        .command = .query,
+        .target_path = target_path,
+        .grammar_path = grammar_path,
+        .names_only = names_only,
+        .query_selector = query_selector,
+    };
+}
+
 fn parseCommand(arg: []const u8) ?Command {
     if (std.mem.eql(u8, arg, "parse")) return .parse;
     if (std.mem.eql(u8, arg, "parse-dir")) return .parse_dir;
+    if (std.mem.eql(u8, arg, "query")) return .query;
     return null;
 }
 
@@ -221,6 +278,59 @@ test "new flags combined with existing --grammar/-g flags" {
     try testing.expect(result.names_only == true);
 }
 
+// Tests for query command
+
+test "query with selector + path + grammar" {
+    const args = &[_][]const u8{ "query", "function[name=\"foo\"]", "file.zig", "-g", "grammars/zig.toml" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .query);
+    try testing.expectEqualStrings(result.query_selector.?, "function[name=\"foo\"]");
+    try testing.expectEqualStrings(result.target_path, "file.zig");
+    try testing.expectEqualStrings(result.grammar_path.?, "grammars/zig.toml");
+}
+
+test "query missing selector returns MissingSelectorString" {
+    const args = &[_][]const u8{"query"};
+    const result = parseArgs(args);
+    try testing.expectError(error.MissingSelectorString, result);
+}
+
+test "query missing path returns MissingFilePath" {
+    const args = &[_][]const u8{ "query", "function" };
+    const result = parseArgs(args);
+    try testing.expectError(error.MissingFilePath, result);
+}
+
+test "query missing grammar value returns MissingFlagValue" {
+    const args = &[_][]const u8{ "query", "function", "file.zig", "--grammar" };
+    const result = parseArgs(args);
+    try testing.expectError(error.MissingFlagValue, result);
+}
+
+test "query with --names-only" {
+    const args = &[_][]const u8{ "query", "function", "file.zig", "-g", "grammar.toml", "--names-only" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .query);
+    try testing.expectEqualStrings(result.query_selector.?, "function");
+    try testing.expectEqualStrings(result.target_path, "file.zig");
+    try testing.expectEqualStrings(result.grammar_path.?, "grammar.toml");
+    try testing.expect(result.names_only == true);
+}
+
+test "query with stdin pipe" {
+    const args = &[_][]const u8{ "query", "*[confidence>0.5]", "-", "-g", "grammar.toml" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .query);
+    try testing.expectEqualStrings(result.query_selector.?, "*[confidence>0.5]");
+    try testing.expectEqualStrings(result.target_path, "-");
+}
+
+test "query unrecognized flag returns UnrecognizedFlag" {
+    const args = &[_][]const u8{ "query", "function", "file.zig", "--node", "call" };
+    const result = parseArgs(args);
+    try testing.expectError(error.UnrecognizedFlag, result);
+}
+
 // --- Property Tests ---
 
 const minish = @import("minish");
@@ -292,7 +402,7 @@ test "property: invalid CLI input rejection" {
     try minish.check(testing.allocator, str_gen, struct {
         fn prop(cmd: []const u8) !void {
             // Skip if the random string happens to be a valid command
-            if (std.mem.eql(u8, cmd, "parse") or std.mem.eql(u8, cmd, "parse-dir")) return;
+            if (std.mem.eql(u8, cmd, "parse") or std.mem.eql(u8, cmd, "parse-dir") or std.mem.eql(u8, cmd, "query")) return;
 
             const args = &[_][]const u8{ cmd, "some/path" };
             const result = parseArgs(args);
