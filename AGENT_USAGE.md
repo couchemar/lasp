@@ -96,9 +96,7 @@ echo 'fn add() void {} fn sub() void {}' | .bin/lasp parse - -g examples/grammar
 .bin/lasp parse src/main.zig -g examples/grammars/zig.toml --node function --names-only
 
 # Pipe source and filter to calls, JSON output
-cat src/main.zig | .bin/lasp parse - -g examples/grammars/zig.toml --node call
-
-# Count functions in a file
+cat src/main.zig | .bin/lasp parse - -g examples/grammars/zig.toml --node call# Count functions in a file
 .bin/lasp parse src/main.zig -g examples/grammars/zig.toml --node function --names-only | wc -l
 
 # Find a specific function
@@ -108,6 +106,68 @@ cat src/main.zig | .bin/lasp parse - -g examples/grammars/zig.toml --node call
 diff <(.bin/lasp parse a.zig -g examples/grammars/zig.toml --node function --names-only) \
      <(.bin/lasp parse b.zig -g examples/grammars/zig.toml --node function --names-only)
 ```
+
+## Structural Query (`lasp query`)
+
+Query events using CSS-selector-inspired syntax. Requires a grammar (`-g`).
+
+### Syntax
+
+```
+lasp query '<selector>' <file> -g <grammar.toml> [--names-only]
+```
+
+### Selector syntax
+
+| Selector | Meaning |
+|----------|---------|
+| `function` | Events with type "function" (case-insensitive) |
+| `*` | All events (wildcard) |
+| `function[name="foo"]` | Functions where captured `name` equals "foo" |
+| `function[name!="print"]` | Functions where `name` is NOT "print" (or field absent) |
+| `call[confidence>0.7]` | Calls with confidence above 0.7 |
+| `*[confidence>0.9]` | All events with high confidence |
+| `function[name="foo"][confidence>0.8]` | Multiple conditions (AND) |
+
+### Examples
+
+```bash
+# Find all functions
+.bin/lasp query 'function' file.zig -g examples/grammars/zig.toml
+
+# Find a specific function by name
+.bin/lasp query 'function[name="add"]' file.zig -g examples/grammars/zig.toml
+
+# Find high-confidence events
+.bin/lasp query '*[confidence>0.8]' file.zig -g examples/grammars/zig.toml
+
+# Exclude known built-in calls
+.bin/lasp query 'call[name!="print"]' file.dart -g grammars/dart.toml
+
+# Names-only output for scripting
+.bin/lasp query 'function' file.zig -g examples/grammars/zig.toml --names-only
+
+# Pipe source via stdin
+echo 'fn add() void {}' | .bin/lasp query 'function' - -g examples/grammars/zig.toml
+
+# Combined: stdin + query + names-only
+cat src/main.zig | .bin/lasp query 'function[name!="main"]' - -g examples/grammars/zig.toml --names-only
+```
+
+### Attribute conditions
+
+- `[field="value"]` — equality: include events where capture `field` equals `value`
+- `[field!="value"]` — negation: include events where `field` is absent or differs from `value`
+- `[confidence>N]` — threshold: include events with confidence strictly above N (0.0–1.0)
+- Multiple conditions are AND-combined: all must pass
+
+### Differences from `--node`
+
+`--node` is a simple type filter on `lasp parse`. `lasp query` is more expressive:
+- Attribute conditions (`[name="foo"]`, `[confidence>0.7]`)
+- Negation (`[name!="print"]`)
+- Wildcard type (`*`)
+- Grammar is always required (no raw token mode)
 
 ## Writing a Grammar
 
@@ -330,4 +390,7 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | Negative weight value | stderr message, non-zero exit |
 | Deprecated `exclude`/`not_preceded_by` field | stderr message, non-zero exit |
 | `--node` without value | stderr message, non-zero exit |
+| `query` without selector | stderr message, non-zero exit |
+| `query` without grammar | stderr message, non-zero exit |
+| Malformed query selector | stderr message, non-zero exit |
 | No args | Usage message on stderr, non-zero exit |

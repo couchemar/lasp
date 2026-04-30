@@ -969,3 +969,145 @@ test "integration: --node filter matching zero events" {
     // Should have empty events array
     try std.testing.expectEqual(@as(usize, 0), json_events.array.items.len);
 }
+
+// --- Integration Tests for Structural Query Command ---
+
+test "integration: query type-only filter returns only function events" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/sample.zig", "-g", "tests/fixtures/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // sample.zig has 1 function (add) and 1 call (import) — only function should appear
+    try std.testing.expect(json_events.array.items.len > 0);
+    for (json_events.array.items) |event| {
+        const typ = event.object.get("type").?.string;
+        try std.testing.expectEqualStrings("function", typ);
+    }
+}
+
+test "integration: query type + equality returns matching event" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "function[name=\"add\"]", "tests/fixtures/sample.zig", "-g", "tests/fixtures/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    try std.testing.expectEqual(@as(usize, 1), json_events.array.items.len);
+    const event = json_events.array.items[0].object;
+    try std.testing.expectEqualStrings("function", event.get("type").?.string);
+    try std.testing.expectEqualStrings("add", event.get("name").?.string);
+}
+
+test "integration: query wildcard + confidence threshold" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "*[confidence>0.5]", "tests/fixtures/sample.zig", "-g", "tests/fixtures/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // All events in sample.zig have confidence 1.0, so all should pass >0.5
+    try std.testing.expect(json_events.array.items.len > 0);
+    for (json_events.array.items) |event| {
+        // Verify confidence field exists
+        try std.testing.expect(event.object.get("confidence") != null);
+    }
+}
+
+test "integration: query with --names-only output" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/sample.zig", "-g", "tests/fixtures/grammars/zig.toml", "--names-only" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    // Should be plain text, not JSON
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(result.stdout[0] != '{');
+
+    // Should contain "add" as a line
+    var has_add = false;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, "add")) has_add = true;
+    }
+    try std.testing.expect(has_add);
+}
+
+test "integration: query stdin pipe support" {
+    const allocator = std.testing.allocator;
+    const source = "fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n";
+
+    const result = try runLaspWithStdin(allocator, &.{ "query", "function", "-", "-g", "tests/fixtures/grammars/zig.toml" }, source);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    try std.testing.expect(json_events.array.items.len > 0);
+    const event = json_events.array.items[0].object;
+    try std.testing.expectEqualStrings("function", event.get("type").?.string);
+    try std.testing.expectEqualStrings("add", event.get("name").?.string);
+}
+
+test "integration: query with no args exits non-zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{"query"});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+    try std.testing.expect(result.stderr.len > 0);
+}
+
+test "integration: query without grammar exits non-zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/sample.zig" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+    try std.testing.expect(result.stderr.len > 0);
+}
+
+test "integration: query nonexistent name returns empty valid JSON" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "function[name=\"nonexistent\"]", "tests/fixtures/sample.zig", "-g", "tests/fixtures/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+
+    // Should be valid JSON with empty events array
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expectEqual(@as(usize, 0), json_events.array.items.len);
+}
