@@ -7,6 +7,8 @@ pub const grammar_compiler = @import("grammar/compiler.zig");
 pub const events = @import("parser/events.zig");
 pub const engine = @import("parser/engine.zig");
 pub const query_filter = @import("query/filter.zig");
+pub const query_parser = @import("query/parser.zig");
+pub const query_evaluator = @import("query/evaluator.zig");
 
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
