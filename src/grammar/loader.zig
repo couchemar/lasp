@@ -390,6 +390,30 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
             }
         }
 
+        // constraints
+        for (pattern.constraints) |constraint| {
+            try w.writeAll("\n[[patterns.constraints]]\n");
+            try w.writeAll("type = \"");
+            switch (constraint.type) {
+                .not => try w.writeAll("not"),
+            }
+            try w.writeAll("\"\n");
+            try std.fmt.format(w, "depth = {d}\n", .{constraint.depth});
+            if (constraint.field) |field| {
+                try w.writeAll("field = \"");
+                try w.writeAll(field);
+                try w.writeAll("\"\n");
+            }
+            try w.writeAll("values = [");
+            for (constraint.values, 0..) |val, j| {
+                if (j > 0) try w.writeAll(", ");
+                try w.writeAll("\"");
+                try w.writeAll(val);
+                try w.writeAll("\"");
+            }
+            try w.writeAll("]\n");
+        }
+
         try w.writeAll("\n");
     }
 
@@ -798,6 +822,209 @@ test "parseGrammar: pattern with no constraints defaults to empty slice" {
 
     try testing.expectEqual(@as(usize, 0), grammar.patterns[0].constraints.len);
     try testing.expect(grammar.patterns[0].position == null);
+}
+
+// --- Formatter: Constraint Serialization Tests ---
+
+test "formatGrammar: depth=0 constraint with field serialized" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "method",
+                .sequence = &.{
+                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .symbol_literal = "(" } },
+                },
+                .captures = &.{
+                    .{ .field_name = "name", .position = 0 },
+                },
+                .constraints = &.{
+                    .{
+                        .type = .not,
+                        .depth = 0,
+                        .field = "name",
+                        .values = &.{ "print", "RegExp" },
+                    },
+                },
+            },
+        },
+        .blocks = .{},
+    };
+
+    const toml_str = try formatGrammar(grammar, alloc);
+
+    // Verify the output contains the constraint section with field
+    try testing.expect(std.mem.indexOf(u8, toml_str, "[[patterns.constraints]]") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "type = \"not\"") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "depth = 0") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "field = \"name\"") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "values = [\"print\", \"RegExp\"]") != null);
+
+    // Round-trip: parse back and verify
+    const parsed = try parseGrammar(toml_str, alloc);
+    try testing.expectEqual(@as(usize, 1), parsed.patterns[0].constraints.len);
+    const c = parsed.patterns[0].constraints[0];
+    try testing.expectEqual(ConstraintType.not, c.type);
+    try testing.expectEqual(@as(u8, 0), c.depth);
+    try testing.expectEqualStrings("name", c.field.?);
+    try testing.expectEqual(@as(usize, 2), c.values.len);
+    try testing.expectEqualStrings("print", c.values[0]);
+    try testing.expectEqualStrings("RegExp", c.values[1]);
+}
+
+test "formatGrammar: depth=1 constraint without field serialized" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .symbol_literal = "(" } },
+                },
+                .captures = &.{
+                    .{ .field_name = "name", .position = 0 },
+                },
+                .constraints = &.{
+                    .{
+                        .type = .not,
+                        .depth = 1,
+                        .values = &.{ "fun", "=" },
+                    },
+                },
+            },
+        },
+        .blocks = .{},
+    };
+
+    const toml_str = try formatGrammar(grammar, alloc);
+
+    // Verify the output contains the constraint section without field
+    try testing.expect(std.mem.indexOf(u8, toml_str, "[[patterns.constraints]]") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "type = \"not\"") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "depth = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "field = ") == null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "values = [\"fun\", \"=\"]") != null);
+
+    // Round-trip: parse back and verify
+    const parsed = try parseGrammar(toml_str, alloc);
+    try testing.expectEqual(@as(usize, 1), parsed.patterns[0].constraints.len);
+    const c = parsed.patterns[0].constraints[0];
+    try testing.expectEqual(ConstraintType.not, c.type);
+    try testing.expectEqual(@as(u8, 1), c.depth);
+    try testing.expect(c.field == null);
+    try testing.expectEqual(@as(usize, 2), c.values.len);
+    try testing.expectEqualStrings("fun", c.values[0]);
+    try testing.expectEqualStrings("=", c.values[1]);
+}
+
+test "formatGrammar: multiple constraints on one pattern" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .symbol_literal = "(" } },
+                },
+                .captures = &.{
+                    .{ .field_name = "name", .position = 0 },
+                },
+                .position = .start,
+                .constraints = &.{
+                    .{
+                        .type = .not,
+                        .depth = 4,
+                        .values = &.{ "-spec", "-type" },
+                    },
+                    .{
+                        .type = .not,
+                        .depth = 1,
+                        .values = &.{ "fun", "=" },
+                    },
+                },
+            },
+        },
+        .blocks = .{},
+    };
+
+    const toml_str = try formatGrammar(grammar, alloc);
+
+    // Should contain two [[patterns.constraints]] sections
+    // Count occurrences
+    var count: usize = 0;
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, toml_str, search_start, "[[patterns.constraints]]")) |pos| {
+        count += 1;
+        search_start = pos + 1;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+
+    // Verify both depth values appear
+    try testing.expect(std.mem.indexOf(u8, toml_str, "depth = 4") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "depth = 1") != null);
+
+    // Round-trip: parse back and verify
+    const parsed = try parseGrammar(toml_str, alloc);
+    try testing.expectEqual(@as(usize, 2), parsed.patterns[0].constraints.len);
+    try testing.expectEqual(@as(u8, 4), parsed.patterns[0].constraints[0].depth);
+    try testing.expectEqual(@as(u8, 1), parsed.patterns[0].constraints[1].depth);
+    // Position should also survive
+    try testing.expect(parsed.patterns[0].position != null);
+    try testing.expectEqual(PositionConstraint.start, parsed.patterns[0].position.?);
+}
+
+test "formatGrammar: no constraints emits no constraints section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "call",
+                .sequence = &.{
+                    .{ .matcher = .{ .identifier = {} } },
+                    .{ .matcher = .{ .symbol_literal = "(" } },
+                },
+                .captures = &.{},
+            },
+        },
+        .blocks = .{},
+    };
+
+    const toml_str = try formatGrammar(grammar, alloc);
+
+    // Should NOT contain any constraints section
+    try testing.expect(std.mem.indexOf(u8, toml_str, "[[patterns.constraints]]") == null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "constraints") == null);
+
+    // Round-trip: parse back and verify empty constraints
+    const parsed = try parseGrammar(toml_str, alloc);
+    try testing.expectEqual(@as(usize, 0), parsed.patterns[0].constraints.len);
 }
 
 // --- Property Tests ---
@@ -1853,6 +2080,114 @@ test "property: invalid constraint configuration rejection" {
                     try testing.expectError(error.InvalidConstraintValues, result);
                 },
                 else => unreachable,
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: unified-constraint-system, Property 1: Grammar TOML round-trip with constraints
+// **Validates: Requirements 1.1, 1.2, 1.5, 7.1, 7.2, 7.3, 7.4, 10.3, 10.4**
+test "property: grammar TOML round-trip with constraints" {
+    // Generate depth (0-8), a random alphanumeric string (for field name and values),
+    // and num_values (1-3)
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        []const u8,
+        u8,
+        gen.intRange(u8, 0, 8),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alphanumeric }),
+        gen.intRange(u8, 1, 3),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, []const u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const depth = vals[0];
+            const rand_str = vals[1];
+            const num_values = vals[2];
+
+            // Build TOML source with a pattern containing a constraint
+            var buf: std.ArrayList(u8) = .empty;
+            const w = buf.writer(alloc);
+
+            try w.writeAll(
+                \\[[patterns]]
+                \\type = "method"
+                \\sequence = ["$name:IDENTIFIER", "("]
+                \\
+                \\[[patterns.constraints]]
+                \\type = "not"
+                \\
+            );
+
+            try std.fmt.format(w, "depth = {d}\n", .{depth});
+
+            // For depth=0, include a field key; for depth>0, omit it
+            if (depth == 0) {
+                try w.writeAll("field = \"");
+                try w.writeAll(rand_str);
+                try w.writeAll("\"\n");
+            }
+
+            // Build values array with num_values entries derived from rand_str
+            try w.writeAll("values = [");
+            for (0..num_values) |i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll("\"");
+                try w.writeAll(rand_str);
+                try std.fmt.format(w, "{d}", .{i});
+                try w.writeAll("\"");
+            }
+            try w.writeAll("]\n");
+
+            const source = buf.items;
+
+            // Step 1: Parse the TOML source
+            const grammar1 = try parseGrammar(source, alloc);
+
+            // Step 2: Format back to TOML
+            const formatted = try formatGrammar(grammar1, alloc);
+
+            // Step 3: Parse the formatted output
+            const grammar2 = try parseGrammar(formatted, alloc);
+
+            // Step 4: Verify constraints match
+            try testing.expectEqual(@as(usize, 1), grammar1.patterns.len);
+            try testing.expectEqual(@as(usize, 1), grammar2.patterns.len);
+
+            const c1 = grammar1.patterns[0].constraints;
+            const c2 = grammar2.patterns[0].constraints;
+
+            try testing.expectEqual(c1.len, c2.len);
+            try testing.expectEqual(@as(usize, 1), c1.len);
+
+            // Verify constraint type
+            try testing.expectEqual(c1[0].type, c2[0].type);
+            try testing.expectEqual(ConstraintType.not, c2[0].type);
+
+            // Verify depth
+            try testing.expectEqual(c1[0].depth, c2[0].depth);
+            try testing.expectEqual(depth, c2[0].depth);
+
+            // Verify field
+            if (depth == 0) {
+                try testing.expect(c1[0].field != null);
+                try testing.expect(c2[0].field != null);
+                try testing.expectEqualStrings(c1[0].field.?, c2[0].field.?);
+                try testing.expectEqualStrings(rand_str, c2[0].field.?);
+            } else {
+                try testing.expect(c1[0].field == null);
+                try testing.expect(c2[0].field == null);
+            }
+
+            // Verify values
+            try testing.expectEqual(c1[0].values.len, c2[0].values.len);
+            try testing.expectEqual(@as(usize, num_values), c2[0].values.len);
+            for (c1[0].values, c2[0].values) |v1, v2| {
+                try testing.expectEqualStrings(v1, v2);
             }
         }
     }.prop, .{ .num_runs = 100 });
