@@ -22,8 +22,16 @@ sequence = ["-spec", "$name:IDENTIFIER", "("]
 type = "function"
 sequence = ["$name:IDENTIFIER", "("]
 position = "start"
-exclude = ["-spec", "-type"]
-not_preceded_by = ["fun", "="]
+
+[[patterns.constraints]]
+type = "not"
+depth = 4
+values = ["-spec", "-type"]
+
+[[patterns.constraints]]
+type = "not"
+depth = 1
+values = ["fun", "="]
 
 [[patterns]]
 type = "call"

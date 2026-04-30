@@ -223,6 +223,54 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
                 }
                 break :blk null;
             },
+            .constraints = blk: {
+                // Reject deprecated fields
+                if (pattern_table.get("exclude") != null) return error.DeprecatedField;
+                if (pattern_table.get("not_preceded_by") != null) return error.DeprecatedField;
+
+                if (pattern_table.get("constraints")) |constraints_val| {
+                    var constraint_list: std.ArrayList(Constraint) = .empty;
+                    for (constraints_val.array.items) |ct| {
+                        // Parse type
+                        const type_str = if (ct.get("type")) |t| t.string else return error.InvalidConstraintType;
+                        const constraint_type: ConstraintType = if (std.mem.eql(u8, type_str, "not"))
+                            .not
+                        else
+                            return error.InvalidConstraintType;
+
+                        // Parse depth
+                        const depth_val = ct.get("depth") orelse return error.InvalidConstraintDepth;
+                        const depth: u8 = @intCast(depth_val.integer);
+
+                        // Parse field (optional)
+                        const field: ?[]const u8 = if (ct.get("field")) |f|
+                            try allocator.dupe(u8, f.string)
+                        else
+                            null;
+
+                        // Validate depth/field combination
+                        if (depth == 0 and field == null) return error.InvalidConstraintDepth;
+                        if (depth > 0 and field != null) return error.InvalidConstraintField;
+
+                        // Parse values
+                        const values_val = ct.get("values") orelse return error.InvalidConstraintValues;
+                        if (values_val.array.items.len == 0) return error.InvalidConstraintValues;
+                        var vals: std.ArrayList([]const u8) = .empty;
+                        for (values_val.array.items) |item| {
+                            try vals.append(allocator, try allocator.dupe(u8, item.string));
+                        }
+
+                        try constraint_list.append(allocator, .{
+                            .type = constraint_type,
+                            .depth = depth,
+                            .field = field,
+                            .values = try vals.toOwnedSlice(allocator),
+                        });
+                    }
+                    break :blk try constraint_list.toOwnedSlice(allocator);
+                }
+                break :blk &.{};
+            },
         });
     }
 
@@ -617,6 +665,139 @@ test "parseGrammar: Phase 2 grammar backward compatibility (no position/constrai
 
     try testing.expect(grammar.patterns[0].position == null);
     try testing.expectEqual(@as(usize, 0), grammar.patterns[0].constraints.len);
+}
+
+test "parseGrammar: depth=0 constraint with field and values" {
+    const source =
+        \\[[patterns]]
+        \\type = "method"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\
+        \\[[patterns.constraints]]
+        \\type = "not"
+        \\depth = 0
+        \\field = "name"
+        \\values = ["print", "RegExp"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), grammar.patterns[0].constraints.len);
+    const c = grammar.patterns[0].constraints[0];
+    try testing.expectEqual(ConstraintType.not, c.type);
+    try testing.expectEqual(@as(u8, 0), c.depth);
+    try testing.expectEqualStrings("name", c.field.?);
+    try testing.expectEqual(@as(usize, 2), c.values.len);
+    try testing.expectEqualStrings("print", c.values[0]);
+    try testing.expectEqualStrings("RegExp", c.values[1]);
+}
+
+test "parseGrammar: depth=1 constraint (no field)" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\
+        \\[[patterns.constraints]]
+        \\type = "not"
+        \\depth = 1
+        \\values = ["fun", "="]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), grammar.patterns[0].constraints.len);
+    const c = grammar.patterns[0].constraints[0];
+    try testing.expectEqual(ConstraintType.not, c.type);
+    try testing.expectEqual(@as(u8, 1), c.depth);
+    try testing.expect(c.field == null);
+    try testing.expectEqual(@as(usize, 2), c.values.len);
+    try testing.expectEqualStrings("fun", c.values[0]);
+    try testing.expectEqualStrings("=", c.values[1]);
+}
+
+test "parseGrammar: depth=4 constraint (lookback window)" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\
+        \\[[patterns.constraints]]
+        \\type = "not"
+        \\depth = 4
+        \\values = ["-spec", "-type"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), grammar.patterns[0].constraints.len);
+    const c = grammar.patterns[0].constraints[0];
+    try testing.expectEqual(ConstraintType.not, c.type);
+    try testing.expectEqual(@as(u8, 4), c.depth);
+    try testing.expect(c.field == null);
+    try testing.expectEqual(@as(usize, 2), c.values.len);
+    try testing.expectEqualStrings("-spec", c.values[0]);
+    try testing.expectEqualStrings("-type", c.values[1]);
+}
+
+test "parseGrammar: multiple constraints on one pattern" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\position = "start"
+        \\
+        \\[[patterns.constraints]]
+        \\type = "not"
+        \\depth = 4
+        \\values = ["-spec", "-type"]
+        \\
+        \\[[patterns.constraints]]
+        \\type = "not"
+        \\depth = 1
+        \\values = ["fun", "="]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), grammar.patterns[0].constraints.len);
+
+    const c0 = grammar.patterns[0].constraints[0];
+    try testing.expectEqual(@as(u8, 4), c0.depth);
+    try testing.expectEqual(@as(usize, 2), c0.values.len);
+    try testing.expectEqualStrings("-spec", c0.values[0]);
+
+    const c1 = grammar.patterns[0].constraints[1];
+    try testing.expectEqual(@as(u8, 1), c1.depth);
+    try testing.expectEqual(@as(usize, 2), c1.values.len);
+    try testing.expectEqualStrings("fun", c1.values[0]);
+
+    // Position should also be parsed
+    try testing.expect(grammar.patterns[0].position != null);
+    try testing.expectEqual(PositionConstraint.start, grammar.patterns[0].position.?);
+}
+
+test "parseGrammar: pattern with no constraints defaults to empty slice" {
+    const source =
+        \\[[patterns]]
+        \\type = "call"
+        \\sequence = ["identifier", "("]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 0), grammar.patterns[0].constraints.len);
+    try testing.expect(grammar.patterns[0].position == null);
 }
 
 // --- Property Tests ---
@@ -1568,4 +1749,111 @@ test "parseGrammar: omitted weights section uses all defaults" {
     try testing.expectApproxEqAbs(defaults.symbol, grammar.weights.symbol, 0.001);
     try testing.expectApproxEqAbs(defaults.block, grammar.weights.block, 0.001);
     try testing.expectApproxEqAbs(defaults.relaxed_keyword, grammar.weights.relaxed_keyword, 0.001);
+}
+
+test "parseGrammar: exclude field returns DeprecatedField error" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\exclude = ["-spec"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.DeprecatedField, result);
+}
+
+test "parseGrammar: not_preceded_by field returns DeprecatedField error" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["$name:IDENTIFIER", "("]
+        \\not_preceded_by = ["fun"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.DeprecatedField, result);
+}
+
+// Feature: unified-constraint-system, Property 2: Invalid constraint configuration rejection
+// **Validates: Requirements 1.3, 1.4, 1.6, 1.7**
+test "property: invalid constraint configuration rejection" {
+    // Generate a case selector (0-3) and random strings for type/field names
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        []const u8,
+        u8,
+        gen.intRange(u8, 0, 3),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.intRange(u8, 1, 10),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, []const u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const case = vals[0];
+            const rand_str = vals[1];
+            const rand_depth = vals[2];
+
+            var buf: std.ArrayList(u8) = .empty;
+            const w = buf.writer(alloc);
+
+            // Common pattern prefix
+            try w.writeAll(
+                \\[[patterns]]
+                \\type = "function"
+                \\sequence = ["$name:IDENTIFIER", "("]
+                \\
+                \\[[patterns.constraints]]
+                \\
+            );
+
+            switch (case) {
+                0 => {
+                    // Case 1: type is a random non-"not" string → InvalidConstraintType
+                    // Ensure the random string is not "not"
+                    const type_str = if (std.mem.eql(u8, rand_str, "not")) "invalid" else rand_str;
+                    try w.writeAll("type = \"");
+                    try w.writeAll(type_str);
+                    try w.writeAll("\"\ndepth = 1\nvalues = [\"x\"]\n");
+
+                    const source = buf.items;
+                    const result = parseGrammar(source, alloc);
+                    try testing.expectError(error.InvalidConstraintType, result);
+                },
+                1 => {
+                    // Case 2: depth=0 with no field → InvalidConstraintDepth
+                    try w.writeAll("type = \"not\"\ndepth = 0\nvalues = [\"x\"]\n");
+
+                    const source = buf.items;
+                    const result = parseGrammar(source, alloc);
+                    try testing.expectError(error.InvalidConstraintDepth, result);
+                },
+                2 => {
+                    // Case 3: depth>0 with a field present → InvalidConstraintField
+                    try std.fmt.format(w, "type = \"not\"\ndepth = {d}\nfield = \"{s}\"\nvalues = [\"x\"]\n", .{ rand_depth, rand_str });
+
+                    const source = buf.items;
+                    const result = parseGrammar(source, alloc);
+                    try testing.expectError(error.InvalidConstraintField, result);
+                },
+                3 => {
+                    // Case 4: values is empty array → InvalidConstraintValues
+                    try w.writeAll("type = \"not\"\ndepth = 1\nvalues = []\n");
+
+                    const source = buf.items;
+                    const result = parseGrammar(source, alloc);
+                    try testing.expectError(error.InvalidConstraintValues, result);
+                },
+                else => unreachable,
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
 }
