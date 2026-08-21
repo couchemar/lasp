@@ -6,3 +6,4 @@ zig-cache/
 .bin/
 result
 feedbacks
+zig-pkg/
