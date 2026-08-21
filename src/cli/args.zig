@@ -4,6 +4,7 @@ pub const Command = enum {
     parse,
     parse_dir,
     query,
+    version,
 };
 
 pub const ParsedArgs = struct {
@@ -48,6 +49,11 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     // Parse command
     const command = parseCommand(args[0]) orelse return error.UnrecognizedCommand;
 
+    // Version is a global flag: report and exit before any positional parsing.
+    if (command == .version) {
+        return ParsedArgs{ .command = .version, .target_path = "" };
+    }
+
     // Query command has different positional arg structure:
     //   query <selector> <file_path> [flags]
     // Parse/parse-dir:
@@ -61,7 +67,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
         return switch (command) {
             .parse => error.MissingFilePath,
             .parse_dir => error.MissingDirectoryPath,
-            .query => unreachable,
+            .query, .version => unreachable,
         };
     }
 
@@ -91,6 +97,8 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
             node_filter = args[i];
         } else if (std.mem.eql(u8, arg, "--names-only")) {
             names_only = true;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
             return error.UnrecognizedFlag;
         }
@@ -135,6 +143,8 @@ fn parseQueryArgs(args: []const []const u8) CliError!ParsedArgs {
             grammar_path = args[i];
         } else if (std.mem.eql(u8, arg, "--names-only")) {
             names_only = true;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
             return error.UnrecognizedFlag;
         }
@@ -155,6 +165,9 @@ fn parseCommand(arg: []const u8) ?Command {
     if (std.mem.eql(u8, arg, "parse")) return .parse;
     if (std.mem.eql(u8, arg, "parse-dir")) return .parse_dir;
     if (std.mem.eql(u8, arg, "query")) return .query;
+    if (std.mem.eql(u8, arg, "version")) return .version;
+    if (std.mem.eql(u8, arg, "--version")) return .version;
+    if (std.mem.eql(u8, arg, "-V")) return .version;
     return null;
 }
 
@@ -402,7 +415,7 @@ test "property: invalid CLI input rejection" {
     try minish.check(testing.allocator, str_gen, struct {
         fn prop(cmd: []const u8) !void {
             // Skip if the random string happens to be a valid command
-            if (std.mem.eql(u8, cmd, "parse") or std.mem.eql(u8, cmd, "parse-dir") or std.mem.eql(u8, cmd, "query")) return;
+            if (std.mem.eql(u8, cmd, "parse") or std.mem.eql(u8, cmd, "parse-dir") or std.mem.eql(u8, cmd, "query") or std.mem.eql(u8, cmd, "version")) return;
 
             const args = &[_][]const u8{ cmd, "some/path" };
             const result = parseArgs(args);
@@ -494,4 +507,36 @@ test "property: flag order independence" {
     try testing.expect(r1.names_only == r4.names_only);
     try testing.expect(r1.names_only == r5.names_only);
     try testing.expect(r1.names_only == r6.names_only);
+}
+
+// --- Version Command Tests ---
+
+test "--version flag returns version command" {
+    const args = &[_][]const u8{"--version"};
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .version);
+}
+
+test "-V short flag returns version command" {
+    const args = &[_][]const u8{"-V"};
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .version);
+}
+
+test "version subcommand returns version command" {
+    const args = &[_][]const u8{"version"};
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .version);
+}
+
+test "--version accepted among parse flags" {
+    const args = &[_][]const u8{ "parse", "file.zig", "-g", "grammar.toml", "--version" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .version);
+}
+
+test "--version accepted among query flags" {
+    const args = &[_][]const u8{ "query", "function", "file.zig", "-V" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .version);
 }

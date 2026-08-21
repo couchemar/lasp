@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // Embed project version (single source of truth: build.zig.zon) into the binary.
+    const version_options = b.addOptions();
+    version_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    exe.root_module.addOptions("build_options", version_options);
+
     // TOML parser dependency
     const toml_dep = b.dependency("toml", .{});
     const toml_module = toml_dep.module("toml");
@@ -31,6 +36,7 @@ pub fn build(b: *std.Build) void {
     });
     test_module.addImport("minish", minish_module);
     test_module.addImport("toml", toml_module);
+    test_module.addOptions("build_options", version_options);
     const main_tests = b.addTest(.{
         .root_module = test_module,
     });

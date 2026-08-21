@@ -401,6 +401,11 @@ lasp query 'call[name!="print"]' file.rs -g grammars/rust.toml --names-only
 
 # Composable pipeline
 echo 'fn add() {}' | lasp parse - -g grammars/rust.toml --node function --names-only
+
+# Version (semver, sourced from build.zig.zon)
+lasp --version
+lasp -V
+lasp version
 ```
 
 **Output JSON Code snippet Events:**

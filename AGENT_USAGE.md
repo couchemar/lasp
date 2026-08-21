@@ -107,6 +107,20 @@ diff <(.bin/lasp parse a.zig -g examples/grammars/zig.toml --node function --nam
      <(.bin/lasp parse b.zig -g examples/grammars/zig.toml --node function --names-only)
 ```
 
+### Version
+
+```bash
+.bin/lasp --version   # same as: .bin/lasp -V  or: .bin/lasp version
+```
+
+Output:
+
+```
+lasp 0.1.0
+```
+
+The version is embedded at build time from `build.zig.zon` (semver). To release a new version: bump `version` in `build.zig.zon` and add a `CHANGELOG.md` entry (Keep a Changelog format). `--version`/`-V` is also accepted among other flags and exits before reading any file.
+
 ## Structural Query (`lasp query`)
 
 Query events using CSS-selector-inspired syntax. Requires a grammar (`-g`).

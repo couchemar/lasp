@@ -9,6 +9,7 @@ pub const engine = @import("parser/engine.zig");
 pub const query_filter = @import("query/filter.zig");
 pub const query_parser = @import("query/parser.zig");
 pub const query_evaluator = @import("query/evaluator.zig");
+const build_options = @import("build_options");
 
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
@@ -51,7 +52,19 @@ pub fn main() !void {
         std.process.fatal("{s}", .{cli.formatCliError(err)});
     };
 
-    // 4. Read source file or stdin
+    // 4. Stdout setup
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    // 5. Version report: exits before any file I/O
+    if (parsed.command == .version) {
+        try stdout.print("lasp {s}\n", .{build_options.version});
+        try stdout.flush();
+        return;
+    }
+
+    // 6. Read source file or stdin
     const source = blk: {
         if (std.mem.eql(u8, parsed.target_path, "-")) {
             var stdin_buffer: [4096]u8 = undefined;
@@ -64,12 +77,7 @@ pub fn main() !void {
         }
     };
 
-    // 5. Stdout setup
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    // 6. Dispatch based on command
+    // 7. Dispatch based on command
     switch (parsed.command) {
         .query => {
             // Query command always requires grammar
@@ -185,6 +193,7 @@ pub fn main() !void {
                 try json.serializeTokens(tokens, stdout);
             }
         },
+        .version => unreachable,
     }
 
     try stdout.writeAll("\n");
@@ -321,6 +330,16 @@ test "integration: no args prints usage and exits non-zero" {
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
+}
+
+test "integration: --version prints version and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{"--version"});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expect(std.mem.startsWith(u8, result.stdout, "lasp "));
 }
 
 test "integration: parse with TOML grammar produces structural events" {

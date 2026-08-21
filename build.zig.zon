@@ -1,6 +1,6 @@
 .{
     .name = .lasp,
-    .version = "0.15.2",
+    .version = "0.1.0",
     .dependencies = .{
         .minish = .{
             .url = "https://github.com/CogitatorTech/minish/archive/refs/heads/main.tar.gz",
