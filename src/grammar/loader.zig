@@ -171,15 +171,16 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
     var all_keywords: std.ArrayList([]const u8) = .empty;
 
     if (root.get("keywords")) |kw_table| {
-        for (kw_table.table.entries) |entry| {
+        var kw_it = kw_table.table.map.iterator();
+        while (kw_it.next()) |entry| {
             var kws: std.ArrayList([]const u8) = .empty;
-            for (entry.value.array.items) |item| {
+            for (entry.value_ptr.*.array.items.items) |item| {
                 const kw = try allocator.dupe(u8, item.string);
                 try kws.append(allocator, kw);
                 try all_keywords.append(allocator, kw);
             }
             try categories.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.key),
+                .name = try allocator.dupe(u8, entry.key_ptr.*),
                 .keywords = try kws.toOwnedSlice(allocator),
             });
         }
@@ -189,19 +190,19 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
     const patterns_val = root.get("patterns") orelse return error.MissingPatterns;
     var patterns: std.ArrayList(Pattern) = .empty;
 
-    for (patterns_val.array.items) |pattern_table| {
+    for (patterns_val.array.items.items) |pattern_table| {
         const type_name = if (pattern_table.get("type")) |t|
             try allocator.dupe(u8, t.string)
         else
             return error.MissingPatterns;
 
         const seq_val = pattern_table.get("sequence") orelse return error.EmptyPatternSequence;
-        if (seq_val.array.items.len == 0) return error.EmptyPatternSequence;
+        if (seq_val.array.items.items.len == 0) return error.EmptyPatternSequence;
 
         var matchers: std.ArrayList(SequenceElement) = .empty;
         var captures: std.ArrayList(Capture) = .empty;
 
-        for (seq_val.array.items, 0..) |item, idx| {
+        for (seq_val.array.items.items, 0..) |item, idx| {
             const result = try parseSequenceElement(item.string, idx, allocator);
             try matchers.append(allocator, result.element);
             if (result.capture) |cap| {
@@ -230,7 +231,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
 
                 if (pattern_table.get("constraints")) |constraints_val| {
                     var constraint_list: std.ArrayList(Constraint) = .empty;
-                    for (constraints_val.array.items) |ct| {
+                    for (constraints_val.array.items.items) |ct| {
                         // Parse type
                         const type_str = if (ct.get("type")) |t| t.string else return error.InvalidConstraintType;
                         const constraint_type: ConstraintType = if (std.mem.eql(u8, type_str, "not"))
@@ -254,9 +255,9 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
 
                         // Parse values
                         const values_val = ct.get("values") orelse return error.InvalidConstraintValues;
-                        if (values_val.array.items.len == 0) return error.InvalidConstraintValues;
+                        if (values_val.array.items.items.len == 0) return error.InvalidConstraintValues;
                         var vals: std.ArrayList([]const u8) = .empty;
-                        for (values_val.array.items) |item| {
+                        for (values_val.array.items.items) |item| {
                             try vals.append(allocator, try allocator.dupe(u8, item.string));
                         }
 

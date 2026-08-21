@@ -3,12 +3,12 @@
     .version = "0.1.0",
     .dependencies = .{
         .minish = .{
-            .url = "https://github.com/CogitatorTech/minish/archive/refs/heads/main.tar.gz",
+            .url = "https://github.com/CogitatorTech/minish/archive/8e44fc95d9b896fcfd6fa6d7f6582526b5b5dd55.tar.gz",
             .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
         },
         .toml = .{
-            .url = "https://gitlab.com/devnw/zig/toml/-/archive/main/toml-main.tar.gz",
-            .hash = "toml-0.1.0-MHnSh64vAgAjI7CtbKkA7megV9k-TcduiLmxmF2nJNrq",
+            .url = "https://gitlab.com/devnw/zig/toml/-/archive/cf2196b53fc7907cf27eeb92ee01a5ba20076058/toml-cf2196b53fc7907cf27eeb92ee01a5ba20076058.tar.gz",
+            .hash = "toml-0.1.6-MHnSh2jABQAt-zpO0oYFLfcY-8zw_d1P8Bi0dDNMIkgH",
         },
     },
     .paths = .{""},
