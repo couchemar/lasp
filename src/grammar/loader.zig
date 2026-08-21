@@ -330,8 +330,8 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
 /// Formats a Grammar struct back into a TOML string.
 /// Used for round-trip testing.
 pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    const w = buf.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    const w = &aw.writer;
 
     // [language]
     if (grammar.language_name) |name| {
@@ -399,7 +399,7 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                 .not => try w.writeAll("not"),
             }
             try w.writeAll("\"\n");
-            try std.fmt.format(w, "depth = {d}\n", .{constraint.depth});
+            try w.print("depth = {d}\n", .{constraint.depth});
             if (constraint.field) |field| {
                 try w.writeAll("field = \"");
                 try w.writeAll(field);
@@ -448,24 +448,24 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
         {
             try w.writeAll("\n[weights]\n");
             if (wts.keyword != defaults.keyword) {
-                try std.fmt.format(w, "keyword = {d}\n", .{wts.keyword});
+                try w.print("keyword = {d}\n", .{wts.keyword});
             }
             if (wts.identifier != defaults.identifier) {
-                try std.fmt.format(w, "identifier = {d}\n", .{wts.identifier});
+                try w.print("identifier = {d}\n", .{wts.identifier});
             }
             if (wts.symbol != defaults.symbol) {
-                try std.fmt.format(w, "symbol = {d}\n", .{wts.symbol});
+                try w.print("symbol = {d}\n", .{wts.symbol});
             }
             if (wts.block != defaults.block) {
-                try std.fmt.format(w, "block = {d}\n", .{wts.block});
+                try w.print("block = {d}\n", .{wts.block});
             }
             if (wts.relaxed_keyword != defaults.relaxed_keyword) {
-                try std.fmt.format(w, "relaxed_keyword = {d}\n", .{wts.relaxed_keyword});
+                try w.print("relaxed_keyword = {d}\n", .{wts.relaxed_keyword});
             }
         }
     }
 
-    return buf.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 // --- Unit Tests ---
@@ -1144,12 +1144,12 @@ test "property: keyword table flattening" {
             const alloc = arena.allocator();
 
             // Build TOML with two categories each containing the random keyword
-            var buf: std.ArrayList(u8) = .empty;
-            const w = buf.writer(alloc);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
             try w.writeAll("[keywords]\ncat_a = [\"");
             try w.writeAll(kw);
             try w.writeAll("\"]\ncat_b = [\"other\"]\n\n[[patterns]]\ntype = \"x\"\nsequence = [\"identifier\"]\n");
-            const source = buf.items;
+            const source = aw.written();
 
             const grammar = try parseGrammar(source, alloc);
 
@@ -1196,9 +1196,11 @@ test "example grammar: erlang.toml parses without errors" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const file = try std.fs.cwd().openFile("examples/grammars/erlang.toml", .{});
-    defer file.close();
-    const source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const file = try std.Io.Dir.cwd().openFile(testing.io, "examples/grammars/erlang.toml", .{});
+    defer file.close(testing.io);
+    var fbuf: [4096]u8 = undefined;
+    var file_reader = file.reader(testing.io, &fbuf);
+    const source = try file_reader.interface.allocRemaining(alloc, .unlimited);
     const grammar = try parseGrammar(source, alloc);
     try testing.expectEqualStrings("erlang", grammar.language_name.?);
     try testing.expect(grammar.patterns.len >= 7);
@@ -1235,9 +1237,11 @@ test "example grammar: zig.toml parses without errors" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const file = try std.fs.cwd().openFile("examples/grammars/zig.toml", .{});
-    defer file.close();
-    const source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const file = try std.Io.Dir.cwd().openFile(testing.io, "examples/grammars/zig.toml", .{});
+    defer file.close(testing.io);
+    var fbuf: [4096]u8 = undefined;
+    var file_reader = file.reader(testing.io, &fbuf);
+    const source = try file_reader.interface.allocRemaining(alloc, .unlimited);
     const grammar = try parseGrammar(source, alloc);
     try testing.expectEqualStrings("zig", grammar.language_name.?);
     try testing.expect(grammar.patterns.len >= 5);
@@ -1366,8 +1370,8 @@ test "property: empty block delimiters treated as absent" {
             const pattern_type = vals[1];
 
             // Build TOML with empty delimiter(s) and a valid [[patterns]] section
-            var buf: std.ArrayList(u8) = .empty;
-            const w = buf.writer(alloc);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
 
             try w.writeAll("[[patterns]]\ntype = \"");
             try w.writeAll(pattern_type);
@@ -1379,7 +1383,7 @@ test "property: empty block delimiters treated as absent" {
                 try w.writeAll("open = \"{\"\nclose = \"\"\n");
             }
 
-            const source = buf.items;
+            const source = aw.written();
             const result = parseGrammar(source, alloc);
 
             // Expected: parsing succeeds (no MissingPatterns)
@@ -1527,8 +1531,8 @@ test "property: non-empty block delimiters preserved" {
             const close_delim = vals[1];
 
             // Build TOML with non-empty delimiters and a valid [[patterns]] section
-            var buf: std.ArrayList(u8) = .empty;
-            const w = buf.writer(alloc);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
 
             try w.writeAll("[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n\n[blocks]\nopen = \"");
             try w.writeAll(open_delim);
@@ -1536,7 +1540,7 @@ test "property: non-empty block delimiters preserved" {
             try w.writeAll(close_delim);
             try w.writeAll("\"\n");
 
-            const source = buf.items;
+            const source = aw.written();
             const grammar = try parseGrammar(source, alloc);
 
             // Non-empty delimiters must be preserved exactly
@@ -1754,8 +1758,8 @@ test "property: weight parsing with defaults" {
             const defaults = [_]f32{ 0.5, 0.2, 0.2, 0.3, 0.1 };
 
             // Build TOML with a [weights] section containing only selected keys
-            var buf: std.ArrayList(u8) = .empty;
-            const w = buf.writer(alloc);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
             try w.writeAll("[[patterns]]\ntype = \"test\"\nsequence = [\"identifier\", \"(\"]\n\n");
 
             var has_any = false;
@@ -1765,11 +1769,11 @@ test "property: weight parsing with defaults" {
                         try w.writeAll("[weights]\n");
                         has_any = true;
                     }
-                    try std.fmt.format(w, "{s} = {d:.2}\n", .{ keys[i], weight_val });
+                    try w.print("{s} = {d:.2}\n", .{ keys[i], weight_val });
                 }
             }
 
-            const source = buf.items;
+            const source = aw.written();
             const grammar = try parseGrammar(source, alloc);
 
             // Verify: specified keys have custom values, omitted keys have defaults
@@ -1818,12 +1822,12 @@ test "property: negative weight rejection" {
             const keys = [_][]const u8{ "keyword", "identifier", "symbol", "block", "relaxed_keyword" };
 
             // Build TOML with a negative weight value
-            var buf: std.ArrayList(u8) = .empty;
-            const w = buf.writer(alloc);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
             try w.writeAll("[[patterns]]\ntype = \"test\"\nsequence = [\"identifier\", \"(\"]\n\n[weights]\n");
-            try std.fmt.format(w, "{s} = {d:.2}\n", .{ keys[key_idx], neg_val });
+            try w.print("{s} = {d:.2}\n", .{ keys[key_idx], neg_val });
 
-            const source = buf.items;
+            const source = aw.written();
             const result = parseGrammar(source, alloc);
             try testing.expectError(error.InvalidWeightValue, result);
         }
@@ -2046,8 +2050,8 @@ test "property: invalid constraint configuration rejection" {
             const rand_str = vals[1];
             const rand_depth = vals[2];
 
-            var buf: std.ArrayList(u8) = .empty;
-            const w = buf.writer(alloc);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
 
             // Common pattern prefix
             try w.writeAll(
@@ -2068,7 +2072,7 @@ test "property: invalid constraint configuration rejection" {
                     try w.writeAll(type_str);
                     try w.writeAll("\"\ndepth = 1\nvalues = [\"x\"]\n");
 
-                    const source = buf.items;
+                    const source = aw.written();
                     const result = parseGrammar(source, alloc);
                     try testing.expectError(error.InvalidConstraintType, result);
                 },
@@ -2076,15 +2080,15 @@ test "property: invalid constraint configuration rejection" {
                     // Case 2: depth=0 with no field → InvalidConstraintDepth
                     try w.writeAll("type = \"not\"\ndepth = 0\nvalues = [\"x\"]\n");
 
-                    const source = buf.items;
+                    const source = aw.written();
                     const result = parseGrammar(source, alloc);
                     try testing.expectError(error.InvalidConstraintDepth, result);
                 },
                 2 => {
                     // Case 3: depth>0 with a field present → InvalidConstraintField
-                    try std.fmt.format(w, "type = \"not\"\ndepth = {d}\nfield = \"{s}\"\nvalues = [\"x\"]\n", .{ rand_depth, rand_str });
+                    try w.print("type = \"not\"\ndepth = {d}\nfield = \"{s}\"\nvalues = [\"x\"]\n", .{ rand_depth, rand_str });
 
-                    const source = buf.items;
+                    const source = aw.written();
                     const result = parseGrammar(source, alloc);
                     try testing.expectError(error.InvalidConstraintField, result);
                 },
@@ -2092,7 +2096,7 @@ test "property: invalid constraint configuration rejection" {
                     // Case 4: values is empty array → InvalidConstraintValues
                     try w.writeAll("type = \"not\"\ndepth = 1\nvalues = []\n");
 
-                    const source = buf.items;
+                    const source = aw.written();
                     const result = parseGrammar(source, alloc);
                     try testing.expectError(error.InvalidConstraintValues, result);
                 },
@@ -2127,8 +2131,8 @@ test "property: grammar TOML round-trip with constraints" {
             const num_values = vals[2];
 
             // Build TOML source with a pattern containing a constraint
-            var buf: std.ArrayList(u8) = .empty;
-            const w = buf.writer(alloc);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
 
             try w.writeAll(
                 \\[[patterns]]
@@ -2140,7 +2144,7 @@ test "property: grammar TOML round-trip with constraints" {
                 \\
             );
 
-            try std.fmt.format(w, "depth = {d}\n", .{depth});
+            try w.print("depth = {d}\n", .{depth});
 
             // For depth=0, include a field key; for depth>0, omit it
             if (depth == 0) {
@@ -2155,12 +2159,12 @@ test "property: grammar TOML round-trip with constraints" {
                 if (i > 0) try w.writeAll(", ");
                 try w.writeAll("\"");
                 try w.writeAll(rand_str);
-                try std.fmt.format(w, "{d}", .{i});
+                try w.print("{d}", .{i});
                 try w.writeAll("\"");
             }
             try w.writeAll("]\n");
 
-            const source = buf.items;
+            const source = aw.written();
 
             // Step 1: Parse the TOML source
             const grammar1 = try parseGrammar(source, alloc);

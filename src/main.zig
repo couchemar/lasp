@@ -14,8 +14,8 @@ const build_options = @import("build_options");
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
 /// Prints descriptive error messages to stderr for FileNotFound and AccessDenied.
-fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+fn readSourceFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         switch (err) {
             error.FileNotFound => {
                 std.debug.print("error: file not found: {s}\n", .{path});
@@ -28,12 +28,16 @@ fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
             else => return err,
         }
     };
-    defer file.close();
+    defer file.close(io);
 
-    return file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    var buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &buffer);
+    return file_reader.interface.allocRemaining(allocator, .unlimited);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
     // 1. Set up arena allocator
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -41,7 +45,8 @@ pub fn main() !void {
 
     // 2. Collect CLI args (skip binary name)
     var arg_list: std.ArrayList([]const u8) = .empty;
-    var args_iter = std.process.args();
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_iter.deinit();
     _ = args_iter.next(); // skip binary name
     while (args_iter.next()) |arg| {
         try arg_list.append(allocator, arg);
@@ -54,7 +59,7 @@ pub fn main() !void {
 
     // 4. Stdout setup
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     // 5. Version report: exits before any file I/O
@@ -68,10 +73,10 @@ pub fn main() !void {
     const source = blk: {
         if (std.mem.eql(u8, parsed.target_path, "-")) {
             var stdin_buffer: [4096]u8 = undefined;
-            var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :blk try stdin_reader.interface.allocRemaining(allocator, .unlimited);
         } else {
-            break :blk readSourceFile(allocator, parsed.target_path) catch {
+            break :blk readSourceFile(io, allocator, parsed.target_path) catch {
                 std.process.fatal("failed to read file: {s}", .{parsed.target_path});
             };
         }
@@ -86,7 +91,7 @@ pub fn main() !void {
             };
 
             // Parse grammar, compile automaton, tokenize, run engine
-            const grammar_source = readSourceFile(allocator, gp) catch {
+            const grammar_source = readSourceFile(io, allocator, gp) catch {
                 std.process.fatal("failed to read grammar file: {s}", .{gp});
             };
             const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
@@ -144,7 +149,7 @@ pub fn main() !void {
         .parse, .parse_dir => {
             if (parsed.grammar_path) |gp| {
                 // Phase 2: TOML grammar → structural events
-                const grammar_source = readSourceFile(allocator, gp) catch {
+                const grammar_source = readSourceFile(io, allocator, gp) catch {
                     std.process.fatal("failed to read grammar file: {s}", .{gp});
                 };
                 const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
@@ -201,7 +206,7 @@ pub fn main() !void {
 }
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }
 
 test {
@@ -213,7 +218,7 @@ test {
 test "readSourceFile returns file contents" {
     const allocator = std.testing.allocator;
     // Read this file itself as a basic smoke test
-    const content = try readSourceFile(allocator, "src/main.zig");
+    const content = try readSourceFile(std.testing.io, allocator, "src/main.zig");
     defer allocator.free(content);
     try std.testing.expect(content.len > 0);
     // The file should start with "const std"
@@ -222,7 +227,7 @@ test "readSourceFile returns file contents" {
 
 test "readSourceFile returns FileNotFound for missing file" {
     const allocator = std.testing.allocator;
-    const result = readSourceFile(allocator, "nonexistent_file_that_does_not_exist.txt");
+    const result = readSourceFile(std.testing.io, allocator, "nonexistent_file_that_does_not_exist.txt");
     try std.testing.expectError(error.FileNotFound, result);
 }
 
@@ -238,13 +243,17 @@ test "property: file read round trip" {
             const tmp_path = "test_prop4_roundtrip.tmp";
 
             // Write random bytes to temp file
-            const file = try std.fs.cwd().createFile(tmp_path, .{});
-            try file.writeAll(data);
-            file.close();
-            defer std.fs.cwd().deleteFile(tmp_path) catch {};
+            const io = std.testing.io;
+            const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+            var wbuf: [256]u8 = undefined;
+            var writer = file.writer(io, &wbuf);
+            try writer.interface.writeAll(data);
+            try writer.interface.flush();
+            file.close(io);
+            defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
             // Read back with readSourceFile
-            const content = try readSourceFile(std.testing.allocator, tmp_path);
+            const content = try readSourceFile(std.testing.io, std.testing.allocator, tmp_path);
             defer std.testing.allocator.free(content);
 
             // Round trip: content must equal original data
@@ -261,23 +270,8 @@ fn runLasp(allocator: std.mem.Allocator, args: []const []const u8) !struct { std
     try argv.append(allocator, "zig-out/bin/lasp");
     for (args) |a| try argv.append(allocator, a);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    var stderr_buf: std.ArrayList(u8) = .empty;
-    try child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024);
-    const term = try child.wait();
-
-    // collectOutput manages the ArrayList buffers; extract owned slices
-    const stdout_slice = try allocator.dupe(u8, stdout_buf.items);
-    const stderr_slice = try allocator.dupe(u8, stderr_buf.items);
-    stdout_buf.deinit(allocator);
-    stderr_buf.deinit(allocator);
-
-    return .{ .stdout = stdout_slice, .stderr = stderr_slice, .term = term };
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = argv.items });
+    return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
 }
 
 test "integration: parse produces valid JSON with expected token types" {
@@ -286,7 +280,7 @@ test "integration: parse produces valid JSON with expected token types" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expect(result.stdout.len > 0);
 
     // Verify it's valid JSON with "events" array
@@ -312,7 +306,7 @@ test "integration: parse nonexistent file exits non-zero" {
 
     // Should exit with non-zero
     switch (result.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => {}, // Signal/other termination is also non-zero
     }
     // Stderr should contain error message
@@ -326,7 +320,7 @@ test "integration: no args prints usage and exits non-zero" {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
@@ -338,7 +332,7 @@ test "integration: --version prints version and exits zero" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expect(std.mem.startsWith(u8, result.stdout, "lasp "));
 }
 
@@ -348,7 +342,7 @@ test "integration: parse with TOML grammar produces structural events" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -371,7 +365,7 @@ test "integration: parse without grammar produces raw tokens" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -391,7 +385,7 @@ test "integration: nonexistent grammar file exits non-zero" {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
@@ -404,7 +398,7 @@ test "integration: malformed grammar file exits non-zero" {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
@@ -418,7 +412,7 @@ test "integration: structural events include col field" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -436,7 +430,7 @@ test "integration: raw token events include col field" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -453,7 +447,7 @@ test "integration: Erlang grammar with position filtering" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -473,7 +467,7 @@ test "integration: invalid position value exits non-zero" {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
@@ -762,36 +756,47 @@ test "property: names-only output correctness" {
 
 // Helper: run lasp with data piped to stdin
 fn runLaspWithStdin(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: []const u8) !struct { stdout: []u8, stderr: []u8, term: std.process.Child.Term } {
+    const io = std.testing.io;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, "zig-out/bin/lasp");
     for (args) |a| try argv.append(allocator, a);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
 
     // Write stdin data and close the pipe
-    if (child.stdin) |*stdin_pipe| {
-        var buf: [4096]u8 = undefined;
-        var writer = stdin_pipe.writer(&buf);
+    if (child.stdin) |stdin_file| {
+        var wbuf: [4096]u8 = undefined;
+        var writer = stdin_file.writer(io, &wbuf);
         try writer.interface.writeAll(stdin_data);
         try writer.interface.flush();
-        stdin_pipe.close();
+        stdin_file.close(io);
         child.stdin = null;
     }
 
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    var stderr_buf: std.ArrayList(u8) = .empty;
-    try child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024);
-    const term = try child.wait();
+    // Collect stdout and stderr concurrently (mirrors std.process.run).
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
 
-    const stdout_slice = try allocator.dupe(u8, stdout_buf.items);
-    const stderr_slice = try allocator.dupe(u8, stderr_buf.items);
-    stdout_buf.deinit(allocator);
-    stderr_buf.deinit(allocator);
+    while (multi_reader.fill(64, .none)) |_| {} else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try multi_reader.checkAnyError();
+
+    const term = try child.wait(io);
+
+    const stdout_slice = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout_slice);
+    const stderr_slice = try multi_reader.toOwnedSlice(1);
 
     return .{ .stdout = stdout_slice, .stderr = stderr_slice, .term = term };
 }
@@ -808,7 +813,7 @@ test "integration: stdin pipe support" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -833,7 +838,7 @@ test "integration: stdin pipe with empty input" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -850,7 +855,7 @@ test "integration: --node filter with grammar" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -875,7 +880,7 @@ test "integration: --node filter with no grammar (flag ignored)" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -898,7 +903,7 @@ test "integration: --names-only with grammar" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     // Should be plain text output, not JSON (should not start with '{')
     try std.testing.expect(result.stdout.len > 0);
@@ -929,7 +934,7 @@ test "integration: --names-only with no grammar (flag ignored)" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     // Should be JSON output (flag ignored)
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
@@ -950,7 +955,7 @@ test "integration: combined stdin + --node + --names-only" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     // Should be plain text output with function names
     try std.testing.expect(result.stdout.len > 0);
@@ -979,7 +984,7 @@ test "integration: --node filter matching zero events" {
         allocator.free(result.stderr);
     }
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -997,7 +1002,7 @@ test "integration: query type-only filter returns only function events" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -1017,7 +1022,7 @@ test "integration: query type + equality returns matching event" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -1035,7 +1040,7 @@ test "integration: query wildcard + confidence threshold" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -1055,7 +1060,7 @@ test "integration: query with --names-only output" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     // Should be plain text, not JSON
     try std.testing.expect(result.stdout.len > 0);
@@ -1078,7 +1083,7 @@ test "integration: query stdin pipe support" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
@@ -1097,7 +1102,7 @@ test "integration: query with no args exits non-zero" {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
@@ -1110,7 +1115,7 @@ test "integration: query without grammar exits non-zero" {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => {},
     }
     try std.testing.expect(result.stderr.len > 0);
@@ -1122,7 +1127,7 @@ test "integration: query nonexistent name returns empty valid JSON" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 
     // Should be valid JSON with empty events array
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});

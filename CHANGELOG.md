@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-21
+
+### Changed
+
+- Migrated to Zig 0.16.0: filesystem access via the new `std.Io` API (`Dir.cwd().openFile(io, ...)`, `File.stdout().writer(io, ...)`), child-process tests via `std.process.run`/`spawn`, string building via `std.Io.Writer.Allocating`.
+- Upgraded `minish` dependency 0.1.0 → 0.3.0 (Zig 0.16-native, no transitive dependencies).
+
+### Fixed
+
+- Pinned all Zig package dependencies to immutable commit archives instead of moving branch URLs; fresh fetches now verify hashes reproducibly.
+
 ## [0.1.0] - 2026-08-21
 
 ### Added

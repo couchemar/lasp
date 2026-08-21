@@ -473,6 +473,20 @@ grammars/
 
 ---
 
+## 🔨 Building & Testing
+
+The project uses a Nix flake for a reproducible toolchain (Zig 0.16.0):
+
+```bash
+nix develop          # dev shell with Zig on PATH
+zig build            # build the CLI into zig-out/bin/lasp
+zig build test       # unit + property + integration tests
+nix build            # ReleaseSafe build via the flake (./result/bin/lasp)
+nix run . -- --version
+```
+
+Note: tests must run through `zig build test`. Plain `zig test src/*.zig` fails because module imports (`minish`, `toml`, `build_options`) are wired by `build.zig`, not discoverable standalone.
+
 ## 🚀 Development Roadmap & Future Extensions
 
 ### Roadmap

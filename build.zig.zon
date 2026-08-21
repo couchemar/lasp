@@ -1,10 +1,10 @@
 .{
     .name = .lasp,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .dependencies = .{
         .minish = .{
-            .url = "https://github.com/CogitatorTech/minish/archive/8e44fc95d9b896fcfd6fa6d7f6582526b5b5dd55.tar.gz",
-            .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
+            .url = "https://github.com/CogitatorTech/minish/archive/bd81dca527f6e9621f6944973f458ed0eb10bc8b.tar.gz",
+            .hash = "minish-0.3.0-SQtSTbM3AgC3bIuRvIPsPB5b1ATKtRPZElR8M9pL-28w",
         },
         .toml = .{
             .url = "https://gitlab.com/devnw/zig/toml/-/archive/cf2196b53fc7907cf27eeb92ee01a5ba20076058/toml-cf2196b53fc7907cf27eeb92ee01a5ba20076058.tar.gz",

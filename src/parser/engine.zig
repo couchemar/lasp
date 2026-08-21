@@ -1379,9 +1379,11 @@ test "e2e: Erlang grammar still detects real function definitions" {
     const alloc = arena.allocator();
 
     // Load the actual Erlang grammar
-    const file = try std.fs.cwd().openFile("examples/grammars/erlang.toml", .{});
-    defer file.close();
-    const grammar_source = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const file = try std.Io.Dir.cwd().openFile(testing.io, "examples/grammars/erlang.toml", .{});
+    defer file.close(testing.io);
+    var fbuf: [4096]u8 = undefined;
+    var file_reader = file.reader(testing.io, &fbuf);
+    const grammar_source = try file_reader.interface.allocRemaining(alloc, .unlimited);
     const grammar = try loader.parseGrammar(grammar_source, alloc);
     const automaton = try compiler.compile(grammar.patterns, alloc);
 

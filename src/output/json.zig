@@ -106,10 +106,10 @@ pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !v
 const testing = std.testing;
 
 fn serializeToString(tokens: []const Token) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(testing.allocator);
-    try serializeTokens(tokens, buf.writer(testing.allocator));
-    return buf.toOwnedSlice(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try serializeTokens(tokens, &aw.writer);
+    return aw.toOwnedSlice();
 }
 
 test "serializeTokens empty tokens" {
@@ -219,12 +219,12 @@ test "property: JSON serialization correctness" {
 
             const tokens = [_]Token{.{ .kind = kind, .start = start, .end = end, .line = 1, .col = start }};
 
-            var buf: std.ArrayList(u8) = .empty;
-            defer buf.deinit(testing.allocator);
-            try serializeTokens(&tokens, buf.writer(testing.allocator));
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            try serializeTokens(&tokens, &aw.writer);
 
             // (a) Parses as valid JSON
-            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf.items, .{});
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
             defer parsed.deinit();
 
             // (b) Has top-level "events" array
@@ -248,10 +248,10 @@ test "property: JSON serialization correctness" {
 // --- Structural Event Tests ---
 
 fn serializeEventsToString(events_list: []const StructuralEvent) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(testing.allocator);
-    try serializeEvents(events_list, buf.writer(testing.allocator));
-    return buf.toOwnedSlice(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try serializeEvents(events_list, &aw.writer);
+    return aw.toOwnedSlice();
 }
 
 test "serializeEvents: empty events" {
@@ -446,12 +446,12 @@ test "property: event JSON serialization correctness" {
                 .confidence = 0.85,
             }};
 
-            var buf: std.ArrayList(u8) = .empty;
-            defer buf.deinit(testing.allocator);
-            try serializeEvents(events_list, buf.writer(testing.allocator));
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            try serializeEvents(events_list, &aw.writer);
 
             // (a) Valid JSON
-            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf.items, .{});
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
             defer parsed.deinit();
 
             // (b) Has "events" array
@@ -505,12 +505,12 @@ test "property: JSON serialization of extended fields" {
                 .block_end = null,
             }};
 
-            var buf: std.ArrayList(u8) = .empty;
-            defer buf.deinit(testing.allocator);
-            try serializeEvents(events_list, buf.writer(testing.allocator));
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            try serializeEvents(events_list, &aw.writer);
 
             // (a) Valid JSON
-            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf.items, .{});
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
             defer parsed.deinit();
 
             const json_events = parsed.value.object.get("events").?;
