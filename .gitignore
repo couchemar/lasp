@@ -7,3 +7,4 @@ zig-cache/
 result
 feedbacks
 zig-pkg/
+.DS_Store
