@@ -201,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
         .version => unreachable,
     }
 
-    try stdout.writeAll("\n");
+    if (!parsed.names_only) try stdout.writeAll("\n");
     try stdout.flush();
 }
 
@@ -1134,4 +1134,140 @@ test "integration: query nonexistent name returns empty valid JSON" {
     defer parsed.deinit();
     const json_events = parsed.value.object.get("events").?;
     try std.testing.expectEqual(@as(usize, 0), json_events.array.items.len);
+}
+
+// --- Bug Condition Exploration Test (names-only-trailing-newline) ---
+
+// Count lines terminated by '\n' in `out`.
+fn newlineTerminatedLineCount(out: []const u8) usize {
+    var count: usize = 0;
+    for (out) |c| {
+        if (c == '\n') count += 1;
+    }
+    return count;
+}
+
+// Count non-empty lines in `out` (the `grep -c .` equivalent).
+fn nonEmptyLineCount(out: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0) count += 1;
+    }
+    return count;
+}
+
+// Feature: names-only-trailing-newline, Property 1: Bug Condition
+// Names-Only Has No Trailing Blank Line.
+// CRITICAL: This test MUST FAIL on the current unfixed code — its failure confirms
+// the bug (an unconditional end-of-main `writeAll("\n")` adds one extra newline in
+// names-only mode). DO NOT fix the code to make it pass; the fix lands in a later task.
+test "exploration: names-only output has no trailing blank line" {
+    const allocator = std.testing.allocator;
+
+    // A deterministic two-function source: names-only should emit exactly `a\nb\n`.
+    const source = "fn a() void {}\nfn b() void {}\n";
+
+    // Case 1: parse ... --node function --names-only — wc -l == grep -c .
+    {
+        const result = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "examples/grammars/zig.toml", "--node", "function", "--names-only" }, source);
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+        const out = result.stdout;
+        try std.testing.expectEqual(nonEmptyLineCount(out), newlineTerminatedLineCount(out));
+        // Non-empty names-only output must end with exactly one '\n', never "\n\n".
+        try std.testing.expect(out.len > 0);
+        try std.testing.expect(!std.mem.endsWith(u8, out, "\n\n"));
+        try std.testing.expect(std.mem.endsWith(u8, out, "\n"));
+    }
+
+    // Case 2: query 'function' ... --names-only — wc -l == grep -c .
+    {
+        const result = try runLaspWithStdin(allocator, &.{ "query", "function", "-", "-g", "examples/grammars/zig.toml", "--names-only" }, source);
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+        const out = result.stdout;
+        try std.testing.expectEqual(nonEmptyLineCount(out), newlineTerminatedLineCount(out));
+        try std.testing.expect(out.len > 0);
+        try std.testing.expect(!std.mem.endsWith(u8, out, "\n\n"));
+        try std.testing.expect(std.mem.endsWith(u8, out, "\n"));
+    }
+
+    // Case 3: zero-match edge case — a nonexistent node type yields zero names, so
+    // names-only output must be exactly 0 bytes (today it is 1 byte: a stray '\n').
+    {
+        const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml", "--node", "nosuchtype", "--names-only" });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    }
+}
+
+// Helper: assert `out` parses as valid JSON and ends with exactly one trailing '\n'.
+fn expectValidJsonSingleTrailingNewline(allocator: std.mem.Allocator, out: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+    defer parsed.deinit();
+    try std.testing.expect(out.len > 0);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\n"));
+    try std.testing.expect(!std.mem.endsWith(u8, out, "\n\n"));
+}
+
+// Feature: names-only-trailing-newline, Property 2: Preservation
+// JSON And Version Output Unchanged.
+// These tests capture the characterizing invariants of the JSON and version output
+// paths on the current (unfixed) binary. The later fix guards the end-of-main newline
+// on `!parsed.names_only`, so every one of these paths must keep its single trailing
+// '\n' byte-for-byte. These MUST PASS on the unfixed code.
+test "preservation: parse with grammar emits valid JSON ending in one newline" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try expectValidJsonSingleTrailingNewline(allocator, result.stdout);
+}
+
+test "preservation: parse without grammar emits valid raw-token JSON ending in one newline" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try expectValidJsonSingleTrailingNewline(allocator, result.stdout);
+}
+
+test "preservation: query without names-only emits valid JSON ending in one newline" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try expectValidJsonSingleTrailingNewline(allocator, result.stdout);
+}
+
+test "preservation: --version prints 'lasp ' prefix ending in exactly one newline" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{"--version"});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    const out = result.stdout;
+    try std.testing.expect(std.mem.startsWith(u8, out, "lasp "));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\n"));
+    try std.testing.expect(!std.mem.endsWith(u8, out, "\n\n"));
 }
