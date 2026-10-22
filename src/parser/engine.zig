@@ -160,9 +160,13 @@ fn computeMaxConstraintDepth(patterns: []const loader.Pattern) usize {
 /// Runs the automaton against the token stream, emitting structural events.
 /// Skips tokens with kind: newline, indent, comment, string.
 /// Processes each non-skipped token exactly once (O(N), no backtracking).
-/// Uses buffered emission for competing pattern evaluation: when a terminal
-/// state is reached, the candidate is buffered and matching continues to find
-/// longer matches. The best candidate is emitted when the automaton resets.
+// Uses buffered emission for competing pattern evaluation: when a terminal
+// state is reached, the candidate is buffered and matching continues to find
+// longer matches. The best candidate is emitted when the automaton resets.
+// INVARIANT: buffering a terminal candidate SHALL NOT flush the region or
+// reset the state while we advance a match from a fixed pattern_start (state
+// never returns to 0); the region flushes only at a true reset, a new match
+// start, a post-buffer constraint rejection, or end-of-stream.
 pub fn parse(
     automaton: Automaton,
     tokens: []const Token,
@@ -188,6 +192,11 @@ pub fn parse(
     var state: usize = 0;
     var pattern_start: usize = 0;
     var pattern_col: usize = 0;
+    // End offset (exclusive) of the most recently matched sequence token.
+    // A region spans the matched tokens only: a candidate buffered at a terminal
+    // reached by skipping optionals ends here, not at the non-matching token
+    // that triggered the skip (keeps optional-tail and union forms equivalent).
+    var last_matched_end: usize = 0;
 
     // Phase 4: Noise penalty infrastructure
     var noise_count: u32 = 0;
@@ -248,6 +257,7 @@ pub fn parse(
             try matched_kinds.append(allocator, token.kind);
             try matched_texts.append(allocator, text);
             try matched_qualities.append(allocator, step_result.match_quality);
+            last_matched_end = token.end;
 
             if (step_result.capture) |cap| {
                 try pending_captures.append(allocator, .{
@@ -274,7 +284,7 @@ pub fn parse(
                         lookback,
                         block_stack,
                         tokens,
-                        token,
+                        last_matched_end,
                         weights,
                         allocator,
                     );
@@ -298,10 +308,15 @@ pub fn parse(
                     continue;
                 }
 
-                // Candidate buffered — DON'T reset state. Continue matching
-                // to see if a longer pattern also matches from this terminal state.
-                // If the terminal state has no outgoing transitions, the next token
-                // will fail to match and we'll flush then.
+                // INVARIANT (same-type-pattern-union): while the automaton
+                // advances a match from a fixed pattern_start (state never
+                // returns to 0), buffering a terminal candidate SHALL NOT flush
+                // the region or reset the state. The region flushes only at a
+                // true reset, a new independent match start, a post-buffer
+                // constraint rejection, or end-of-stream. Keep advancing so a
+                // longer same-start alternative (prefix case) can buffer too;
+                // if this terminal has no outgoing transitions, the next token
+                // fails to match and we flush then.
             }
         } else {
             // No match from current state — check for optional transitions to skip
@@ -336,6 +351,7 @@ pub fn parse(
                         try matched_kinds.append(allocator, token.kind);
                         try matched_texts.append(allocator, text);
                         try matched_qualities.append(allocator, skip_step_result.match_quality);
+                        last_matched_end = token.end;
 
                         if (skip_step_result.capture) |cap| {
                             try pending_captures.append(allocator, .{
@@ -375,6 +391,7 @@ pub fn parse(
                     try matched_kinds.append(allocator, token.kind);
                     try matched_texts.append(allocator, text);
                     try matched_qualities.append(allocator, retry_result.match_quality);
+                    last_matched_end = token.end;
 
                     if (retry_result.capture) |cap| {
                         try pending_captures.append(allocator, .{
@@ -401,7 +418,7 @@ pub fn parse(
                                 lookback,
                                 block_stack,
                                 tokens,
-                                token,
+                                last_matched_end,
                                 weights,
                                 allocator,
                             );
@@ -437,7 +454,7 @@ pub fn parse(
                             lookback,
                             block_stack,
                             tokens,
-                            token,
+                            last_matched_end,
                             weights,
                             allocator,
                         );
@@ -461,7 +478,10 @@ pub fn parse(
                         continue;
                     }
 
-                    // Candidate buffered — continue matching for longer patterns
+                    // INVARIANT: same as the main terminal path — a successfully
+                    // buffered candidate (optionals skipped) does NOT reset or
+                    // flush; keep matching for a longer alternative from this
+                    // same pattern_start.
                 }
             }
         }
@@ -537,7 +557,7 @@ fn bufferCandidate(
     lookback: LookbackBuffer,
     block_stack: BlockStack,
     tokens: []const Token,
-    token: Token,
+    last_matched_end: usize,
     weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
 ) !bool {
@@ -615,7 +635,7 @@ fn bufferCandidate(
         .type_name = event_info.type_name,
         .captures = try event_captures.toOwnedSlice(allocator),
         .start = pattern_start,
-        .end = token.end,
+        .end = last_matched_end,
         .line = pattern_line,
         .col = pattern_col,
         .confidence = confidence,
@@ -647,7 +667,7 @@ fn bufferCandidateWithMinEvidence(
     lookback: LookbackBuffer,
     block_stack: BlockStack,
     tokens: []const Token,
-    token: Token,
+    last_matched_end: usize,
     weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
 ) !bool {
@@ -687,7 +707,7 @@ fn bufferCandidateWithMinEvidence(
         lookback,
         block_stack,
         tokens,
-        token,
+        last_matched_end,
         weights,
         allocator,
     );
@@ -3558,4 +3578,784 @@ test "parse: --node function on colliding grammar filters to only function heads
     try testing.expectEqual(@as(usize, 2), fn_events.items.len);
     try testing.expectEqualStrings("ann", fn_events.items[0].captures[0].value);
     try testing.expectEqualStrings("compute", fn_events.items[1].captures[0].value);
+}
+
+// --- Same-Type Pattern Union: shared test helpers ---
+
+const TestTokenItem = struct {
+    kind: TokenKind,
+    text: []const u8,
+};
+
+const StreamBuilt = struct {
+    source: []const u8,
+    tokens: []Token,
+};
+
+/// Builds a single-line source string and matching token list from items.
+fn buildStream(alloc: std.mem.Allocator, items: []const TestTokenItem) !StreamBuilt {
+    var total: usize = 0;
+    for (items) |it| total += it.text.len;
+    const source = try alloc.alloc(u8, total);
+    var pos: usize = 0;
+    for (items) |it| {
+        @memcpy(source[pos..][0..it.text.len], it.text);
+        pos += it.text.len;
+    }
+    const tokens = try alloc.alloc(Token, items.len);
+    var offset: usize = 0;
+    for (items, 0..) |it, i| {
+        tokens[i] = .{
+            .kind = it.kind,
+            .start = offset,
+            .end = offset + it.text.len,
+            .line = 1,
+            .col = offset,
+        };
+        offset += it.text.len;
+    }
+    return .{ .source = source, .tokens = tokens };
+}
+
+const SEP_ITEM = TestTokenItem{ .kind = .symbol, .text = ";" };
+const LPAREN_ITEM = TestTokenItem{ .kind = .delimiter, .text = "(" };
+
+fn kwItem(text: []const u8) TestTokenItem {
+    return .{ .kind = .keyword, .text = text };
+}
+
+fn idItem(text: []const u8) TestTokenItem {
+    return .{ .kind = .identifier, .text = text };
+}
+
+fn setKwCaptureSeq(seq: *[2]loader.SequenceElement, kw: []const u8, field: []const u8) void {
+    seq[0] = .{ .matcher = .{ .keyword_literal = kw } };
+    seq[1] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 1 } } };
+}
+
+fn setKwCaptureParenSeq(seq: *[3]loader.SequenceElement, kw: []const u8, field: []const u8) void {
+    seq[0] = .{ .matcher = .{ .keyword_literal = kw } };
+    seq[1] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 1 } } };
+    seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+}
+
+fn setKwCaptureOptParenSeq(seq: *[3]loader.SequenceElement, kw: []const u8, field: []const u8) void {
+    seq[0] = .{ .matcher = .{ .keyword_literal = kw } };
+    seq[1] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 1 } } };
+    seq[2] = .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true };
+}
+
+fn setSingleCaptureSeq(seq: *[1]loader.SequenceElement, field: []const u8) void {
+    seq[0] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 0 } } };
+}
+
+fn distinctStrings(a: []const u8, b: []const u8) bool {
+    return !std.mem.eql(u8, a, b);
+}
+
+// Feature: same-type-pattern-union, Property 1: Union membership emits the shared type
+// **Validates: Requirements 1.1, 1.2**
+test "property: union membership emits the shared type" {
+    const P1Input = struct {
+        shared_type: []const u8,
+        kw_a: []const u8,
+        kw_b: []const u8,
+        kw_c: []const u8,
+    };
+    const p1_gen = gen.structure(P1Input, .{
+        .shared_type = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .kw_a = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .kw_b = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .kw_c = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    });
+
+    try minish.check(testing.allocator, p1_gen, struct {
+        fn prop(inp: P1Input) !void {
+            const shared_type = inp.shared_type;
+            const kw_a = inp.kw_a;
+            const kw_b = inp.kw_b;
+            const kw_c = inp.kw_c;
+            if (!distinctStrings(kw_a, kw_b) or
+                !distinctStrings(kw_a, kw_c) or
+                !distinctStrings(kw_b, kw_c)) return;
+
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq_a: [2]loader.SequenceElement = undefined;
+            var seq_b: [2]loader.SequenceElement = undefined;
+            var seq_c: [2]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq_a, kw_a, "a");
+            setKwCaptureSeq(&seq_b, kw_b, "b");
+            setKwCaptureSeq(&seq_c, kw_c, "c");
+
+            const patterns = &[_]loader.Pattern{
+                .{ .type_name = shared_type, .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 1 } } },
+                .{ .type_name = shared_type, .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 1 } } },
+                .{ .type_name = shared_type, .sequence = &seq_c, .captures = &.{.{ .field_name = "c", .position = 1 } } },
+            };
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            try items.append(alloc, kwItem(kw_a));
+            try items.append(alloc, idItem("va"));
+            try items.append(alloc, SEP_ITEM);
+            try items.append(alloc, kwItem(kw_b));
+            try items.append(alloc, idItem("vb"));
+            try items.append(alloc, SEP_ITEM);
+            try items.append(alloc, kwItem(kw_c));
+            try items.append(alloc, idItem("vc"));
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 3), result.len);
+
+            const Expected = struct { field: []const u8, value: []const u8 };
+            const expected = [_]Expected{
+                .{ .field = "a", .value = "va" },
+                .{ .field = "b", .value = "vb" },
+                .{ .field = "c", .value = "vc" },
+            };
+            for (result, expected) |ev, exp| {
+                try testing.expectEqualStrings(shared_type, ev.type_name);
+                try testing.expectEqual(@as(usize, 1), ev.captures.len);
+                try testing.expectEqualStrings(exp.field, ev.captures[0].field_name);
+                try testing.expectEqualStrings(exp.value, ev.captures[0].value);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 2: Disjoint same-type alternatives each emit,
+// carrying the matched alternative's captures
+// **Validates: Requirements 2.1, 2.2**
+test "property: disjoint same-type alternatives emit, carrying the matched alternative's captures" {
+    const P2Input = struct {
+        shared_type: []const u8,
+        kw_a: []const u8,
+        kw_b: []const u8,
+        cap_a: []const u8,
+        cap_b: []const u8,
+    };
+    const p2_gen = gen.structure(P2Input, .{
+        .shared_type = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .kw_a = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .kw_b = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .cap_a = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .cap_b = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    });
+
+    try minish.check(testing.allocator, p2_gen, struct {
+        fn prop(inp: P2Input) !void {
+            if (!distinctStrings(inp.kw_a, inp.kw_b)) return;
+
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq_a: [2]loader.SequenceElement = undefined;
+            var seq_b: [2]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq_a, inp.kw_a, "a");
+            setKwCaptureSeq(&seq_b, inp.kw_b, "b");
+
+            const patterns = &[_]loader.Pattern{
+                .{ .type_name = inp.shared_type, .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 1 } } },
+                .{ .type_name = inp.shared_type, .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 1 } } },
+            };
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            try items.append(alloc, kwItem(inp.kw_a));
+            try items.append(alloc, idItem(inp.cap_a));
+            try items.append(alloc, SEP_ITEM);
+            try items.append(alloc, kwItem(inp.kw_b));
+            try items.append(alloc, idItem(inp.cap_b));
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 2), result.len);
+
+            try testing.expectEqualStrings(inp.shared_type, result[0].type_name);
+            try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+            try testing.expectEqualStrings("a", result[0].captures[0].field_name);
+            try testing.expectEqualStrings(inp.cap_a, result[0].captures[0].value);
+
+            try testing.expectEqualStrings(inp.shared_type, result[1].type_name);
+            try testing.expectEqual(@as(usize, 1), result[1].captures.len);
+            try testing.expectEqualStrings("b", result[1].captures[0].field_name);
+            try testing.expectEqualStrings(inp.cap_b, result[1].captures[0].value);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 3: Prefix longest-wins
+// **Validates: Requirements 3.4, 4.1, 4.2, 4.3**
+test "property: prefix longest-wins" {
+    const P3Input = struct {
+        kw: []const u8,
+        value: []const u8,
+        same_type: bool,
+    };
+    const p3_gen = gen.structure(P3Input, .{
+        .kw = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .value = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .same_type = gen.boolean(),
+    });
+
+    try minish.check(testing.allocator, p3_gen, struct {
+        fn prop(inp: P3Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const type_short = if (inp.same_type) "union" else "short";
+            const type_long = if (inp.same_type) "union" else "long";
+
+            var seq_a: [2]loader.SequenceElement = undefined;
+            var seq_b: [3]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq_a, inp.kw, "name");
+            setKwCaptureParenSeq(&seq_b, inp.kw, "name");
+
+            const patterns = &[_]loader.Pattern{
+                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+            };
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            try items.append(alloc, kwItem(inp.kw));
+            try items.append(alloc, idItem(inp.value));
+            try items.append(alloc, LPAREN_ITEM);
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            // Longer form B matches: exactly one primary spanning B (through "("), never a
+            // separate shorter primary ending at A's span.
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectEqualStrings(type_long, result[0].type_name);
+            try testing.expectEqual(@as(usize, 0), result[0].start);
+            try testing.expectEqual(stream.tokens[2].end, result[0].end);
+            try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+            try testing.expectEqualStrings("name", result[0].captures[0].field_name);
+            try testing.expectEqualStrings(inp.value, result[0].captures[0].value);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 4: Prefix short-only emits the shorter
+// **Validates: Requirements 4.4**
+test "property: prefix short-only emits the shorter" {
+    const P4Input = struct {
+        kw: []const u8,
+        value: []const u8,
+        same_type: bool,
+    };
+    const p4_gen = gen.structure(P4Input, .{
+        .kw = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .value = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .same_type = gen.boolean(),
+    });
+
+    try minish.check(testing.allocator, p4_gen, struct {
+        fn prop(inp: P4Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const type_short = if (inp.same_type) "union" else "short";
+            const type_long = if (inp.same_type) "union" else "long";
+
+            var seq_a: [2]loader.SequenceElement = undefined;
+            var seq_b: [3]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq_a, inp.kw, "name");
+            setKwCaptureParenSeq(&seq_b, inp.kw, "name");
+
+            const patterns = &[_]loader.Pattern{
+                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+            };
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            try items.append(alloc, kwItem(inp.kw));
+            try items.append(alloc, idItem(inp.value));
+            try items.append(alloc, SEP_ITEM);
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            // Only the shorter form matches: exactly one primary covering A's span.
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectEqualStrings(type_short, result[0].type_name);
+            try testing.expectEqual(@as(usize, 0), result[0].start);
+            try testing.expectEqual(stream.tokens[1].end, result[0].end);
+            try testing.expectEqualStrings(inp.value, result[0].captures[0].value);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 5: Non-overlapping matches are independent
+// **Validates: Requirements 5.1, 5.2**
+test "property: non-overlapping matches are independent" {
+    const P5Input = struct {
+        count: u8,
+        kw: []const u8,
+    };
+    const p5_gen = gen.structure(P5Input, .{
+        .count = gen.intRange(u8, 1, 5),
+        .kw = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    });
+
+    try minish.check(testing.allocator, p5_gen, struct {
+        fn prop(inp: P5Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: [2]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq, inp.kw, "name");
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "unit",
+                .sequence = &seq,
+                .captures = &.{.{ .field_name = "name", .position = 1 }},
+            }};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            for (0..inp.count) |_| {
+                try items.append(alloc, kwItem(inp.kw));
+                try items.append(alloc, idItem("x"));
+                try items.append(alloc, SEP_ITEM);
+            }
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, inp.count), result.len);
+            for (result, 0..) |ev, i| {
+                try testing.expectEqual(stream.tokens[3 * i].start, ev.start);
+                try testing.expectEqualStrings("unit", ev.type_name);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 6: Optional-tail and union forms yield equivalent primaries
+// **Validates: Requirements 6.1, 6.2, 6.3**
+test "property: optional-tail and union forms yield equivalent primaries" {
+    const P6Input = struct {
+        kw: []const u8,
+        value: []const u8,
+    };
+    const p6_gen = gen.structure(P6Input, .{
+        .kw = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .value = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    });
+
+    try minish.check(testing.allocator, p6_gen, struct {
+        fn prop(inp: P6Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Optional-tail grammar: [kw, capture, "("?]
+            var seq_opt: [3]loader.SequenceElement = undefined;
+            setKwCaptureOptParenSeq(&seq_opt, inp.kw, "name");
+            const opt_patterns = &[_]loader.Pattern{.{
+                .type_name = "decl",
+                .sequence = &seq_opt,
+                .captures = &.{.{ .field_name = "name", .position = 1 }},
+            }};
+            const opt_automaton = try compiler.compile(opt_patterns, alloc);
+
+            // Union grammar: [kw, capture] and [kw, capture, "("] sharing one type
+            var seq_a: [2]loader.SequenceElement = undefined;
+            var seq_b: [3]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq_a, inp.kw, "name");
+            setKwCaptureParenSeq(&seq_b, inp.kw, "name");
+            const union_patterns = &[_]loader.Pattern{
+                .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+            };
+            const union_automaton = try compiler.compile(union_patterns, alloc);
+
+            // Short shape: [kw, value, SEP]; long shape: [kw, value, "("]
+            const shapes = [_]struct { items: [3]TestTokenItem, label: []const u8 }{
+                .{ .items = .{ kwItem(inp.kw), idItem(inp.value), SEP_ITEM }, .label = "short" },
+                .{ .items = .{ kwItem(inp.kw), idItem(inp.value), LPAREN_ITEM }, .label = "long" },
+            };
+
+            for (shapes) |shape| {
+                const stream = try buildStream(alloc, shape.items[0..]);
+                const union_result = try parse(union_automaton, stream.tokens, stream.source, union_patterns, .{}, .{}, alloc);
+                const opt_result = try parse(opt_automaton, stream.tokens, stream.source, opt_patterns, .{}, .{}, alloc);
+
+                try testing.expectEqual(@as(usize, 1), union_result.len);
+                try testing.expectEqual(@as(usize, 1), opt_result.len);
+                try testing.expectEqualStrings("decl", union_result[0].type_name);
+                try testing.expectEqualStrings("decl", opt_result[0].type_name);
+                try testing.expectEqual(union_result[0].start, opt_result[0].start);
+                try testing.expectEqual(union_result[0].end, opt_result[0].end);
+                try testing.expectEqual(union_result[0].captures.len, opt_result[0].captures.len);
+                try testing.expectEqualStrings(union_result[0].captures[0].field_name, opt_result[0].captures[0].field_name);
+                try testing.expectEqualStrings(union_result[0].captures[0].value, opt_result[0].captures[0].value);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 7: Different-type overlap collapses to one tiebreak-selected primary
+// **Validates: Requirements 3.1, 3.2, 3.3, 3.5, 4.5**
+test "property: different-type overlap collapses to one tiebreak-selected primary" {
+    const P7Input = struct {
+        kw: []const u8,
+        value: []const u8,
+        same_type: bool,
+        relax: u8, // 0 = none, 1 = relax the shared first keyword, 2 = relax B's trailing keyword
+    };
+    const p7_gen = gen.structure(P7Input, .{
+        .kw = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .value = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .same_type = gen.boolean(),
+        .relax = gen.intRange(u8, 0, 2),
+    });
+
+    try minish.check(testing.allocator, p7_gen, struct {
+        fn prop(inp: P7Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const type_short = if (inp.same_type) "overlap" else "short";
+            const type_long = if (inp.same_type) "overlap" else "long";
+
+            // A = [kw, capture]; B = [kw, capture, keyword_literal "?"] (A is a strict prefix).
+            // B's trailing keyword can be relaxed by tokenizing it as an identifier.
+            var seq_a: [2]loader.SequenceElement = undefined;
+            var seq_b: [3]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq_a, inp.kw, "name");
+            seq_b[0] = .{ .matcher = .{ .keyword_literal = inp.kw } };
+            seq_b[1] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } };
+            seq_b[2] = .{ .matcher = .{ .keyword_literal = "?" } };
+
+            const patterns = &[_]loader.Pattern{
+                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+            };
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            if (inp.relax == 1) {
+                try items.append(alloc, idItem(inp.kw));
+            } else {
+                try items.append(alloc, kwItem(inp.kw));
+            }
+            try items.append(alloc, idItem(inp.value));
+            if (inp.relax == 2) {
+                try items.append(alloc, idItem("?"));
+            } else {
+                try items.append(alloc, kwItem("?"));
+            }
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+
+            // Expected winner by Tiebreak_Order (confidence → length → grammar order):
+            // - no relaxation: both full, equal confidence → longest (B)
+            // - shared first keyword relaxed: A below 1.0 → B (higher confidence)
+            // - B's trailing keyword relaxed: B below 1.0 → A (higher confidence, despite shorter)
+            const expected_type = switch (inp.relax) {
+                2 => type_short,
+                else => type_long,
+            };
+            try testing.expectEqualStrings(expected_type, result[0].type_name);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 8: Backward compatibility for non-overlapping,
+// non-prefix grammars (Requirement 9.1, 9.2, 1.4). The single-pass O(N) step count is not
+// observable through the public parse() API; the loop structurally visits each token once
+// (no backtracking) as reviewed in the implementation.
+test "property: backward compatibility for non-overlapping, non-prefix grammars" {
+    const P8Input = struct {
+        kw_a: []const u8,
+        kw_b: []const u8,
+        cap_a: []const u8,
+        cap_b: []const u8,
+    };
+    const p8_gen = gen.structure(P8Input, .{
+        .kw_a = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .kw_b = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .cap_a = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .cap_b = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    });
+
+    try minish.check(testing.allocator, p8_gen, struct {
+        fn prop(inp: P8Input) !void {
+            if (!distinctStrings(inp.kw_a, inp.kw_b)) return;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Distinct types per pattern: identical to pre-feature behavior.
+            var seq_a: [2]loader.SequenceElement = undefined;
+            var seq_b: [2]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq_a, inp.kw_a, "name");
+            setKwCaptureSeq(&seq_b, inp.kw_b, "other");
+            const patterns = &[_]loader.Pattern{
+                .{ .type_name = "type_a", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = "type_b", .sequence = &seq_b, .captures = &.{.{ .field_name = "other", .position = 1 } } },
+            };
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            try items.append(alloc, kwItem(inp.kw_a));
+            try items.append(alloc, idItem(inp.cap_a));
+            try items.append(alloc, SEP_ITEM);
+            try items.append(alloc, kwItem(inp.kw_b));
+            try items.append(alloc, idItem(inp.cap_b));
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 2), result.len);
+            try testing.expectEqualStrings("type_a", result[0].type_name);
+            try testing.expectEqualStrings("name", result[0].captures[0].field_name);
+            try testing.expectEqualStrings(inp.cap_a, result[0].captures[0].value);
+            try testing.expectEqual(stream.tokens[0].start, result[0].start);
+            try testing.expectEqual(stream.tokens[1].end, result[0].end);
+            try testing.expectEqualStrings("type_b", result[1].type_name);
+            try testing.expectEqualStrings("other", result[1].captures[0].field_name);
+            try testing.expectEqualStrings(inp.cap_b, result[1].captures[0].value);
+            try testing.expectEqual(stream.tokens[3].start, result[1].start);
+            try testing.expectEqual(stream.tokens[4].end, result[1].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Requirement 1.4: a one-pattern type behaves identically to the pre-feature engine.
+test "property: single-pattern grammar emits identically to pre-feature" {
+    const P8BInput = struct {
+        kw: []const u8,
+        value: []const u8,
+    };
+    const p8b_gen = gen.structure(P8BInput, .{
+        .kw = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        .value = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    });
+    try minish.check(testing.allocator, p8b_gen, struct {
+        fn prop(inp: P8BInput) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: [2]loader.SequenceElement = undefined;
+            setKwCaptureSeq(&seq, inp.kw, "name");
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "single",
+                .sequence = &seq,
+                .captures = &.{.{ .field_name = "name", .position = 1 }},
+            }};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            try items.append(alloc, kwItem(inp.kw));
+            try items.append(alloc, idItem(inp.value));
+            try items.append(alloc, SEP_ITEM);
+            try items.append(alloc, kwItem(inp.kw));
+            try items.append(alloc, idItem(inp.value));
+            const stream = try buildStream(alloc, items.items);
+
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 2), result.len);
+            for (result) |ev| {
+                try testing.expectEqualStrings("single", ev.type_name);
+                try testing.expectEqualStrings("name", ev.captures[0].field_name);
+                try testing.expectEqualStrings(inp.value, ev.captures[0].value);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: same-type-pattern-union, Property 9: Identical-sequence union coexists via the shadowing fix
+// **Validates: Requirements 8.1, 8.2, 8.3**
+test "property: identical-sequence union coexists via the shadowing fix" {
+    const v_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+    try minish.check(testing.allocator, v_gen, struct {
+        fn prop(value: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq_a: [1]loader.SequenceElement = undefined;
+            var seq_b: [1]loader.SequenceElement = undefined;
+            setSingleCaptureSeq(&seq_a, "a");
+            setSingleCaptureSeq(&seq_b, "b");
+
+            const patterns = &[_]loader.Pattern{
+                .{ .type_name = "same", .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 0 } } },
+                .{ .type_name = "same", .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 0 } } },
+            };
+            const automaton = try compiler.compile(patterns, alloc);
+            const term = automaton.states[1];
+            try testing.expectEqual(@as(usize, 2), term.events.len);
+            try testing.expectEqual(@as(usize, 0), term.events[0].pattern_index);
+            try testing.expectEqual(@as(usize, 1), term.events[1].pattern_index);
+            try testing.expectEqualStrings("same", term.events[0].type_name);
+            try testing.expectEqualStrings("same", term.events[1].type_name);
+
+            const items = [_]TestTokenItem{idItem(value)};
+            const stream = try buildStream(alloc, &items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            // One event of the shared type; tiebreak picks grammar order (index 0 → field "a").
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectEqualStrings("same", result[0].type_name);
+            try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+            try testing.expectEqualStrings("a", result[0].captures[0].field_name);
+            try testing.expectEqualStrings(value, result[0].captures[0].value);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Same-Type Pattern Union: unit tests (concrete examples and edge cases) ---
+
+test "parse: prefix pair emits the long form once on long input" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq_a: [2]loader.SequenceElement = undefined;
+    var seq_b: [3]loader.SequenceElement = undefined;
+    setKwCaptureSeq(&seq_a, "fn", "name");
+    setKwCaptureParenSeq(&seq_b, "fn", "name");
+    const patterns = &[_]loader.Pattern{
+        .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+    };
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{ kwItem("fn"), idItem("add"), LPAREN_ITEM };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("decl", result[0].type_name);
+    try testing.expectEqual(@as(usize, 0), result[0].start);
+    try testing.expectEqual(stream.tokens[2].end, result[0].end);
+    try testing.expectEqualStrings("add", result[0].captures[0].value);
+}
+
+test "parse: prefix pair emits the short form on short input" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq_a: [2]loader.SequenceElement = undefined;
+    var seq_b: [3]loader.SequenceElement = undefined;
+    setKwCaptureSeq(&seq_a, "fn", "name");
+    setKwCaptureParenSeq(&seq_b, "fn", "name");
+    const patterns = &[_]loader.Pattern{
+        .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+    };
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{ kwItem("fn"), idItem("add"), SEP_ITEM };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("decl", result[0].type_name);
+    try testing.expectEqual(@as(usize, 0), result[0].start);
+    try testing.expectEqual(stream.tokens[1].end, result[0].end);
+    try testing.expectEqualStrings("add", result[0].captures[0].value);
+}
+
+test "parse: same-type union with disjoint first tokens emits the shared type for each form" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq_a: [2]loader.SequenceElement = undefined;
+    var seq_b: [2]loader.SequenceElement = undefined;
+    setKwCaptureSeq(&seq_a, "def", "name");
+    setKwCaptureSeq(&seq_b, "class", "name");
+    const patterns = &[_]loader.Pattern{
+        .{ .type_name = "thing", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "thing", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+    };
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{ kwItem("def"), idItem("x"), SEP_ITEM, kwItem("class"), idItem("y") };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 2), result.len);
+    try testing.expectEqualStrings("thing", result[0].type_name);
+    try testing.expectEqualStrings("x", result[0].captures[0].value);
+    try testing.expectEqualStrings("thing", result[1].type_name);
+    try testing.expectEqualStrings("y", result[1].captures[0].value);
+}
+
+test "parse: constraint-rejected terminal candidate does not produce a premature shorter primary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A = [kw, capture] with a depth-0 constraint rejecting the captured value "bad".
+    // B = [kw, capture, "("] — the longer same-start alternative.
+    var seq_a: [2]loader.SequenceElement = undefined;
+    var seq_b: [3]loader.SequenceElement = undefined;
+    setKwCaptureSeq(&seq_a, "fn", "name");
+    setKwCaptureParenSeq(&seq_b, "fn", "name");
+    const patterns = &[_]loader.Pattern{
+        .{
+            .type_name = "decl",
+            .sequence = &seq_a,
+            .captures = &.{.{ .field_name = "name", .position = 1 }},
+            .constraints = &.{.{
+                .type = .not,
+                .depth = 0,
+                .field = "name",
+                .values = &.{"bad"},
+            }},
+        },
+        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+    };
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // Input "fn bad (" — A's constraint rejects the captured "bad" at A's terminal, so the
+    // region aborts: neither a shorter primary nor B is emitted for this start.
+    const items = [_]TestTokenItem{ kwItem("fn"), idItem("bad"), LPAREN_ITEM };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 0), result.len);
+
+    // Input "fn good (" — B matches fully and wins as the longer alternative.
+    const items2 = [_]TestTokenItem{ kwItem("fn"), idItem("good"), LPAREN_ITEM };
+    const stream2 = try buildStream(alloc, &items2);
+    const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result2.len);
+    try testing.expectEqualStrings("decl", result2[0].type_name);
+    try testing.expectEqualStrings("good", result2[0].captures[0].value);
+}
+
+test "parse: arbitrary non-language type strings are treated opaquely" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq_a: [2]loader.SequenceElement = undefined;
+    var seq_b: [2]loader.SequenceElement = undefined;
+    setKwCaptureSeq(&seq_a, "alpha", "name");
+    setKwCaptureSeq(&seq_b, "beta", "name");
+    const patterns = &[_]loader.Pattern{
+        .{ .type_name = "xyzzy", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "42type", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+    };
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{ kwItem("alpha"), idItem("a"), SEP_ITEM, kwItem("beta"), idItem("b") };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 2), result.len);
+    try testing.expectEqualStrings("xyzzy", result[0].type_name);
+    try testing.expectEqualStrings("42type", result[1].type_name);
 }

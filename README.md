@@ -312,6 +312,9 @@ sequence = ["Config:IDENTIFIER", ".", "$method:IDENTIFIER", "("]
 ```
 This matches only when the identifier text is exactly `"Config"`. Unlike keyword literals, this matches `.identifier` tokens — useful for names that aren't language keywords.
 
+### Same-Type Pattern Union
+Multiple `[[patterns]]` entries sharing the same `type` name act as **alternatives of one type**: an occurrence matching any alternative emits a single event of that shared type. Overlapping alternatives collapse to one primary event (highest confidence → longest match → grammar order); if one alternative's sequence is a prefix of another's and the source matches the longer form, the longer form wins. A union of alternatives and an equivalent optional-tail pattern produce the same type, captures, and source region. Works for any type name — no new flags, grammar keys, or JSON fields.
+
 ### Block Definitions
 Blocks describe structural scopes either by tokens (`{ }`) or explicitly mapped for python/YAML logic:
 ```

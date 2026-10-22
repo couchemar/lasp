@@ -227,6 +227,27 @@ open = "{"
 close = "}"
 ```
 
+### Same-type pattern union
+
+Multiple `[[patterns]]` entries that share the same `type` name are **alternatives of one type**: an occurrence matching any of them emits a single event of that shared type. This lets you describe one logical construct in several shapes:
+
+```toml
+[[patterns]]
+type = "reference"
+sequence = ["&", "$callee:IDENTIFIER"]          # bare capture ref  &foo
+
+[[patterns]]
+type = "reference"
+sequence = ["&", "$callee:IDENTIFIER", "/", "number"]  # arity-qualified  &foo/1
+```
+
+Semantics:
+- **Non-overlapping alternatives** each emit their own event (both forms above are detected).
+- **Overlapping alternatives** collapse to one primary event per construct: highest confidence → longest match → grammar order. If one alternative's sequence is a prefix of another's and the source matches the longer form, the longer form wins — the shorter is never emitted separately from the same start.
+- **Equivalent choice**: a `Type_Union` of alternatives and a single optional-tail pattern (`["&", "$callee:IDENTIFIER", "/?", "number?"]`) produce the same type, captures, and source region. Pick whichever reads more clearly.
+- Failing alternatives are never exposed without `--alternatives` (a separate feature); by default only the winner is emitted.
+- Works for any `type` name — the engine hardcodes none, and no new flags or grammar keys are needed.
+
 ### Position constraints
 
 Restrict a pattern to match only at column 0 (line start):
@@ -374,6 +395,7 @@ block_close = "-}"
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
 | `"fn?"` | Optional keyword — boosts confidence when present |
 | `"(?"` | Optional symbol — boosts confidence when present |
+| Same `type` on multiple `[[patterns]]` | Alternatives of one type; overlap collapses to longest match → grammar order |
 
 ## Workflow: Analyze an Unfamiliar Codebase
 

@@ -1,0 +1,17 @@
+[language]
+name = "union"
+
+[keywords]
+decl = ["fn", "use"]
+
+[[patterns]]
+type = "decl"
+sequence = ["fn", "$name:IDENTIFIER"]
+
+[[patterns]]
+type = "decl"
+sequence = ["fn", "$name:IDENTIFIER", "("]
+
+[[patterns]]
+type = "call"
+sequence = ["use", "$callee:IDENTIFIER"]

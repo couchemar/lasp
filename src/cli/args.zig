@@ -1080,3 +1080,11 @@ test "property: non-help parsing is preserved" {
         }
     }.prop, .{ .num_runs = 100 });
 }
+
+// Feature: same-type-pattern-union, Requirement 7.3: union semantics add no new CLI flag.
+test "--union style flags are unrecognized" {
+    const parse_args = &[_][]const u8{ "parse", "file.zig", "--union" };
+    try testing.expectError(error.UnrecognizedFlag, parseArgs(parse_args));
+    const query_args = &[_][]const u8{ "query", "function", "file.zig", "-g", "grammar.toml", "--union" };
+    try testing.expectError(error.UnrecognizedFlag, parseArgs(query_args));
+}

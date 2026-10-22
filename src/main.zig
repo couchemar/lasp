@@ -1727,3 +1727,40 @@ test "integration: colliding identical-sequence patterns emit both functions and
         try std.testing.expectEqualStrings("helper\n", result_call.stdout);
     }
 }
+
+// Feature: same-type-pattern-union, Integration: a union/prefix grammar emits one primary
+// per construct (Requirement 7.2). The `--alternatives` flag belongs to the separate
+// competing-candidate-emission feature and is not part of this spec.
+test "integration: same-type pattern union emits one primary per construct" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/union_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/union.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // "fn alpha (" matches both decl alternatives; longest-match collapses to one decl.
+    // "fn beta ;" matches only the short decl. "use gamma" is a call.
+    try std.testing.expectEqual(@as(usize, 3), json_events.array.items.len);
+
+    const expected_types = [_][]const u8{ "decl", "decl", "call" };
+    const expected_values = [_][]const u8{ "alpha", "beta", "gamma" };
+    for (json_events.array.items, expected_types, expected_values) |ev, exp_type, exp_value| {
+        try std.testing.expectEqualStrings(exp_type, ev.object.get("type").?.string);
+        // No losers exposed without --alternatives: no "alternatives" key in the JSON.
+        try std.testing.expect(ev.object.get("alternatives") == null);
+        const cap_key = if (std.mem.eql(u8, exp_type, "call")) "callee" else "name";
+        try std.testing.expectEqualStrings(exp_value, ev.object.get(cap_key).?.string);
+    }
+}

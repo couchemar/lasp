@@ -819,3 +819,38 @@ test "compile: shared-prefix patterns create distinct terminals each with one ev
     try testing.expectEqual(@as(usize, 1), automaton.states[term_a].events.len);
     try testing.expectEqual(@as(usize, 1), automaton.states[term_b].events.len);
 }
+
+// Feature: same-type-pattern-union, Unit: identical-sequence same-type alternatives land
+// on one terminal with both events in grammar order (Requirement 8.1, 8.2).
+test "compile: identical-sequence same-type alternatives land on one terminal in grammar order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]Pattern{
+        .{
+            .type_name = "same",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "a", .position = 0 } } },
+            },
+            .captures = &.{.{ .field_name = "a", .position = 0 }},
+        },
+        .{
+            .type_name = "same",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "b", .position = 0 } } },
+            },
+            .captures = &.{.{ .field_name = "b", .position = 0 }},
+        },
+    };
+
+    const automaton = try compile(patterns, alloc);
+    const term = automaton.states[1];
+    try testing.expectEqual(@as(usize, 2), term.events.len);
+    try testing.expectEqualStrings("same", term.events[0].type_name);
+    try testing.expectEqual(@as(usize, 0), term.events[0].pattern_index);
+    try testing.expectEqualStrings("a", term.events[0].capture_fields[0]);
+    try testing.expectEqualStrings("same", term.events[1].type_name);
+    try testing.expectEqual(@as(usize, 1), term.events[1].pattern_index);
+    try testing.expectEqualStrings("b", term.events[1].capture_fields[0]);
+}
