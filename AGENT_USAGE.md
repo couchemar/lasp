@@ -389,7 +389,7 @@ block_close = "-}"
 | Element | Matches |
 |---------|---------|
 | `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
-| `"("` | Exact symbol/delimiter |
+| `"("` | Exact punctuation character — operator, symbol, or delimiter (`+ - * / = < > ! & \| ^ % ~ ( ) { } [ ] , ; : . @ ?`) |
 | `"identifier"` | Any identifier token |
 | `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |

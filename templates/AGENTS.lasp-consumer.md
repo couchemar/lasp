@@ -181,7 +181,8 @@ close = "}"
 | Element | Matches |
 |---------|---------|
 | `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
-| `"("` | Exact symbol/delimiter |
+| `"("` | Exact punctuation — symbol, delimiter, or operator (`+ - * / = < > ! & \| ^ % ~`) by exact text. Single-character only: a multi-char literal like `"->"` compiles but never matches |
+| `"-"` | Anchor sigil constructs on their leading operator — e.g. `["-", "module", "("]` for Erlang `-module(...)`, `["@", ...]` for Elixir attributes, `["&", ...]` for capture refs |
 | `"identifier"` | Any identifier token |
 | `"$name:IDENTIFIER"` | Identifier, captured into the `name` field |
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |

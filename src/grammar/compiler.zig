@@ -72,7 +72,7 @@ fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) M
             if (kind == .identifier and std.mem.eql(u8, text, kw)) return .relaxed_match;
             return .no_match;
         },
-        .symbol_literal => |sym| if ((kind == .delimiter or kind == .symbol) and std.mem.eql(u8, text, sym)) .full_match else .no_match,
+        .symbol_literal => |sym| if ((kind == .delimiter or kind == .symbol or kind == .operator) and std.mem.eql(u8, text, sym)) .full_match else .no_match,
         .identifier => if (kind == .identifier) .full_match else .no_match,
         .capture => if (kind == .identifier) .full_match else .no_match,
         .identifier_literal => |id| if (kind == .identifier and std.mem.eql(u8, text, id)) .full_match else .no_match,
@@ -853,4 +853,114 @@ test "compile: identical-sequence same-type alternatives land on one terminal in
     try testing.expectEqualStrings("same", term.events[1].type_name);
     try testing.expectEqual(@as(usize, 1), term.events[1].pattern_index);
     try testing.expectEqualStrings("b", term.events[1].capture_fields[0]);
+}
+
+// Feature: operator-token-matching, Unit: matchesTransition punctuation matching
+// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 7.2, 8.1, 8.2, 8.3**
+test "matchesTransition: operator tokens full-match equal-text punctuation literal" {
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .operator, "-") == .full_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .operator, "+") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "&" }, .operator, "&") == .full_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "?" }, .operator, "?") == .full_match);
+}
+
+test "matchesTransition: punctuation literals reject non-punctuation tokens" {
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .identifier, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .keyword, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .string, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .number, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .newline, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .indent, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .comment, "-") == .no_match);
+}
+
+test "matchesTransition: symbol and delimiter matching preserved" {
+    try testing.expect(matchesTransition(.{ .symbol_literal = "(" }, .delimiter, "(") == .full_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = ":" }, .symbol, ":") == .full_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = "(" }, .delimiter, ")") == .no_match);
+    try testing.expect(matchesTransition(.{ .symbol_literal = ":" }, .symbol, ";") == .no_match);
+}
+
+// Feature: operator-token-matching, Property 1: Operator tokens full-match an equal-text
+// punctuation literal
+// **Validates: Requirements 1.1, 1.2**
+test "property: operator tokens full-match an equal-text punctuation literal" {
+    const ops = "+-*/=<>!&|^%~";
+    const idx_gen = gen.intRange(u8, 0, ops.len - 1);
+
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idx: u8) !void {
+            const c = ops[idx];
+            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            try testing.expect(matchesTransition(m, .operator, &[1]u8{c}) == .full_match);
+            // Different operator text → no match, never relaxed.
+            const other = ops[(idx + 1) % ops.len];
+            try testing.expect(matchesTransition(m, .operator, &[1]u8{other}) == .no_match);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: operator-token-matching, Property 2: Symbol and delimiter matching is preserved
+// **Validates: Requirements 1.3, 1.4, 7.2**
+test "property: symbol and delimiter matching is preserved" {
+    const syms = ",;:.@?";
+    const delims = "(){}[]";
+    const idx_gen = gen.intRange(u8, 0, syms.len + delims.len - 1);
+
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idx: u8) !void {
+            const c = if (idx < syms.len) syms[idx] else delims[idx - syms.len];
+            const kind: TokenKind = if (idx < syms.len) .symbol else .delimiter;
+            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == .full_match);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: operator-token-matching, Property 3: Punctuation literals reject non-punctuation tokens
+// **Validates: Requirements 2.1, 2.2, 2.3, 8.1, 8.2**
+test "property: punctuation literals reject non-punctuation tokens" {
+    const punct = "(){}[],;:.@?+-*/=<>!&|^%~";
+    const kinds = [_]TokenKind{ .identifier, .keyword, .string, .number, .newline, .indent, .comment };
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        u8,
+        gen.intRange(u8, 0, punct.len - 1),
+        gen.intRange(u8, 0, kinds.len - 1),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8 }) !void {
+            const c = punct[vals[0]];
+            const kind = kinds[vals[1]];
+            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            // Even when the token text equals the literal, non-punctuation kinds reject.
+            try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == .no_match);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: operator-token-matching, Property 6: Punctuation matching is single-token and exact
+// **Validates: Requirements 3.1, 3.2, 8.3**
+test "property: punctuation matching is single-token and exact" {
+    const punct = "(){}[],;:.@?+-*/=<>!&|^%~";
+    const all_kinds = [_]TokenKind{ .identifier, .keyword, .symbol, .string, .number, .operator, .newline, .indent, .comment, .delimiter };
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        u8,
+        gen.intRange(u8, 0, punct.len - 1),
+        gen.intRange(u8, 0, all_kinds.len - 1),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8 }) !void {
+            const c = punct[vals[0]];
+            const kind = all_kinds[vals[1]];
+            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            const is_punct_kind = kind == .operator or kind == .symbol or kind == .delimiter;
+            const expected: MatchResult = if (is_punct_kind) .full_match else .no_match;
+            try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == expected);
+            try testing.expect(matchesTransition(m, kind, "x") == .no_match);
+        }
+    }.prop, .{ .num_runs = 100 });
 }

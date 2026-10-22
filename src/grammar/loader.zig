@@ -112,10 +112,13 @@ pub const GrammarError = error{
 
 const delimiter_chars = "(){}[]";
 const symbol_chars = ",;:.@?";
+const operator_chars = "+-*/=<>!&|^%~";
 
-fn isSymbolOrDelimiter(s: []const u8) bool {
+/// Single-character punctuation: symbols, delimiters, and operators (unified
+/// punctuation matching, spec: operator-token-matching).
+fn isPunctuation(s: []const u8) bool {
     if (s.len != 1) return false;
-    for (delimiter_chars ++ symbol_chars) |c| {
+    for (delimiter_chars ++ symbol_chars ++ operator_chars) |c| {
         if (s[0] == c) return true;
     }
     return false;
@@ -162,8 +165,8 @@ fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.All
         const exact_text = try allocator.dupe(u8, s[0 .. s.len - 11]);
         return .{ .element = .{ .matcher = .{ .identifier_literal = exact_text }, .is_optional = optional }, .capture = null };
     }
-    // Symbol/delimiter literal (single char)
-    if (isSymbolOrDelimiter(s)) {
+    // Punctuation literal (single char: symbol, delimiter, or operator)
+    if (isPunctuation(s)) {
         return .{ .element = .{ .matcher = .{ .symbol_literal = try allocator.dupe(u8, s) }, .is_optional = optional }, .capture = null };
     }
     // Keyword literal
@@ -2903,4 +2906,104 @@ test "parseGrammar + formatGrammar round-trip without [comments] section" {
     try testing.expectEqualStrings("#", parsed2.comments.line_prefixes[1]);
     try testing.expectEqualStrings("/*", parsed2.comments.block_open.?);
     try testing.expectEqualStrings("*/", parsed2.comments.block_close.?);
+}
+
+// Feature: operator-token-matching, Unit: parseSequenceElement routing
+// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
+test "parseSequenceElement: operator characters route to symbol_literal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ops = "+-*/=<>!&|^%~";
+    for (ops) |c| {
+        const s = [1]u8{c};
+        const res = try parseSequenceElement(&s, 0, alloc);
+        try testing.expect(res.element.matcher == .symbol_literal);
+        try testing.expectEqualStrings(&s, res.element.matcher.symbol_literal);
+    }
+
+    // Existing symbol/delimiter characters continue to route identically.
+    const sym_delim = "(){}[],;:.@?";
+    for (sym_delim) |c| {
+        const s = [1]u8{c};
+        const res = try parseSequenceElement(&s, 0, alloc);
+        try testing.expect(res.element.matcher == .symbol_literal);
+        try testing.expectEqualStrings(&s, res.element.matcher.symbol_literal);
+    }
+}
+
+test "parseSequenceElement: non-punctuation routes to non-punctuation matchers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        const res = try parseSequenceElement("module", 0, alloc);
+        try testing.expect(res.element.matcher == .keyword_literal);
+        try testing.expectEqualStrings("module", res.element.matcher.keyword_literal);
+    }
+    {
+        const res = try parseSequenceElement("$name:IDENTIFIER", 0, alloc);
+        try testing.expect(res.element.matcher == .capture);
+        try testing.expectEqualStrings("name", res.element.matcher.capture.field_name);
+    }
+    {
+        const res = try parseSequenceElement("Config:IDENTIFIER", 0, alloc);
+        try testing.expect(res.element.matcher == .identifier_literal);
+        try testing.expectEqualStrings("Config", res.element.matcher.identifier_literal);
+    }
+    {
+        const res = try parseSequenceElement("identifier", 0, alloc);
+        try testing.expect(res.element.matcher == .identifier);
+    }
+}
+
+test "parseSequenceElement: optional suffix preserved on punctuation routing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const res = try parseSequenceElement("-?", 0, alloc);
+    try testing.expect(res.element.is_optional);
+    try testing.expect(res.element.matcher == .symbol_literal);
+    try testing.expectEqualStrings("-", res.element.matcher.symbol_literal);
+}
+
+// Feature: operator-token-matching, Property 4: Loader routes punctuation characters
+// to the punctuation matcher
+// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
+test "property: loader routes punctuation characters to the punctuation matcher" {
+    const punct = "(){}[],;:.@?+-*/=<>!&|^%~";
+    const idx_gen = gen.intRange(u8, 0, punct.len - 1);
+
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idx: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const c = punct[idx];
+            const s = [1]u8{c};
+            const res = try parseSequenceElement(&s, 0, alloc);
+            try testing.expect(res.element.matcher == .symbol_literal);
+            try testing.expectEqualStrings(&s, res.element.matcher.symbol_literal);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const res = try parseSequenceElement(word, 0, alloc);
+            if (std.mem.eql(u8, word, "identifier")) {
+                try testing.expect(res.element.matcher == .identifier);
+            } else {
+                try testing.expect(res.element.matcher == .keyword_literal);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
 }

@@ -611,7 +611,7 @@ fn bufferCandidate(
             matched_weights += switch (kind) {
                 .keyword => weights.keyword,
                 .identifier => weights.identifier,
-                .delimiter, .symbol => weights.symbol,
+                .delimiter, .symbol, .operator => weights.symbol,
                 else => 0.0,
             };
         }
@@ -4358,4 +4358,254 @@ test "parse: arbitrary non-language type strings are treated opaquely" {
     try testing.expectEqual(@as(usize, 2), result.len);
     try testing.expectEqualStrings("xyzzy", result[0].type_name);
     try testing.expectEqualStrings("42type", result[1].type_name);
+}
+
+// --- Operator Token Matching (spec: operator-token-matching) ---
+
+fn opItem(text: []const u8) TestTokenItem {
+    return .{ .kind = .operator, .text = text };
+}
+
+// Feature: operator-token-matching, Unit: operator-anchored pattern scores identically to
+// the equivalent symbol-anchored pattern
+// **Validates: Requirements 4.1, 4.2, 4.3**
+test "parse: operator-anchored pattern scores identically to symbol-anchored pattern" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A: [kw "fn", id, sym "("]; B: [kw "fn", id, sym "-"]. The first keyword is
+    // relaxed (identifier token) so confidence < 1 and the symbol weight is observable.
+    var seq_a: [3]loader.SequenceElement = undefined;
+    var seq_b: [3]loader.SequenceElement = undefined;
+    seq_a[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
+    seq_a[1] = .{ .matcher = .{ .identifier = {} } };
+    seq_a[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+    seq_b[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
+    seq_b[1] = .{ .matcher = .{ .identifier = {} } };
+    seq_b[2] = .{ .matcher = .{ .symbol_literal = "-" } };
+
+    const patterns_a = &[_]loader.Pattern{.{
+        .type_name = "a",
+        .sequence = &seq_a,
+        .captures = &.{},
+    }};
+    const patterns_b = &[_]loader.Pattern{.{
+        .type_name = "b",
+        .sequence = &seq_b,
+        .captures = &.{},
+    }};
+    const auto_a = try compiler.compile(patterns_a, alloc);
+    const auto_b = try compiler.compile(patterns_b, alloc);
+
+    const items_a = [_]TestTokenItem{ idItem("fn"), idItem("x"), LPAREN_ITEM };
+    const items_b = [_]TestTokenItem{ idItem("fn"), idItem("x"), opItem("-") };
+    const stream_a = try buildStream(alloc, &items_a);
+    const stream_b = try buildStream(alloc, &items_b);
+
+    const res_a = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, .{}, alloc);
+    const res_b = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), res_a.len);
+    try testing.expectEqual(@as(usize, 1), res_b.len);
+    try testing.expectApproxEqRel(res_a[0].confidence, res_b[0].confidence, 0.001);
+
+    // Same equivalence under a [weights] override of the symbol weight.
+    const custom_weights = loader.EvidenceWeights{ .symbol = 0.8 };
+    const res_a_c = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, custom_weights, alloc);
+    const res_b_c = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, custom_weights, alloc);
+    try testing.expectApproxEqRel(res_a_c[0].confidence, res_b_c[0].confidence, 0.001);
+
+    // The opacity weight change actually moved the operator-anchored confidence.
+    try testing.expect(res_b_c[0].confidence > res_b[0].confidence);
+}
+
+// Feature: operator-token-matching, Property 5: Operator matches contribute the symbol weight
+// **Validates: Requirements 4.1, 4.2, 4.3**
+test "property: operator matches contribute the symbol weight" {
+    const override_gen = gen.boolean();
+
+    try minish.check(testing.allocator, override_gen, struct {
+        fn prop(override: bool) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq_a: [3]loader.SequenceElement = undefined;
+            var seq_b: [3]loader.SequenceElement = undefined;
+            seq_a[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
+            seq_a[1] = .{ .matcher = .{ .identifier = {} } };
+            seq_a[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+            seq_b[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
+            seq_b[1] = .{ .matcher = .{ .identifier = {} } };
+            seq_b[2] = .{ .matcher = .{ .symbol_literal = "-" } };
+
+            const patterns_a = &[_]loader.Pattern{.{
+                .type_name = "a",
+                .sequence = &seq_a,
+                .captures = &.{},
+            }};
+            const patterns_b = &[_]loader.Pattern{.{
+                .type_name = "b",
+                .sequence = &seq_b,
+                .captures = &.{},
+            }};
+            const auto_a = try compiler.compile(patterns_a, alloc);
+            const auto_b = try compiler.compile(patterns_b, alloc);
+
+            const weights = if (override) loader.EvidenceWeights{ .symbol = 0.8 } else loader.EvidenceWeights{};
+            const items_a = [_]TestTokenItem{ idItem("fn"), idItem("x"), LPAREN_ITEM };
+            const items_b = [_]TestTokenItem{ idItem("fn"), idItem("x"), opItem("-") };
+            const stream_a = try buildStream(alloc, &items_a);
+            const stream_b = try buildStream(alloc, &items_b);
+
+            const res_a = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, weights, alloc);
+            const res_b = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, weights, alloc);
+            try testing.expectEqual(@as(usize, 1), res_a.len);
+            try testing.expectEqual(@as(usize, 1), res_b.len);
+            try testing.expectApproxEqRel(res_a[0].confidence, res_b[0].confidence, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: operator-token-matching, Unit: Erlang -module attribute anchoring
+// **Validates: Requirements 6.1, 6.2, 6.3**
+test "parse: -module attribute anchors on the leading '-' operator" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [4]loader.SequenceElement = undefined;
+    seq[0] = .{ .matcher = .{ .symbol_literal = "-" } };
+    seq[1] = .{ .matcher = .{ .keyword_literal = "module" } };
+    seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+    seq[3] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 3 } } };
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "module_attr",
+        .sequence = &seq,
+        .captures = &.{.{ .field_name = "name", .position = 3 }},
+    }};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // -module(foo): leading "-" is an operator token → event emitted, captures foo.
+    const items = [_]TestTokenItem{ opItem("-"), kwItem("module"), LPAREN_ITEM, idItem("foo") };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("module_attr", result[0].type_name);
+    try testing.expectEqual(@as(usize, 0), result[0].start);
+    try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+    try testing.expectEqualStrings("foo", result[0].captures[0].value);
+
+    // module(foo): no leading "-" → the attribute pattern must not fire.
+    const items2 = [_]TestTokenItem{ kwItem("module"), LPAREN_ITEM, idItem("foo") };
+    const stream2 = try buildStream(alloc, &items2);
+    const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 0), result2.len);
+}
+
+test "parse: multi-character operator literal compiles but never matches single-token operators" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [2]loader.SequenceElement = undefined;
+    seq[0] = .{ .matcher = .{ .symbol_literal = "->" } };
+    seq[1] = .{ .matcher = .{ .keyword_literal = "module" } };
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "arrow_attr",
+        .sequence = &seq,
+        .captures = &.{},
+    }};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // "->" tokenizes as two single-character operator tokens; the literal cannot match
+    // a single token, so no event is emitted (documented single-token limitation).
+    const items = [_]TestTokenItem{ opItem("-"), opItem(">"), kwItem("module") };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+// Feature: operator-token-matching, Property 7: Erlang attribute anchoring end-to-end
+// **Validates: Requirements 6.1, 6.2, 6.3**
+test "property: erlang attribute anchoring end-to-end" {
+    const name_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, name_gen, struct {
+        fn prop(name: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: [4]loader.SequenceElement = undefined;
+            seq[0] = .{ .matcher = .{ .symbol_literal = "-" } };
+            seq[1] = .{ .matcher = .{ .keyword_literal = "module" } };
+            seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+            seq[3] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 3 } } };
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "module_attr",
+                .sequence = &seq,
+                .captures = &.{.{ .field_name = "name", .position = 3 }},
+            }};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            const items = [_]TestTokenItem{ opItem("-"), kwItem("module"), LPAREN_ITEM, idItem(name) };
+            const stream = try buildStream(alloc, &items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectEqualStrings("module_attr", result[0].type_name);
+            try testing.expectEqualStrings(name, result[0].captures[0].value);
+
+            const items2 = [_]TestTokenItem{ kwItem("module"), LPAREN_ITEM, idItem(name) };
+            const stream2 = try buildStream(alloc, &items2);
+            const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 0), result2.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: operator-token-matching, Property 8: Backward compatibility of existing grammar output
+// **Validates: Requirements 7.1, 7.3, 7.4**
+test "property: backward compatibility of existing grammar output" {
+    const pair_gen = comptime gen.tuple2(
+        []const u8,
+        []const u8,
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, pair_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // A symbol/delimiter-only grammar (pre-feature surface) must emit the same
+            // events as before: one full-match event per occurrence with confidence 1.0.
+            var seq: [3]loader.SequenceElement = undefined;
+            seq[0] = .{ .matcher = .{ .keyword_literal = vals[0] } };
+            seq[1] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } };
+            seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "call",
+                .sequence = &seq,
+                .captures = &.{.{ .field_name = "name", .position = 1 }},
+            }};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            const items = [_]TestTokenItem{
+                kwItem(vals[0]), idItem(vals[1]), LPAREN_ITEM, SEP_ITEM,
+                kwItem(vals[0]), idItem("second"), LPAREN_ITEM,
+            };
+            const stream = try buildStream(alloc, &items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 2), result.len);
+            try testing.expectEqualStrings("call", result[0].type_name);
+            try testing.expectEqualStrings(vals[1], result[0].captures[0].value);
+            try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.001);
+            try testing.expectEqualStrings("call", result[1].type_name);
+            try testing.expectEqualStrings("second", result[1].captures[0].value);
+            try testing.expectApproxEqRel(@as(f32, 1.0), result[1].confidence, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
 }

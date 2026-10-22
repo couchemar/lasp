@@ -10,6 +10,10 @@ function = ["fun"]
 type = "module"
 sequence = ["-module", "(", "$name:IDENTIFIER"]
 
+
+[[patterns]]
+type = "module_attr"
+sequence = ["-", "module", "(", "$name:IDENTIFIER"]
 [[patterns]]
 type = "export"
 sequence = ["-export", "("]
