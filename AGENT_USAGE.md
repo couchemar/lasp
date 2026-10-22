@@ -129,7 +129,7 @@ diff <(.bin/lasp parse a.zig -g examples/grammars/zig.toml --node function --nam
 Output:
 
 ```
-lasp 0.2.0
+lasp 0.3.0
 ```
 
 The version is embedded at build time from `build.zig.zon` (semver). To release a new version: bump `version` in `build.zig.zon` and add a `CHANGELOG.md` entry (Keep a Changelog format). `--version`/`-V` is also accepted among other flags and exits before reading any file.

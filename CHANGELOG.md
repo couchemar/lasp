@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-23
+
 ### Added
 
 - Operator tokens are now matchable in pattern sequences (unified punctuation matching). A quoted punctuation literal matches operator tokens (`+ - * / = < > ! & ^ % ~` and `|`) in addition to symbol and delimiter tokens, keyed on exact text, so sigil constructs can be anchored on their leading operator — e.g. `sequence = ["-", "module", "("]` for Erlang `-module(...)`, or `@`/`&`/`?` for attributes, capture refs, and macros. Single-character only: a multi-character literal like `"->"` compiles but never matches the single-character-operator tokenizer. A `-module` demonstration pattern was added to the example Erlang grammar. (Issue #19)
