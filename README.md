@@ -294,8 +294,8 @@ nodes:
 ### Available Token Primitives
 - **Keywords**: `"fn"`, `"class"`, `"import"`.
 - **Identifiers**: `IDENTIFIER`.
+- **Numbers**: `number` — matches any numeric token; supports `number?`; captures nothing; scores with the symbol weight.
 - **Exact Identifiers**: `"Config:IDENTIFIER"` — matches an identifier token with exact text (no capture).
-- **Punctuation**: `"{"`, `":"`, `","`, `"-"`, `"&"` — a quoted punctuation element matches operator, symbol, or delimiter tokens by exact text (`+ - * / = < > ! & \| ^ % ~ ( ) { } [ ] , ; : . @ ?`). Single-character only: the tokenizer emits one operator token per operator character, so `"->"` compiles but never matches.
 
 ### Identifier Captures
 Captures allow patterns to extract values from tokens. Represented by `$name:IDENTIFIER`.

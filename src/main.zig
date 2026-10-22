@@ -1764,3 +1764,33 @@ test "integration: same-type pattern union emits one primary per construct" {
         try std.testing.expectEqualStrings(exp_value, ev.object.get(cap_key).?.string);
     }
 }
+
+// Feature: number-token-primitive, Integration: the number primitive emits events with
+// confidence 1.0 end-to-end (Requirements 4.1, 6.3).
+test "integration: number primitive emits events end-to-end" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/number_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/number.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+
+    // "42" → num event; "x 7" → decl event (name=x, optional number present).
+    try std.testing.expectEqual(@as(usize, 2), json_events.array.items.len);
+    try std.testing.expectEqualStrings("num", json_events.array.items[0].object.get("type").?.string);
+    try std.testing.expectEqual(@as(f64, 1.0), json_events.array.items[0].object.get("confidence").?.float);
+    try std.testing.expectEqualStrings("decl", json_events.array.items[1].object.get("type").?.string);
+    try std.testing.expectEqual(@as(f64, 1.0), json_events.array.items[1].object.get("confidence").?.float);
+    try std.testing.expectEqualStrings("x", json_events.array.items[1].object.get("name").?.string);
+}

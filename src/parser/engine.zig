@@ -103,6 +103,7 @@ fn patternMaxScore(sequence: []const loader.SequenceElement, weights: loader.Evi
             .keyword_literal => weights.keyword,
             .symbol_literal => weights.symbol,
             .identifier, .capture, .identifier_literal => weights.identifier,
+            .number => weights.symbol,
         };
     }
     return total;
@@ -612,6 +613,7 @@ fn bufferCandidate(
                 .keyword => weights.keyword,
                 .identifier => weights.identifier,
                 .delimiter, .symbol, .operator => weights.symbol,
+                .number => weights.symbol,
                 else => 0.0,
             };
         }
@@ -4606,6 +4608,101 @@ test "property: backward compatibility of existing grammar output" {
             try testing.expectEqualStrings("call", result[1].type_name);
             try testing.expectEqualStrings("second", result[1].captures[0].value);
             try testing.expectApproxEqRel(@as(f32, 1.0), result[1].confidence, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Number Token Primitive (spec: number-token-primitive) ---
+
+fn numItem(text: []const u8) TestTokenItem {
+    return .{ .kind = .number, .text = text };
+}
+
+// Feature: number-token-primitive, Unit: confidence examples
+// **Validates: Requirements 6.3**
+test "parse: lone number pattern scores exactly 1.0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [1]loader.SequenceElement = undefined;
+    seq[0] = .{ .matcher = .{ .number = {} } };
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "num",
+        .sequence = &seq,
+        .captures = &.{},
+    }};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{numItem("42")};
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("num", result[0].type_name);
+    try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.001);
+    try testing.expectEqual(@as(usize, 0), result[0].captures.len);
+}
+
+test "parse: composed capture + optional number pattern scores sensibly" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [2]loader.SequenceElement = undefined;
+    seq[0] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } };
+    seq[1] = .{ .matcher = .{ .number = {} }, .is_optional = true };
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "decl",
+        .sequence = &seq,
+        .captures = &.{.{ .field_name = "name", .position = 0 }},
+    }};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // Short shape (number absent): confidence = identifier/(identifier+symbol) = 0.5.
+    const items_short = [_]TestTokenItem{ idItem("x"), SEP_ITEM };
+    const stream_short = try buildStream(alloc, &items_short);
+    const res_short = try parse(automaton, stream_short.tokens, stream_short.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), res_short.len);
+    try testing.expectApproxEqRel(@as(f32, 0.2 / 0.4), res_short[0].confidence, 0.001);
+
+    // Long shape (number present): full match → 1.0.
+    const items_long = [_]TestTokenItem{ idItem("x"), numItem("7") };
+    const stream_long = try buildStream(alloc, &items_long);
+    const res_long = try parse(automaton, stream_long.tokens, stream_long.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), res_long.len);
+    try testing.expectApproxEqRel(@as(f32, 1.0), res_long[0].confidence, 0.001);
+    try testing.expectEqualStrings("x", res_long[0].captures[0].value);
+}
+
+// Feature: number-token-primitive, Property 5: a lone required number match scores 1.0
+// with the symbol weight
+// **Validates: Requirements 6.1, 6.2, 6.3**
+test "property: a lone required number match scores 1.0 with the symbol weight" {
+    const weight_gen = gen.intRange(u16, 1, 100);
+
+    try minish.check(testing.allocator, weight_gen, struct {
+        fn prop(pct: u16) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const sym_weight: f32 = @as(f32, @floatFromInt(pct)) / 100.0;
+            const weights = loader.EvidenceWeights{ .symbol = sym_weight };
+
+            var seq: [1]loader.SequenceElement = undefined;
+            seq[0] = .{ .matcher = .{ .number = {} } };
+            const patterns = &[_]loader.Pattern{.{
+                .type_name = "num",
+                .sequence = &seq,
+                .captures = &.{},
+            }};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            const items = [_]TestTokenItem{numItem("42")};
+            const stream = try buildStream(alloc, &items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, weights, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.001);
         }
     }.prop, .{ .num_runs = 100 });
 }

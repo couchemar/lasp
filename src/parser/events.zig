@@ -37,6 +37,7 @@ pub fn weightForKind(kind: TokenKind) f32 {
         .keyword => evidence_weights.keyword,
         .identifier => evidence_weights.identifier,
         .delimiter, .symbol => evidence_weights.symbol,
+        .number => evidence_weights.symbol,
         else => 0.0,
     };
 }

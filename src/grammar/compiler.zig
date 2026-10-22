@@ -76,6 +76,7 @@ fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) M
         .identifier => if (kind == .identifier) .full_match else .no_match,
         .capture => if (kind == .identifier) .full_match else .no_match,
         .identifier_literal => |id| if (kind == .identifier and std.mem.eql(u8, text, id)) .full_match else .no_match,
+        .number => if (kind == .number) .full_match else .no_match,
     };
 }
 
@@ -170,6 +171,7 @@ fn matchersEqual(a: TokenMatcher, b: TokenMatcher) bool {
         .identifier => 2,
         .capture => 3,
         .identifier_literal => 4,
+        .number => 5,
     };
     const tag_b: u3 = switch (b) {
         .keyword_literal => 0,
@@ -177,6 +179,7 @@ fn matchersEqual(a: TokenMatcher, b: TokenMatcher) bool {
         .identifier => 2,
         .capture => 3,
         .identifier_literal => 4,
+        .number => 5,
     };
     if (tag_a != tag_b) return false;
 
@@ -186,6 +189,7 @@ fn matchersEqual(a: TokenMatcher, b: TokenMatcher) bool {
         .identifier => true,
         .capture => true, // captures match any identifier, same as identifier
         .identifier_literal => |ia| std.mem.eql(u8, ia, b.identifier_literal),
+        .number => true,
     };
 }
 
@@ -961,6 +965,108 @@ test "property: punctuation matching is single-token and exact" {
             const expected: MatchResult = if (is_punct_kind) .full_match else .no_match;
             try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == expected);
             try testing.expect(matchesTransition(m, kind, "x") == .no_match);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: number-token-primitive, Unit: compiler match and equality
+// **Validates: Requirements 4.1, 4.2, 5.1, 5.2**
+test "matchesTransition: number matcher matches numeric tokens only" {
+    try testing.expect(matchesTransition(.{ .number = {} }, .number, "42") == .full_match);
+    try testing.expect(matchesTransition(.{ .number = {} }, .number, "x") == .full_match); // kind wildcard, text ignored
+    try testing.expect(matchesTransition(.{ .number = {} }, .identifier, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .number = {} }, .keyword, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .number = {} }, .symbol, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .number = {} }, .delimiter, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .number = {} }, .operator, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .number = {} }, .string, "42") == .no_match);
+}
+
+test "matchersEqual: number matchers equal each other, never other variants" {
+    try testing.expect(matchersEqual(.{ .number = {} }, .{ .number = {} }));
+    const variants = [_]TokenMatcher{
+        .{ .keyword_literal = "fn" },
+        .{ .symbol_literal = "(" },
+        .{ .identifier = {} },
+        .{ .capture = .{ .field_name = "n", .position = 0 } },
+        .{ .identifier_literal = "Config" },
+    };
+    for (variants) |v| {
+        try testing.expect(!matchersEqual(v, .{ .number = {} }));
+        try testing.expect(!matchersEqual(.{ .number = {} }, v));
+    }
+}
+
+test "automaton step: number matcher advances one token with no capture" {
+    const auto = Automaton{ .states = &.{
+        .{ .transitions = &.{.{
+            .matcher = .{ .number = {} },
+            .next_state = 1,
+        }}, .events = &.{} },
+        .{ .transitions = &.{}, .events = &.{} },
+    } };
+    const res = auto.step(0, .{ .kind = .number, .start = 0, .end = 2, .line = 1, .col = 0 }, "42");
+    try testing.expect(res != null);
+    try testing.expectEqual(@as(usize, 1), res.?.next);
+    try testing.expect(res.?.capture == null);
+    const no = auto.step(0, .{ .kind = .identifier, .start = 0, .end = 2, .line = 1, .col = 0 }, "42");
+    try testing.expect(no == null);
+}
+
+// Feature: number-token-primitive, Property 3: the number matcher matches numeric tokens
+// only, by kind, without capture
+// **Validates: Requirements 4.1, 4.2, 4.3, 4.4**
+test "property: number matcher matches numeric tokens only, by kind, without capture" {
+    const kinds = [_]TokenKind{ .identifier, .keyword, .symbol, .string, .number, .operator, .newline, .indent, .comment, .delimiter };
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        []const u8,
+        gen.intRange(u8, 0, kinds.len - 1),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alphanumeric }),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, []const u8 }) !void {
+            const kind = kinds[vals[0]];
+            const m: TokenMatcher = .{ .number = {} };
+            const expected: MatchResult = if (kind == .number) .full_match else .no_match;
+            try testing.expect(matchesTransition(m, kind, vals[1]) == expected);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: number-token-primitive, Property 4: number-matcher equality
+// **Validates: Requirements 5.1, 5.2**
+test "property: number-matcher equality" {
+    const samples = [_]TokenMatcher{
+        .{ .keyword_literal = "fn" },
+        .{ .symbol_literal = "(" },
+        .{ .identifier = {} },
+        .{ .capture = .{ .field_name = "n", .position = 0 } },
+        .{ .identifier_literal = "Config" },
+        .{ .number = {} },
+    };
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        u8,
+        gen.intRange(u8, 0, samples.len - 1),
+        gen.intRange(u8, 0, samples.len - 1),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8 }) !void {
+            const a = samples[vals[0]];
+            const b = samples[vals[1]];
+            const expected = vals[0] == vals[1];
+            try testing.expectEqual(expected, matchersEqual(a, b));
+            const a_is_number = a == .number;
+            const b_is_number = b == .number;
+            if (a_is_number != b_is_number) {
+                try testing.expect(!matchersEqual(a, b));
+            }
+            if (a_is_number and b_is_number) {
+                try testing.expect(matchersEqual(a, b));
+            }
         }
     }.prop, .{ .num_runs = 100 });
 }

@@ -1,0 +1,7 @@
+[[patterns]]
+type = "num"
+sequence = ["number"]
+
+[[patterns]]
+type = "decl"
+sequence = ["$name:IDENTIFIER", "number?"]

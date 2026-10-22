@@ -60,6 +60,7 @@ pub const TokenMatcher = union(enum) {
     identifier: void,
     capture: Capture,
     identifier_literal: []const u8,
+    number: void,
 };
 
 pub const Capture = struct {
@@ -159,6 +160,10 @@ fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.All
     // Identifier wildcard
     if (std.mem.eql(u8, s, "identifier")) {
         return .{ .element = .{ .matcher = .{ .identifier = {} }, .is_optional = optional }, .capture = null };
+    }
+    // Number wildcard
+    if (std.mem.eql(u8, s, "number")) {
+        return .{ .element = .{ .matcher = .{ .number = {} }, .is_optional = optional }, .capture = null };
     }
     // EXACT IDENTIFIER matching (Config:IDENTIFIER)
     if (std.mem.endsWith(u8, s, ":IDENTIFIER") and s.len > 11 and s[0] != '$') {
@@ -467,6 +472,7 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                     try w.writeAll(id);
                     try w.writeAll(":IDENTIFIER");
                 },
+                .number => try w.writeAll("number"),
             }
             if (elem.is_optional) try w.writeAll("?");
             try w.writeAll("\"");
@@ -1868,6 +1874,7 @@ test "property: optional element parsing round-trip" {
                 .identifier => 2,
                 .capture => 3,
                 .identifier_literal => 4,
+                .number => 5,
             };
             const parsed_tag: u3 = switch (parsed_elem.matcher) {
                 .keyword_literal => 0,
@@ -1875,6 +1882,7 @@ test "property: optional element parsing round-trip" {
                 .identifier => 2,
                 .capture => 3,
                 .identifier_literal => 4,
+                .number => 5,
             };
             try testing.expectEqual(orig_tag, parsed_tag);
         }
@@ -3004,6 +3012,194 @@ test "property: loader routes punctuation characters to the punctuation matcher"
             } else {
                 try testing.expect(res.element.matcher == .keyword_literal);
             }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: number-token-primitive, Unit: loader parse and format
+// **Validates: Requirements 1.1, 2.1, 2.2, 7.1, 7.2, 8.3**
+test "parseSequenceElement: number parses to non-capturing number matcher" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        const res = try parseSequenceElement("number", 0, alloc);
+        try testing.expect(res.element.matcher == .number);
+        try testing.expect(!res.element.is_optional);
+        try testing.expect(res.capture == null);
+    }
+    {
+        const res = try parseSequenceElement("number?", 0, alloc);
+        try testing.expect(res.element.matcher == .number);
+        try testing.expect(res.element.is_optional);
+        try testing.expect(res.capture == null);
+    }
+}
+
+test "parseSequenceElement: near-miss number strings fall through to keyword literal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const near_misses = [_][]const u8{ "numbers", "number2", "Number" };
+    for (near_misses) |nm| {
+        const res = try parseSequenceElement(nm, 0, alloc);
+        try testing.expect(res.element.matcher == .keyword_literal);
+        try testing.expectEqualStrings(nm, res.element.matcher.keyword_literal);
+    }
+}
+
+test "formatGrammar: number emits number / number?" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\[[patterns]]
+        \\type = "num"
+        \\sequence = ["number", "number?"]
+    ;
+    const grammar = try parseGrammar(source, alloc);
+    const formatted = try formatGrammar(grammar, alloc);
+    try testing.expect(std.mem.indexOf(u8, formatted, "\"number\", \"number?\"") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "\"number?\"") != null);
+}
+
+// Feature: number-token-primitive, Property 1: `number` and `number?` parse to a
+// non-capturing number matcher
+// **Validates: Requirements 1.1, 1.2, 1.3, 2.1, 2.2**
+test "property: number and number? parse to a non-capturing number matcher" {
+    const opt_gen = gen.boolean();
+
+    try minish.check(testing.allocator, opt_gen, struct {
+        fn prop(optional: bool) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const elem_text = if (optional) "number?" else "number";
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"num\"\nsequence = [\"{s}\"]\n", .{elem_text});
+            const grammar = try parseGrammar(source, alloc);
+            const elem = grammar.patterns[0].sequence[0];
+            try testing.expect(elem.matcher == .number);
+            try testing.expectEqual(optional, elem.is_optional);
+            try testing.expectEqual(@as(usize, 0), grammar.patterns[0].captures.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: number-token-primitive, Property 2: existing primitives are unaffected by the
+// number branch
+// **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 8.1**
+test "property: existing primitives are unaffected by the number branch" {
+    const punct = "(){}[],;:.@?+-*/=<>!&|^%~";
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        []const u8,
+        gen.intRange(u8, 0, 4),
+        gen.string(.{ .min_len = 2, .max_len = 8, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const form: []const u8 = switch (vals[0]) {
+                0 => "identifier",
+                1 => "Config:IDENTIFIER",
+                2 => "$name:IDENTIFIER",
+                3 => &[1]u8{punct[vals[0]]},
+                else => vals[1],
+            };
+            if (std.mem.eql(u8, form, "number")) return;
+
+            const res = try parseSequenceElement(form, 0, alloc);
+            switch (vals[0]) {
+                0 => try testing.expect(res.element.matcher == .identifier),
+                1 => {
+                    try testing.expect(res.element.matcher == .identifier_literal);
+                    try testing.expectEqualStrings("Config", res.element.matcher.identifier_literal);
+                },
+                2 => {
+                    try testing.expect(res.element.matcher == .capture);
+                    try testing.expectEqualStrings("name", res.element.matcher.capture.field_name);
+                },
+                3 => {
+                    try testing.expect(res.element.matcher == .symbol_literal);
+                    try testing.expectEqualStrings(&[1]u8{punct[vals[0]]}, res.element.matcher.symbol_literal);
+                },
+                else => try testing.expect(res.element.matcher == .keyword_literal),
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: number-token-primitive, Property 6: round-trip through grammar formatting
+// **Validates: Requirements 7.1, 7.2, 7.3**
+test "property: round-trip through grammar formatting" {
+    const opt_gen = gen.boolean();
+
+    try minish.check(testing.allocator, opt_gen, struct {
+        fn prop(optional: bool) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const seq = if (optional)
+                "[\"fn\", \"number?\", \"$name:IDENTIFIER\", \"(\", \"number\"]"
+            else
+                "[\"fn\", \"number\", \"$name:IDENTIFIER\", \"(\"]";
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = {s}\n", .{seq});
+            const grammar = try parseGrammar(source, alloc);
+            const formatted = try formatGrammar(grammar, alloc);
+            const re = try parseGrammar(formatted, alloc);
+
+            try testing.expectEqual(@as(usize, 1), re.patterns.len);
+            try testing.expectEqual(grammar.patterns[0].sequence.len, re.patterns[0].sequence.len);
+            for (grammar.patterns[0].sequence, re.patterns[0].sequence) |a, b| {
+                try testing.expectEqual(a.is_optional, b.is_optional);
+                try testing.expectEqual(@as(u8, matcherTag(a.matcher)), @as(u8, matcherTag(b.matcher)));
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+fn matcherTag(m: TokenMatcher) u3 {
+    return switch (m) {
+        .keyword_literal => 0,
+        .symbol_literal => 1,
+        .identifier => 2,
+        .capture => 3,
+        .identifier_literal => 4,
+        .number => 5,
+    };
+}
+
+// Feature: number-token-primitive, Property 7: grammars without number are byte-for-byte
+// stable (the new branch is never taken)
+// **Validates: Requirements 8.1, 8.2**
+test "property: grammars without number are stable through formatting" {
+    const word_gen = gen.string(.{ .min_len = 2, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            if (std.mem.eql(u8, word, "number") or std.mem.eql(u8, word, "identifier")) return;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"{s}\", \"$name:IDENTIFIER\", \"(\"]\n", .{word});
+            const grammar = try parseGrammar(source, alloc);
+            const formatted = try formatGrammar(grammar, alloc);
+            // The number branch must never contribute: no bare "number" primitive in output.
+            try testing.expect(std.mem.indexOf(u8, formatted, "\"number\"") == null);
+            try testing.expect(std.mem.indexOf(u8, formatted, "\"number?\"") == null);
+            // Re-parse is stable.
+            const re = try parseGrammar(formatted, alloc);
+            try testing.expectEqual(grammar.patterns[0].sequence.len, re.patterns[0].sequence.len);
         }
     }.prop, .{ .num_runs = 100 });
 }
