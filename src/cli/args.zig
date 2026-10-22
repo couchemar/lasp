@@ -773,3 +773,102 @@ test "parseSubcommand maps subcommands correctly" {
     try testing.expect(parseSubcommand("foo") == null);
     try testing.expect(parseSubcommand("") == null);
 }
+
+// --- Help Text Content Assertion Tests ---
+
+test "general_help_text contains all command names" {
+    const help = general_help_text;
+    try testing.expect(std.mem.indexOf(u8, help, "parse") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "parse-dir") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "query") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "version") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "help") != null);
+}
+
+test "general_help_text contains all flag spellings" {
+    const help = general_help_text;
+    // -g/--grammar flags
+    try testing.expect(std.mem.indexOf(u8, help, "-g") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--grammar") != null);
+    // --grammar-dir flag
+    try testing.expect(std.mem.indexOf(u8, help, "--grammar-dir") != null);
+    // -n/--node flags
+    try testing.expect(std.mem.indexOf(u8, help, "-n") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--node") != null);
+    // --names-only flag
+    try testing.expect(std.mem.indexOf(u8, help, "--names-only") != null);
+    // -V/--version flags
+    try testing.expect(std.mem.indexOf(u8, help, "-V") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--version") != null);
+    // -h/--help flags
+    try testing.expect(std.mem.indexOf(u8, help, "-h") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--help") != null);
+}
+
+test "general_help_text contains stdin '-' note" {
+    const help = general_help_text;
+    try testing.expect(std.mem.indexOf(u8, help, "Stdin:") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "'-'") != null);
+}
+
+test "general_help_text contains all grammar section tokens" {
+    const help = general_help_text;
+    try testing.expect(std.mem.indexOf(u8, help, "[language]") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "[keywords]") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "[[patterns]]") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "[blocks]") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "[weights]") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "[comments]") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "[[patterns.constraints]]") != null);
+}
+
+test "query_help_text mentions selector argument and -g flag" {
+    const help = query_help_text;
+    try testing.expect(std.mem.indexOf(u8, help, "<selector>") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "-g") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--grammar") != null);
+}
+
+test "parse_help_text mentions -n/--node and --names-only flags" {
+    const help = parse_help_text;
+    try testing.expect(std.mem.indexOf(u8, help, "-n") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--node") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--names-only") != null);
+}
+
+test "parse_dir_help_text mentions --grammar-dir flag" {
+    const help = parse_dir_help_text;
+    try testing.expect(std.mem.indexOf(u8, help, "--grammar-dir") != null);
+}
+
+test "helpText function returns correct texts for various inputs" {
+    // null returns general help text
+    try testing.expect(std.mem.eql(u8, helpText(null), general_help_text));
+
+    // .parse returns parse_help_text
+    try testing.expect(std.mem.eql(u8, helpText(.parse), parse_help_text));
+
+    // .parse_dir returns parse_dir_help_text
+    try testing.expect(std.mem.eql(u8, helpText(.parse_dir), parse_dir_help_text));
+
+    // .query returns query_help_text
+    try testing.expect(std.mem.eql(u8, helpText(.query), query_help_text));
+
+    // .version returns general_help_text (else clause)
+    try testing.expect(std.mem.eql(u8, helpText(.version), general_help_text));
+
+    // .help returns general_help_text (else clause)
+    try testing.expect(std.mem.eql(u8, helpText(.help), general_help_text));
+}
+
+test "helpText function edge cases" {
+    // Verify that all Command enum values are handled
+    const commands = std.enums.values(Command);
+    for (commands) |cmd| {
+        _ = helpText(cmd); // Should not crash
+    }
+
+    // Verify null returns general help (already tested above)
+    const null_help = helpText(null);
+    try testing.expect(std.mem.eql(u8, null_help, general_help_text));
+}
