@@ -17,6 +17,7 @@ pub const ParsedArgs = struct {
     names_only: bool = false,
     query_selector: ?[]const u8 = null,
     help_topic: ?Command = null,
+    alternatives: bool = false,
 };
 
 pub const CliError = error{
@@ -27,6 +28,7 @@ pub const CliError = error{
     MissingDirectoryPath,
     MissingFlagValue,
     MissingSelectorString,
+    AlternativesOnQuery,
 };
 
 pub const general_help_text =
@@ -127,6 +129,7 @@ pub fn formatCliError(err: CliError) []const u8 {
         error.MissingDirectoryPath => "error: parse-dir command requires a directory path",
         error.MissingFlagValue => "error: flag requires a value",
         error.MissingSelectorString => "error: query command requires a selector string",
+        error.AlternativesOnQuery => "error: --alternatives is supported on the parse command only",
     };
 }
 
@@ -181,6 +184,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     var grammar_dir: ?[]const u8 = null;
     var node_filter: ?[]const u8 = null;
     var names_only: bool = false;
+    var alternatives: bool = false;
 
     var i: usize = 2;
     while (i < args.len) {
@@ -200,6 +204,8 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
             node_filter = args[i];
         } else if (std.mem.eql(u8, arg, "--names-only")) {
             names_only = true;
+        } else if (std.mem.eql(u8, arg, "--alternatives")) {
+            alternatives = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
@@ -216,6 +222,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
         .grammar_dir = grammar_dir,
         .node_filter = node_filter,
         .names_only = names_only,
+        .alternatives = alternatives,
     };
 }
 
@@ -246,6 +253,8 @@ fn parseQueryArgs(args: []const []const u8) CliError!ParsedArgs {
             grammar_path = args[i];
         } else if (std.mem.eql(u8, arg, "--names-only")) {
             names_only = true;
+        } else if (std.mem.eql(u8, arg, "--alternatives")) {
+            return error.AlternativesOnQuery;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
@@ -1087,4 +1096,34 @@ test "--union style flags are unrecognized" {
     try testing.expectError(error.UnrecognizedFlag, parseArgs(parse_args));
     const query_args = &[_][]const u8{ "query", "function", "file.zig", "-g", "grammar.toml", "--union" };
     try testing.expectError(error.UnrecognizedFlag, parseArgs(query_args));
+}
+
+// Feature: competing-candidate-emission, Unit: flag parsing
+// **Validates: Requirements 1.1, 1.5, 6.2, 8.2**
+test "--alternatives sets flag on parse" {
+    const args = &[_][]const u8{ "parse", "file.zig", "--alternatives" };
+    const result = try parseArgs(args);
+    try testing.expect(result.alternatives);
+}
+
+test "--alternatives=value is unrecognized" {
+    const args = &[_][]const u8{ "parse", "file.zig", "--alternatives=5" };
+    try testing.expectError(error.UnrecognizedFlag, parseArgs(args));
+}
+
+test "--alternatives on query is rejected" {
+    const args = &[_][]const u8{ "query", "function", "file.zig", "-g", "g.toml", "--alternatives" };
+    try testing.expectError(error.AlternativesOnQuery, parseArgs(args));
+}
+
+test "--alternatives composes with other flags" {
+    const args = &[_][]const u8{ "parse", "file.zig", "-g", "g.toml", "--node", "function", "--names-only", "--alternatives" };
+    const result = try parseArgs(args);
+    try testing.expect(result.alternatives);
+    try testing.expect(result.names_only);
+    try testing.expectEqualStrings("function", result.node_filter.?);
+}
+
+test "formatCliError: AlternativesOnQuery message" {
+    try testing.expectEqualStrings("error: --alternatives is supported on the parse command only", formatCliError(error.AlternativesOnQuery));
 }

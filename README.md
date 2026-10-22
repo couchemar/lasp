@@ -385,6 +385,9 @@ Confidence scores allow agents operating autonomously over massive unknown depen
 - **Context evaluation**: Framework-aware scoring (e.g., `router.get("/users")` → endpoint detection)
 - **Frequency-based thresholds**: Repeated similar structures build dynamic confidence over a repository
 
+### Alternatives output (`--alternatives`)
+Opt-in parse-only flag: every winning event carries an `alternatives` JSON array listing the losing competitors from the same overlapping region (each with only `type`, `confidence`, and captures). Flag off ⇒ byte-identical output with no `alternatives` key. Rejected on `query`; ignored by `--names-only`. Designed as the probabilistic front-end for an LLM disambiguator (`request deeper analysis where confidence < 0.8`).
+
 ---
 
 ## 📉 Output Format & Example Workflow

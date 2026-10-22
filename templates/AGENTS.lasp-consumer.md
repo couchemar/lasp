@@ -96,8 +96,9 @@ lasp parse <file> --grammar .lasp/grammars/<lang>.toml   # long form
 ```bash
 lasp parse <file> -g .lasp/grammars/<lang>.toml --node function   # only events of one type (case-insensitive)
 lasp parse <file> -g .lasp/grammars/<lang>.toml --names-only      # first capture value per event, one per line
+lasp parse <file> -g .lasp/grammars/<lang>.toml --alternatives    # each event gains an "alternatives" array of losing competitors (parse only)
 ```
-`--node` and `--names-only` compose, and both are silently ignored when no grammar is given (raw tokens are emitted instead).
+`--node` and `--names-only` compose, and both are silently ignored when no grammar is given (raw tokens are emitted instead). `--alternatives` is parse-only (rejected on `query`), off by default, and ignored by `--names-only`; when set, each event carries an `alternatives` array listing the same-region candidates that lost the tiebreak, each with only `type`, `confidence`, and captures.
 
 ### Structural query (CSS-selector-inspired)
 ```bash

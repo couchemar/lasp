@@ -5,6 +5,19 @@ const TokenKind = tokenizer.TokenKind;
 
 // --- Data Types ---
 
+pub const CaptureEntry = struct {
+    field_name: []const u8,
+    value: []const u8,
+};
+
+/// A non-winning candidate from the same Candidate_Set as a winning event.
+/// Carries only type, confidence, and captures — no position fields.
+pub const Alternative = struct {
+    type_name: []const u8,
+    confidence: f32,
+    captures: []const CaptureEntry,
+};
+
 pub const StructuralEvent = struct {
     type_name: []const u8,
     captures: []const CaptureEntry,
@@ -15,12 +28,9 @@ pub const StructuralEvent = struct {
     confidence: f32,
     block_start: ?usize = null,
     block_end: ?usize = null,
+    alternatives: []const Alternative = &.{},
 };
 
-pub const CaptureEntry = struct {
-    field_name: []const u8,
-    value: []const u8,
-};
 
 /// Evidence weights for confidence scoring.
 pub const evidence_weights = struct {
@@ -61,4 +71,33 @@ pub fn computeConfidence(
     const capped_penalty = @min(@as(f32, @floatFromInt(noise_count)) * noise_penalty_per_token, max_noise_penalty);
     const raw = @max(@as(f32, 0.0), matched_weights - capped_penalty);
     return @min(raw / pattern_max_score, 1.0);
+}
+
+const testing = std.testing;
+// Feature: competing-candidate-emission, Unit: Alternative type and default
+// **Validates: Requirements 3.1, 5.1**
+test "StructuralEvent: alternatives defaults to empty" {
+    const ev = StructuralEvent{
+        .type_name = "t",
+        .captures = &.{},
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+    };
+    try testing.expectEqual(@as(usize, 0), ev.alternatives.len);
+}
+
+test "Alternative: constructs and reads back" {
+    const alt = Alternative{
+        .type_name = "call",
+        .confidence = 0.4,
+        .captures = &.{.{ .field_name = "callee", .value = "foo" }},
+    };
+    try testing.expectEqualStrings("call", alt.type_name);
+    try testing.expectApproxEqRel(@as(f32, 0.4), alt.confidence, 0.001);
+    try testing.expectEqual(@as(usize, 1), alt.captures.len);
+    try testing.expectEqualStrings("callee", alt.captures[0].field_name);
+    try testing.expectEqualStrings("foo", alt.captures[0].value);
 }

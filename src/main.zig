@@ -128,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
             };
             const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
             const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
-            const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
+            const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, false, allocator);
 
             // Parse selector string into QueryFilter
             const selector = parsed.query_selector orelse {
@@ -197,7 +197,7 @@ pub fn main(init: std.process.Init) !void {
                 };
                 const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
                 const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
-                var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
+                var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, parsed.alternatives, allocator);
 
                 // Apply node filter if specified
                 if (parsed.node_filter) |filter| {
@@ -220,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                 } else {
-                    try json.serializeEvents(structural_events, stdout);
+                    try json.serializeEventsWithAlternatives(structural_events, parsed.alternatives, stdout);
                 }
             } else {
                 // No grammar: raw token output
@@ -1837,4 +1837,69 @@ test "integration: invalid prior value rejected with descriptive message" {
         }
         try std.testing.expect(std.mem.containsAtLeast(u8, result.stderr, 1, "prior must be greater than 0.0 and at most 2.0"));
     }
+}
+
+// Feature: competing-candidate-emission, Integration
+// **Validates: Requirements 2.1, 7.1, 8.2, 9.2**
+test "integration: --alternatives emits alternatives array; off emits none" {
+    const allocator = std.testing.allocator;
+    const src = "tests/fixtures/union_sample.txt";
+    const grammar = "tests/fixtures/grammars/union.toml";
+
+    {
+        const result = try runLasp(allocator, &.{ "parse", src, "-g", grammar, "--alternatives" });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+        defer parsed.deinit();
+        const events_arr = parsed.value.object.get("events").?.array.items;
+        var saw_key = false;
+        for (events_arr) |ev| {
+            if (ev.object.get("alternatives") != null) saw_key = true;
+        }
+        try std.testing.expect(saw_key);
+    }
+
+    {
+        const result = try runLasp(allocator, &.{ "parse", src, "-g", grammar });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "alternatives") == null);
+    }
+
+    {
+        const result = try runLasp(allocator, &.{ "query", "decl", src, "-g", grammar, "--alternatives" });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        switch (result.term) {
+            .exited => |code| try std.testing.expect(code != 0),
+            else => {},
+        }
+        try std.testing.expect(std.mem.containsAtLeast(u8, result.stderr, 1, "--alternatives is supported on the parse command only"));
+    }
+}
+
+test "integration: --alternatives leaves names-only output unchanged" {
+    const allocator = std.testing.allocator;
+    const src = "tests/fixtures/union_sample.txt";
+    const grammar = "tests/fixtures/grammars/union.toml";
+
+    const plain = try runLasp(allocator, &.{ "parse", src, "-g", grammar, "--names-only" });
+    defer {
+        allocator.free(plain.stdout);
+        allocator.free(plain.stderr);
+    }
+    const with_flag = try runLasp(allocator, &.{ "parse", src, "-g", grammar, "--names-only", "--alternatives" });
+    defer {
+        allocator.free(with_flag.stdout);
+        allocator.free(with_flag.stderr);
+    }
+    try std.testing.expectEqualStrings(plain.stdout, with_flag.stdout);
 }

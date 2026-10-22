@@ -66,7 +66,20 @@ Emit only structural events matching a specific type name:
 
 The comparison is case-insensitive. When the filter matches zero events, the output is a valid JSON object with an empty events array. When no grammar is specified, `--node` is silently ignored and raw token JSON is emitted.
 
-### Names-only output (`--names-only`)
+### Alternatives output (`--alternatives`)
+
+Opt-in, parse-only boolean flag: every winning event gains an `alternatives` JSON array listing the losing competitors from the same overlapping region, each with only `type`, `confidence`, and its captures (no position fields). The winner keeps all its fields. When the flag is absent, output is byte-for-byte identical and no `alternatives` key appears. The flag is rejected on `query` and ignored by `--names-only`.
+
+```bash
+.bin/lasp parse file.zig -g examples/grammars/zig.toml --alternatives
+```
+
+```json
+{ "type": "function", "start": 0, "end": 10, "confidence": 0.90, "name": "foo",
+  "alternatives": [ { "type": "call", "confidence": 0.60, "callee": "foo" } ] }
+```
+
+Use it to inspect the full distribution of interpretations for a region — the probabilistic front-end for an LLM disambiguator.
 
 Emit just the first capture value per event, one per line — plain text, no JSON:
 

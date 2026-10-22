@@ -232,6 +232,58 @@ fn spanScan(
     };
 }
 
+/// Strict ordering matching Tiebreak_Order: higher confidence first, then longer
+/// match_length, then lower pattern_index. `true` means a ranks ahead of b.
+fn candidateLessThan(_: void, a: CandidateEvent, b: CandidateEvent) bool {
+    if (a.event.confidence != b.event.confidence)
+        return a.event.confidence > b.event.confidence;
+    if (a.match_length != b.match_length)
+        return a.match_length > b.match_length;
+    return a.pattern_index < b.pattern_index;
+}
+
+/// Flushes buffered candidates into result. Selects the winner by Tiebreak_Order.
+/// When collect_alternatives is true, attaches the other candidates (ordered by
+/// Tiebreak_Order) to the winner as alternatives before appending.
+/// Clears the candidates list. No-op when the list is empty.
+fn flushCandidates(
+    result: *std.ArrayList(StructuralEvent),
+    candidates: *std.ArrayList(CandidateEvent),
+    collect_alternatives: bool,
+    allocator: std.mem.Allocator,
+) !void {
+    if (candidates.items.len == 0) return;
+
+    if (!collect_alternatives) {
+        // Exact current behavior: argmax winner, no allocation.
+        if (selectBestCandidate(candidates.items)) |winner| {
+            try result.append(allocator, winner.event);
+        }
+        candidates.clearRetainingCapacity();
+        return;
+    }
+
+    // Collecting: sort a copy by Tiebreak_Order so [0] is the winner and
+    // [1..] are the alternatives in ranked order.
+    const ordered = try allocator.alloc(CandidateEvent, candidates.items.len);
+    @memcpy(ordered, candidates.items);
+    std.mem.sort(CandidateEvent, ordered, {}, candidateLessThan);
+
+    var winner = ordered[0].event;
+    const alts = try allocator.alloc(events_mod.Alternative, ordered.len - 1);
+    for (ordered[1..], 0..) |cand, idx| {
+        alts[idx] = .{
+            .type_name = cand.event.type_name,
+            .confidence = cand.event.confidence,
+            .captures = cand.event.captures,
+        };
+    }
+    winner.alternatives = alts;
+
+    try result.append(allocator, winner);
+    candidates.clearRetainingCapacity();
+}
+
 pub fn parse(
     automaton: Automaton,
     tokens: []const Token,
@@ -239,6 +291,7 @@ pub fn parse(
     patterns: []const loader.Pattern,
     blocks: loader.BlockConfig,
     weights: loader.EvidenceWeights,
+    collect_alternatives: bool,
     allocator: std.mem.Allocator,
 ) ![]StructuralEvent {
     var result: std.ArrayList(StructuralEvent) = .empty;
@@ -310,10 +363,7 @@ pub fn parse(
             if (state == 0) {
                 // Starting a new match — flush any buffered candidates from previous region
                 if (candidates.items.len > 0) {
-                    if (selectBestCandidate(candidates.items)) |winner| {
-                        try result.append(allocator, winner.event);
-                    }
-                    candidates.clearRetainingCapacity();
+                    try flushCandidates(&result, &candidates, collect_alternatives, allocator);
                 }
                 pattern_start = token.start;
                 pattern_col = token.col;
@@ -367,10 +417,7 @@ pub fn parse(
                 if (!any_buffered) {
                     // Constraint check failed — flush any existing candidates and reset
                     if (candidates.items.len > 0) {
-                        if (selectBestCandidate(candidates.items)) |winner| {
-                            try result.append(allocator, winner.event);
-                        }
-                        candidates.clearRetainingCapacity();
+                        try flushCandidates(&result, &candidates, collect_alternatives, allocator);
                     }
                     state = 0;
                     noise_count = 0;
@@ -448,10 +495,7 @@ pub fn parse(
             if (!skipped) {
                 // Automaton truly resets — flush any buffered candidates
                 if (candidates.items.len > 0) {
-                    if (selectBestCandidate(candidates.items)) |winner| {
-                        try result.append(allocator, winner.event);
-                    }
-                    candidates.clearRetainingCapacity();
+                    try flushCandidates(&result, &candidates, collect_alternatives, allocator);
                 }
                 state = 0;
                 noise_count = 0;
@@ -549,10 +593,7 @@ pub fn parse(
                     if (!any_buffered) {
                         // Constraint or minimum evidence check failed — flush and reset
                         if (candidates.items.len > 0) {
-                            if (selectBestCandidate(candidates.items)) |winner| {
-                                try result.append(allocator, winner.event);
-                            }
-                            candidates.clearRetainingCapacity();
+                            try flushCandidates(&result, &candidates, collect_alternatives, allocator);
                         }
                         state = 0;
                         noise_count = 0;
@@ -574,10 +615,7 @@ pub fn parse(
 
     // Flush any remaining candidates at end of token stream
     if (candidates.items.len > 0) {
-        if (selectBestCandidate(candidates.items)) |winner| {
-            try result.append(allocator, winner.event);
-        }
-        candidates.clearRetainingCapacity();
+        try flushCandidates(&result, &candidates, collect_alternatives, allocator);
     }
 
     return result.toOwnedSlice(allocator);
@@ -843,7 +881,7 @@ test "parse: single pattern match emits event" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
     try testing.expectEqual(@as(usize, 0), result[0].start);
@@ -875,7 +913,7 @@ test "parse: identifier_literal matching pattern emits event" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("test_literal", result[0].type_name);
     try testing.expectEqual(@as(usize, 0), result[0].start);
@@ -901,7 +939,7 @@ test "parse: no matching pattern emits nothing" {
         .{ .kind = .identifier, .start = 4, .end = 5, .line = 1, .col = 4 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
@@ -926,7 +964,7 @@ test "parse: skip tokens between structural tokens" {
         .{ .kind = .identifier, .start = 5, .end = 8, .line = 2, .col = 2 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
 }
@@ -955,7 +993,7 @@ test "parse: confidence computation for known tokens" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // All tokens matched their expected kinds, so confidence = 1.0
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
@@ -981,7 +1019,7 @@ test "parse: multiple pattern matches" {
         .{ .kind = .delimiter, .start = 8, .end = 9, .line = 1, .col = 8 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 2), result.len);
     try testing.expectEqualStrings("call", result[0].type_name);
     try testing.expectEqualStrings("call", result[1].type_name);
@@ -1146,7 +1184,7 @@ test "parse: position = start at col 0 emits event" {
         .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(usize, 0), result[0].col);
 }
@@ -1170,7 +1208,7 @@ test "parse: position = start at col > 0 discards event" {
         .{ .kind = .identifier, .start = 5, .end = 8, .line = 1, .col = 5 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
@@ -1194,7 +1232,7 @@ test "parse: block delimiters set block_start on events" {
         .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(?usize, 0), result[0].block_start);
 }
@@ -1217,7 +1255,7 @@ test "parse: no blocks section means block_start is null" {
         .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(?usize, null), result[0].block_start);
 }
@@ -1242,7 +1280,7 @@ test "parse: unmatched close delimiter does not crash" {
     };
 
     // Should not crash even with unmatched close delimiter
-    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqual(@as(?usize, null), result[0].block_start);
 }
@@ -1281,7 +1319,7 @@ test "property: engine pattern match correctness" {
                 .{ .kind = .identifier, .start = 3, .end = 3 + ident.len, .line = 1, .col = 3 },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings("function", result[0].type_name);
             try testing.expectEqual(@as(usize, 1), result[0].captures.len);
@@ -1318,7 +1356,7 @@ test "property: engine skip token transparency" {
             }
             try tokens.append(alloc, .{ .kind = .identifier, .start = 3, .end = 6, .line = 2, .col = 0 });
 
-            const result = try parse(automaton, tokens.items, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens.items, source, patterns, .{}, .{}, false, alloc);
             // Should always match regardless of skip tokens
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings("function", result[0].type_name);
@@ -1350,7 +1388,7 @@ test "property: event field invariants" {
                 .{ .kind = .delimiter, .start = ident.len, .end = ident.len + 1, .line = 1, .col = ident.len },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
             for (result) |event| {
                 try testing.expect(event.start <= event.end);
                 try testing.expect(event.end <= source.len);
@@ -1411,7 +1449,7 @@ test "property: position constraint enforcement" {
                 .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = col + 3 },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
             if (col == 0) {
                 try testing.expectEqual(@as(usize, 1), result.len);
             } else {
@@ -1484,7 +1522,7 @@ test "property: block stack annotates events correctly" {
                     .{ .kind = .identifier, .start = 2, .end = 5, .line = 1, .col = 2 },
                     .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
                 };
-                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
+                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, false, alloc);
                 try testing.expectEqual(@as(usize, 1), result.len);
                 try testing.expectEqual(@as(?usize, 0), result[0].block_start);
             } else {
@@ -1494,7 +1532,7 @@ test "property: block stack annotates events correctly" {
                     .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 },
                     .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
                 };
-                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, alloc);
+                const result = try parse(automaton, tokens, source, patterns, .{ .open = "{", .close = "}" }, .{}, false, alloc);
                 try testing.expectEqual(@as(usize, 1), result.len);
                 try testing.expectEqual(@as(?usize, null), result[0].block_start);
             }
@@ -1521,7 +1559,7 @@ test "e2e: Erlang grammar still detects real function definitions" {
     // Erlang source: a real function definition at column 0
     const source = "handle_call(Request, From, State) ->\n    {reply, ok, State}.";
     const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, alloc);
-    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, alloc);
+    const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, false, alloc);
 
     // "handle_call" SHOULD be detected as a function definition
     var found_function = false;
@@ -1596,8 +1634,8 @@ test "property: relaxed match produces lower confidence than full match" {
             pos += 1;
             const source = buf[0..pos];
 
-            const full_result = try parse(automaton, full_tokens.items, source, patterns, .{}, .{}, alloc);
-            const relaxed_result = try parse(automaton, relaxed_tokens.items, source, patterns, .{}, .{}, alloc);
+            const full_result = try parse(automaton, full_tokens.items, source, patterns, .{}, .{}, false, alloc);
+            const relaxed_result = try parse(automaton, relaxed_tokens.items, source, patterns, .{}, .{}, false, alloc);
 
             try testing.expectEqual(@as(usize, 1), full_result.len);
             try testing.expectEqual(@as(usize, 1), relaxed_result.len);
@@ -1645,7 +1683,7 @@ test "property: backward compatibility full keyword match produces confidence 1.
             }
             const source = buf[0..offset];
 
-            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
         }
@@ -1707,7 +1745,7 @@ test "property: perfect match produces confidence 1.0" {
             }};
 
             const automaton = try compiler.compile(patterns, alloc);
-            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens_list.items, source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
         }
@@ -1741,7 +1779,7 @@ test "parse: keyword as identifier token produces confidence < 1.0 (relaxed matc
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // relaxed_keyword(0.1) + identifier(0.2) + symbol(0.2) = 0.5 / 0.9 ≈ 0.556
     try testing.expect(result[0].confidence < 1.0);
@@ -1772,7 +1810,7 @@ test "parse: full keyword match produces confidence = 1.0" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
 }
@@ -1802,7 +1840,7 @@ test "parse: mixed relaxed and full matches in same pattern" {
         .{ .kind = .identifier, .start = 7, .end = 10, .line = 1, .col = 7 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // full(0.5) + relaxed(0.1) + identifier(0.2) = 0.8 / (0.5+0.5+0.2) = 0.8/1.2 ≈ 0.667
     try testing.expect(result[0].confidence < 1.0);
@@ -1854,7 +1892,7 @@ test "property: optional elements affect confidence monotonically" {
                 try full_tokens.append(alloc, .{ .kind = .delimiter, .start = 7, .end = 8, .line = 1, .col = 7 });
             }
 
-            const full_result = try parse(automaton, full_tokens.items, full_source, patterns, .{}, .{}, alloc);
+            const full_result = try parse(automaton, full_tokens.items, full_source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), full_result.len);
 
             // All-present confidence should be 1.0
@@ -1869,7 +1907,7 @@ test "property: optional elements affect confidence monotonically" {
                 .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
             };
 
-            const partial_result = try parse(automaton, partial_tokens, partial_source, patterns, .{}, .{}, alloc);
+            const partial_result = try parse(automaton, partial_tokens, partial_source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), partial_result.len);
 
             // Partial confidence should be < 1.0
@@ -1907,7 +1945,7 @@ test "parse: optional element present produces confidence = 1.0" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
 }
@@ -1937,7 +1975,7 @@ test "parse: optional element absent produces confidence < 1.0 but event still e
         .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // Confidence should be < 1.0 because optional element is absent
     // matched: keyword(0.5) + identifier(0.2) = 0.7
@@ -1971,7 +2009,7 @@ test "parse: all-optional pattern with none matching emits no event (Minimum_Evi
         .{ .kind = .identifier, .start = 4, .end = 5, .line = 1, .col = 4 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     // No event should be emitted — Minimum_Evidence rule: at least one required element must match
     try testing.expectEqual(@as(usize, 0), result.len);
 }
@@ -2006,7 +2044,7 @@ test "parse: mix of required and optional, optional absent produces confidence <
         .{ .kind = .symbol, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     // matched: keyword(0.5) + identifier(0.2) = 0.7
     // max: keyword(0.5) + identifier(0.2) + symbol(0.2) + symbol(0.2) = 1.1
@@ -2173,7 +2211,7 @@ test "parse: single pattern emitted normally with buffered emission (no regressi
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
     try testing.expectEqualStrings("add", result[0].captures[0].value);
@@ -2218,7 +2256,7 @@ test "parse: competing patterns with shared prefix, longer match wins" {
         .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     // Should emit only one event — the longer/higher-confidence match
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("fn_call", result[0].type_name);
@@ -2260,7 +2298,7 @@ test "parse: competing patterns, shorter match emitted when longer doesn't compl
         .{ .kind = .symbol, .start = 7, .end = 8, .line = 1, .col = 7 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     // ";" doesn't match "(" so the longer pattern fails.
     // The shorter pattern (fn_decl) should be emitted from the buffer.
     try testing.expectEqual(@as(usize, 1), result.len);
@@ -2302,7 +2340,7 @@ test "parse: competing patterns, end of stream flushes buffered candidate" {
         .{ .kind = .identifier, .start = 3, .end = 6, .line = 1, .col = 3 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     // End of stream should flush the buffered fn_decl candidate
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("fn_decl", result[0].type_name);
@@ -2528,7 +2566,7 @@ test "property: custom weights flow through to confidence" {
 
             // Run with default weights
             const default_weights = loader.EvidenceWeights{};
-            const default_result = try parse(automaton, tokens, source, patterns, .{}, default_weights, alloc);
+            const default_result = try parse(automaton, tokens, source, patterns, .{}, default_weights, false, alloc);
 
             // Run with custom weights (only keyword changed)
             const custom_weights = loader.EvidenceWeights{
@@ -2538,7 +2576,7 @@ test "property: custom weights flow through to confidence" {
                 .block = 0.3,
                 .relaxed_keyword = 0.1,
             };
-            const custom_result = try parse(automaton, tokens, source, patterns, .{}, custom_weights, alloc);
+            const custom_result = try parse(automaton, tokens, source, patterns, .{}, custom_weights, false, alloc);
 
             // Both should produce exactly 1 event (full match → confidence = 1.0 in both cases
             // since matched_weights == max_score for full matches)
@@ -2554,8 +2592,8 @@ test "property: custom weights flow through to confidence" {
                 .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
             };
 
-            const default_relaxed = try parse(automaton, relaxed_tokens, source, patterns, .{}, default_weights, alloc);
-            const custom_relaxed = try parse(automaton, relaxed_tokens, source, patterns, .{}, custom_weights, alloc);
+            const default_relaxed = try parse(automaton, relaxed_tokens, source, patterns, .{}, default_weights, false, alloc);
+            const custom_relaxed = try parse(automaton, relaxed_tokens, source, patterns, .{}, custom_weights, false, alloc);
 
             try testing.expectEqual(@as(usize, 1), default_relaxed.len);
             try testing.expectEqual(@as(usize, 1), custom_relaxed.len);
@@ -2600,7 +2638,7 @@ test "parse: custom weights produce different confidence than defaults for same 
     // Default weights: keyword=0.5, identifier=0.2, symbol=0.2, relaxed_keyword=0.1
     // Relaxed match: matched = 0.1 + 0.2 + 0.2 = 0.5, max = 0.5 + 0.2 + 0.2 = 0.9
     // confidence = 0.5 / 0.9 ≈ 0.556
-    const default_result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const default_result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), default_result.len);
 
     // Custom weights: keyword=0.8 (higher), rest same
@@ -2613,7 +2651,7 @@ test "parse: custom weights produce different confidence than defaults for same 
         .block = 0.3,
         .relaxed_keyword = 0.1,
     };
-    const custom_result = try parse(automaton, tokens, source, patterns, .{}, custom_weights, alloc);
+    const custom_result = try parse(automaton, tokens, source, patterns, .{}, custom_weights, false, alloc);
     try testing.expectEqual(@as(usize, 1), custom_result.len);
 
     // Confidence should differ
@@ -3307,7 +3345,7 @@ test "parse: combined position + constraints evaluation order" {
             .{ .kind = .identifier, .start = 2, .end = 8, .line = 1, .col = 2 },
             .{ .kind = .delimiter, .start = 8, .end = 9, .line = 1, .col = 8 },
         };
-        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
         try testing.expectEqual(@as(usize, 0), result.len); // rejected by position
     }
 
@@ -3319,7 +3357,7 @@ test "parse: combined position + constraints evaluation order" {
             .{ .kind = .identifier, .start = 0, .end = 5, .line = 1, .col = 0 },
             .{ .kind = .delimiter, .start = 5, .end = 6, .line = 1, .col = 5 },
         };
-        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
         try testing.expectEqual(@as(usize, 0), result.len); // rejected by constraint
     }
 
@@ -3331,7 +3369,7 @@ test "parse: combined position + constraints evaluation order" {
             .{ .kind = .identifier, .start = 0, .end = 6, .line = 1, .col = 0 },
             .{ .kind = .delimiter, .start = 6, .end = 7, .line = 1, .col = 6 },
         };
-        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+        const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
         try testing.expectEqual(@as(usize, 1), result.len); // both checks pass
         try testing.expectEqualStrings("function", result[0].type_name);
     }
@@ -3399,7 +3437,7 @@ test "property: identical-sequence patterns coexist and route correctly" {
                 .{ .kind = .delimiter, .start = call_start + call_name.len, .end = call_start + call_name.len + 1, .line = 2, .col = indent_val + call_name.len },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
 
             // Expected behavior (Property 1):
             // Both patterns coexist and route correctly:
@@ -3476,7 +3514,7 @@ test "preservation: non-colliding grammars event stream is preserved" {
                 .{ .kind = .delimiter, .start = fn_len + 8 + name.len, .end = fn_len + 9 + name.len, .line = 2, .col = 7 + name.len },
             };
 
-            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
 
             try testing.expectEqual(@as(usize, 2), result.len);
             try testing.expectEqualStrings("function", result[0].type_name);
@@ -3522,7 +3560,7 @@ test "preservation: single function pattern grammar event stream" {
         .{ .kind = .delimiter, .start = 10, .end = 11, .line = 1, .col = 10 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("function", result[0].type_name);
     try testing.expectEqual(@as(usize, 1), result[0].captures.len);
@@ -3587,7 +3625,7 @@ test "parse: function vs call colliding grammar emits function for col 0 and cal
         .{ .kind = .delimiter, .start = 28, .end = 29, .line = 4, .col = 8 },
     };
 
-    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 4), result.len);
 
     try testing.expectEqualStrings("function", result[0].type_name);
@@ -3655,7 +3693,7 @@ test "parse: --node function on colliding grammar filters to only function heads
         .{ .kind = .delimiter, .start = 28, .end = 29, .line = 3, .col = 8 },
     };
 
-    const all_events = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    const all_events = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 3), all_events.len);
 
     // Filter by node type "function"
@@ -3799,7 +3837,7 @@ test "property: union membership emits the shared type" {
             try items.append(alloc, idItem("vc"));
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 3), result.len);
 
             const Expected = struct { field: []const u8, value: []const u8 };
@@ -3864,7 +3902,7 @@ test "property: disjoint same-type alternatives emit, carrying the matched alter
             try items.append(alloc, idItem(inp.cap_b));
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 2), result.len);
 
             try testing.expectEqualStrings(inp.shared_type, result[0].type_name);
@@ -3920,7 +3958,7 @@ test "property: prefix longest-wins" {
             try items.append(alloc, LPAREN_ITEM);
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             // Longer form B matches: exactly one primary spanning B (through "("), never a
             // separate shorter primary ending at A's span.
             try testing.expectEqual(@as(usize, 1), result.len);
@@ -3974,7 +4012,7 @@ test "property: prefix short-only emits the shorter" {
             try items.append(alloc, SEP_ITEM);
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             // Only the shorter form matches: exactly one primary covering A's span.
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings(type_short, result[0].type_name);
@@ -4020,7 +4058,7 @@ test "property: non-overlapping matches are independent" {
             }
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, inp.count), result.len);
             for (result, 0..) |ev, i| {
                 try testing.expectEqual(stream.tokens[3 * i].start, ev.start);
@@ -4077,8 +4115,8 @@ test "property: optional-tail and union forms yield equivalent primaries" {
 
             for (shapes) |shape| {
                 const stream = try buildStream(alloc, shape.items[0..]);
-                const union_result = try parse(union_automaton, stream.tokens, stream.source, union_patterns, .{}, .{}, alloc);
-                const opt_result = try parse(opt_automaton, stream.tokens, stream.source, opt_patterns, .{}, .{}, alloc);
+                const union_result = try parse(union_automaton, stream.tokens, stream.source, union_patterns, .{}, .{}, false, alloc);
+                const opt_result = try parse(opt_automaton, stream.tokens, stream.source, opt_patterns, .{}, .{}, false, alloc);
 
                 try testing.expectEqual(@as(usize, 1), union_result.len);
                 try testing.expectEqual(@as(usize, 1), opt_result.len);
@@ -4148,7 +4186,7 @@ test "property: different-type overlap collapses to one tiebreak-selected primar
             }
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
 
             // Expected winner by Tiebreak_Order (confidence → length → grammar order):
@@ -4208,7 +4246,7 @@ test "property: backward compatibility for non-overlapping, non-prefix grammars"
             try items.append(alloc, idItem(inp.cap_b));
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 2), result.len);
             try testing.expectEqualStrings("type_a", result[0].type_name);
             try testing.expectEqualStrings("name", result[0].captures[0].field_name);
@@ -4257,7 +4295,7 @@ test "property: single-pattern grammar emits identically to pre-feature" {
             try items.append(alloc, idItem(inp.value));
             const stream = try buildStream(alloc, items.items);
 
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 2), result.len);
             for (result) |ev| {
                 try testing.expectEqualStrings("single", ev.type_name);
@@ -4297,7 +4335,7 @@ test "property: identical-sequence union coexists via the shadowing fix" {
 
             const items = [_]TestTokenItem{idItem(value)};
             const stream = try buildStream(alloc, &items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             // One event of the shared type; tiebreak picks grammar order (index 0 → field "a").
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings("same", result[0].type_name);
@@ -4327,7 +4365,7 @@ test "parse: prefix pair emits the long form once on long input" {
 
     const items = [_]TestTokenItem{ kwItem("fn"), idItem("add"), LPAREN_ITEM };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("decl", result[0].type_name);
     try testing.expectEqual(@as(usize, 0), result[0].start);
@@ -4352,7 +4390,7 @@ test "parse: prefix pair emits the short form on short input" {
 
     const items = [_]TestTokenItem{ kwItem("fn"), idItem("add"), SEP_ITEM };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("decl", result[0].type_name);
     try testing.expectEqual(@as(usize, 0), result[0].start);
@@ -4377,7 +4415,7 @@ test "parse: same-type union with disjoint first tokens emits the shared type fo
 
     const items = [_]TestTokenItem{ kwItem("def"), idItem("x"), SEP_ITEM, kwItem("class"), idItem("y") };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 2), result.len);
     try testing.expectEqualStrings("thing", result[0].type_name);
     try testing.expectEqualStrings("x", result[0].captures[0].value);
@@ -4416,13 +4454,13 @@ test "parse: constraint-rejected terminal candidate does not produce a premature
     // region aborts: neither a shorter primary nor B is emitted for this start.
     const items = [_]TestTokenItem{ kwItem("fn"), idItem("bad"), LPAREN_ITEM };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 
     // Input "fn good (" — B matches fully and wins as the longer alternative.
     const items2 = [_]TestTokenItem{ kwItem("fn"), idItem("good"), LPAREN_ITEM };
     const stream2 = try buildStream(alloc, &items2);
-    const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, alloc);
+    const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result2.len);
     try testing.expectEqualStrings("decl", result2[0].type_name);
     try testing.expectEqualStrings("good", result2[0].captures[0].value);
@@ -4445,7 +4483,7 @@ test "parse: arbitrary non-language type strings are treated opaquely" {
 
     const items = [_]TestTokenItem{ kwItem("alpha"), idItem("a"), SEP_ITEM, kwItem("beta"), idItem("b") };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 2), result.len);
     try testing.expectEqualStrings("xyzzy", result[0].type_name);
     try testing.expectEqualStrings("42type", result[1].type_name);
@@ -4494,16 +4532,16 @@ test "parse: operator-anchored pattern scores identically to symbol-anchored pat
     const stream_a = try buildStream(alloc, &items_a);
     const stream_b = try buildStream(alloc, &items_b);
 
-    const res_a = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, .{}, alloc);
-    const res_b = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, .{}, alloc);
+    const res_a = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, .{}, false, alloc);
+    const res_b = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), res_a.len);
     try testing.expectEqual(@as(usize, 1), res_b.len);
     try testing.expectApproxEqRel(res_a[0].confidence, res_b[0].confidence, 0.001);
 
     // Same equivalence under a [weights] override of the symbol weight.
     const custom_weights = loader.EvidenceWeights{ .symbol = 0.8 };
-    const res_a_c = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, custom_weights, alloc);
-    const res_b_c = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, custom_weights, alloc);
+    const res_a_c = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, custom_weights, false, alloc);
+    const res_b_c = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, custom_weights, false, alloc);
     try testing.expectApproxEqRel(res_a_c[0].confidence, res_b_c[0].confidence, 0.001);
 
     // The opacity weight change actually moved the operator-anchored confidence.
@@ -4549,8 +4587,8 @@ test "property: operator matches contribute the symbol weight" {
             const stream_a = try buildStream(alloc, &items_a);
             const stream_b = try buildStream(alloc, &items_b);
 
-            const res_a = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, weights, alloc);
-            const res_b = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, weights, alloc);
+            const res_a = try parse(auto_a, stream_a.tokens, stream_a.source, patterns_a, .{}, weights, false, alloc);
+            const res_b = try parse(auto_b, stream_b.tokens, stream_b.source, patterns_b, .{}, weights, false, alloc);
             try testing.expectEqual(@as(usize, 1), res_a.len);
             try testing.expectEqual(@as(usize, 1), res_b.len);
             try testing.expectApproxEqRel(res_a[0].confidence, res_b[0].confidence, 0.001);
@@ -4580,7 +4618,7 @@ test "parse: -module attribute anchors on the leading '-' operator" {
     // -module(foo): leading "-" is an operator token → event emitted, captures foo.
     const items = [_]TestTokenItem{ opItem("-"), kwItem("module"), LPAREN_ITEM, idItem("foo") };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("module_attr", result[0].type_name);
     try testing.expectEqual(@as(usize, 0), result[0].start);
@@ -4590,7 +4628,7 @@ test "parse: -module attribute anchors on the leading '-' operator" {
     // module(foo): no leading "-" → the attribute pattern must not fire.
     const items2 = [_]TestTokenItem{ kwItem("module"), LPAREN_ITEM, idItem("foo") };
     const stream2 = try buildStream(alloc, &items2);
-    const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, alloc);
+    const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 0), result2.len);
 }
 
@@ -4613,7 +4651,7 @@ test "parse: multi-character operator literal compiles but never matches single-
     // a single token, so no event is emitted (documented single-token limitation).
     const items = [_]TestTokenItem{ opItem("-"), opItem(">"), kwItem("module") };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
@@ -4642,14 +4680,14 @@ test "property: erlang attribute anchoring end-to-end" {
 
             const items = [_]TestTokenItem{ opItem("-"), kwItem("module"), LPAREN_ITEM, idItem(name) };
             const stream = try buildStream(alloc, &items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings("module_attr", result[0].type_name);
             try testing.expectEqualStrings(name, result[0].captures[0].value);
 
             const items2 = [_]TestTokenItem{ kwItem("module"), LPAREN_ITEM, idItem(name) };
             const stream2 = try buildStream(alloc, &items2);
-            const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, alloc);
+            const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 0), result2.len);
         }
     }.prop, .{ .num_runs = 100 });
@@ -4689,7 +4727,7 @@ test "property: backward compatibility of existing grammar output" {
                 kwItem(vals[0]), idItem("second"), LPAREN_ITEM,
             };
             const stream = try buildStream(alloc, &items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 2), result.len);
             try testing.expectEqualStrings("call", result[0].type_name);
             try testing.expectEqualStrings(vals[1], result[0].captures[0].value);
@@ -4725,7 +4763,7 @@ test "parse: lone number pattern scores exactly 1.0" {
 
     const items = [_]TestTokenItem{numItem("42")};
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("num", result[0].type_name);
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.001);
@@ -4750,14 +4788,14 @@ test "parse: composed capture + optional number pattern scores sensibly" {
     // Short shape (number absent): confidence = identifier/(identifier+symbol) = 0.5.
     const items_short = [_]TestTokenItem{ idItem("x"), SEP_ITEM };
     const stream_short = try buildStream(alloc, &items_short);
-    const res_short = try parse(automaton, stream_short.tokens, stream_short.source, patterns, .{}, .{}, alloc);
+    const res_short = try parse(automaton, stream_short.tokens, stream_short.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), res_short.len);
     try testing.expectApproxEqRel(@as(f32, 0.2 / 0.4), res_short[0].confidence, 0.001);
 
     // Long shape (number present): full match → 1.0.
     const items_long = [_]TestTokenItem{ idItem("x"), numItem("7") };
     const stream_long = try buildStream(alloc, &items_long);
-    const res_long = try parse(automaton, stream_long.tokens, stream_long.source, patterns, .{}, .{}, alloc);
+    const res_long = try parse(automaton, stream_long.tokens, stream_long.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), res_long.len);
     try testing.expectApproxEqRel(@as(f32, 1.0), res_long[0].confidence, 0.001);
     try testing.expectEqualStrings("x", res_long[0].captures[0].value);
@@ -4789,7 +4827,7 @@ test "property: a lone required number match scores 1.0 with the symbol weight" 
 
             const items = [_]TestTokenItem{numItem("42")};
             const stream = try buildStream(alloc, &items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, weights, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, weights, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.001);
         }
@@ -4820,7 +4858,7 @@ test "parse: parameterized capture spans dotted path and trailing sigil" {
     {
         const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." }, idItem("B"), .{ .kind = .symbol, .text = "." }, idItem("C") };
         const stream = try buildStream(alloc, &items);
-        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
         try testing.expectEqual(@as(usize, 1), result.len);
         try testing.expectEqualStrings("A.B.C", result[0].captures[0].value);
         try testing.expectEqual(stream.tokens[4].end, result[0].end);
@@ -4828,7 +4866,7 @@ test "parse: parameterized capture spans dotted path and trailing sigil" {
     {
         const items = [_]TestTokenItem{ idItem("foo"), opItem("!") };
         const stream = try buildStream(alloc, &items);
-        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
         try testing.expectEqual(@as(usize, 1), result.len);
         try testing.expectEqualStrings("foo!", result[0].captures[0].value);
     }
@@ -4849,7 +4887,7 @@ test "parse: parameterized capture stops at non-continuation" {
     {
         const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." } };
         const stream = try buildStream(alloc, &items);
-        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
         try testing.expectEqual(@as(usize, 1), result.len);
         try testing.expectEqualStrings("A", result[0].captures[0].value);
     }
@@ -4862,7 +4900,7 @@ test "parse: parameterized capture stops at non-continuation" {
             .{ .kind = .symbol, .start = 1, .end = 2, .line = 1, .col = 1 },
             .{ .kind = .identifier, .start = 3, .end = 4, .line = 1, .col = 3 },
         };
-        const result = try parse(automaton, tokens[0..], src, patterns, .{}, .{}, alloc);
+        const result = try parse(automaton, tokens[0..], src, patterns, .{}, .{}, false, alloc);
         // The gap prevents spanning: "A" is captured alone; the later "B" is its own match.
         try testing.expectEqual(@as(usize, 2), result.len);
         try testing.expectEqualStrings("A", result[0].captures[0].value);
@@ -4887,7 +4925,7 @@ test "parse: later element matches the first token after the span" {
 
     const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." }, idItem("B"), kwItem("fn") };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("decl", result[0].type_name);
     try testing.expectEqualStrings("A.B", result[0].captures[0].value);
@@ -4916,7 +4954,7 @@ test "parse: depth-0 constraint evaluates against the full span value" {
 
     const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." }, idItem("B") };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 0), result.len); // full-span value "A.B" rejected
 }
 
@@ -4957,7 +4995,7 @@ test "property: greedy separator span captures the exact source span" {
                 try expected.appendSlice(alloc, name);
             }
             const stream = try buildStream(alloc, items.items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualSlices(u8, expected.items, result[0].captures[0].value);
             try testing.expectEqual(stream.tokens[stream.tokens.len - 1].end, result[0].end);
@@ -5001,7 +5039,7 @@ test "property: multi-character separator is tokenizer-split-agnostic" {
                 try expected.appendSlice(alloc, name);
             }
             const stream = try buildStream(alloc, items.items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualSlices(u8, expected.items, result[0].captures[0].value);
         }
@@ -5045,7 +5083,7 @@ test "property: suffix absorption takes exactly one adjacent set member" {
             const count: usize = switch (inp.mode) { 0 => 1, 1 => 2, 2 => 2, else => 3 };
             const items = src_items[0..count];
             const stream = try buildStream(alloc, items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectEqualStrings(expected_value, result[0].captures[0].value);
         }
@@ -5085,11 +5123,11 @@ test "property: confidence is contributed once regardless of span length" {
                 try items_span.append(alloc, idItem("x"));
             }
             const stream_span = try buildStream(alloc, items_span.items);
-            const res_span = try parse(auto_span, stream_span.tokens, stream_span.source, patterns_span, .{}, .{}, alloc);
+            const res_span = try parse(auto_span, stream_span.tokens, stream_span.source, patterns_span, .{}, .{}, false, alloc);
 
             const items_bare = [_]TestTokenItem{idItem("x")};
             const stream_bare = try buildStream(alloc, &items_bare);
-            const res_bare = try parse(auto_bare, stream_bare.tokens, stream_bare.source, patterns_bare, .{}, .{}, alloc);
+            const res_bare = try parse(auto_bare, stream_bare.tokens, stream_bare.source, patterns_bare, .{}, .{}, false, alloc);
 
             try testing.expectEqual(@as(usize, 1), res_span.len);
             try testing.expectEqual(@as(usize, 1), res_bare.len);
@@ -5122,7 +5160,7 @@ test "property: single-token backward compatibility is byte-identical" {
             // A bare capture captures exactly one token even when separator-like bytes follow.
             const items = [_]TestTokenItem{ idItem(inp.value), .{ .kind = .symbol, .text = "." }, idItem("B") };
             const stream = try buildStream(alloc, &items);
-            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
             // Two identifier matches: first is the bare capture of inp.value; second is "B".
             try testing.expectEqual(@as(usize, 2), result.len);
             try testing.expectEqualStrings(inp.value, result[0].captures[0].value);
@@ -5197,8 +5235,8 @@ test "parse: prior 1.0 yields confidence identical to no prior" {
     // Relaxed keyword (identifier token for "fn") so confidence < 1 and observable.
     const items = [_]TestTokenItem{ idItem("fn"), idItem("x") };
     const stream = try buildStream(alloc, &items);
-    const res_prior = try parse(auto_prior, stream.tokens, stream.source, patterns_prior, .{}, .{}, alloc);
-    const res_bare = try parse(auto_bare, stream.tokens, stream.source, patterns_bare, .{}, .{}, alloc);
+    const res_prior = try parse(auto_prior, stream.tokens, stream.source, patterns_prior, .{}, .{}, false, alloc);
+    const res_bare = try parse(auto_bare, stream.tokens, stream.source, patterns_bare, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), res_prior.len);
     try testing.expectEqual(@as(usize, 1), res_bare.len);
     try testing.expectApproxEqRel(res_bare[0].confidence, res_prior[0].confidence, 0.001);
@@ -5215,14 +5253,14 @@ test "parse: demoting prior drops match below 0.3" {
 
     const items = [_]TestTokenItem{ idItem("fn"), idItem("x") };
     const stream = try buildStream(alloc, &items);
-    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
     // Evidence ≈ 0.5 × 0.4 = 0.2 < 0.3 → dropped.
     try testing.expectEqual(@as(usize, 0), result.len);
 
     // Milder prior keeps it visible at reduced confidence.
     const patterns_mild = &[_]loader.Pattern{priorPattern(&seq, 0.8)};
     const auto_mild = try compiler.compile(patterns_mild, alloc);
-    const result_mild = try parse(auto_mild, stream.tokens, stream.source, patterns_mild, .{}, .{}, alloc);
+    const result_mild = try parse(auto_mild, stream.tokens, stream.source, patterns_mild, .{}, .{}, false, alloc);
     try testing.expectEqual(@as(usize, 1), result_mild.len);
     try testing.expect(result_mild[0].confidence < 1.0);
     try testing.expect(result_mild[0].confidence >= 0.3);
@@ -5258,8 +5296,8 @@ test "property: default prior is a no-op" {
 
             const items = [_]TestTokenItem{ idItem("fn"), idItem(word) };
             const stream = try buildStream(alloc, &items);
-            const res_a = try parse(auto_a, stream.tokens, stream.source, patterns_implicit, .{}, .{}, alloc);
-            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_explicit, .{}, .{}, alloc);
+            const res_a = try parse(auto_a, stream.tokens, stream.source, patterns_implicit, .{}, .{}, false, alloc);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_explicit, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), res_a.len);
             try testing.expectEqual(@as(usize, 1), res_b.len);
             try testing.expectApproxEqRel(res_a[0].confidence, res_b[0].confidence, 0.001);
@@ -5294,8 +5332,8 @@ test "property: monotonic demotion" {
 
             const items = [_]TestTokenItem{ idItem("fn"), idItem(vals[1]) };
             const stream = try buildStream(alloc, &items);
-            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, alloc);
-            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, alloc);
+            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, false, alloc);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), res_b.len);
             if (res_p.len == 1) {
                 const evidence = res_b[0].confidence;
@@ -5335,8 +5373,8 @@ test "property: bounded boost" {
 
             const items = [_]TestTokenItem{ idItem("fn"), idItem(vals[1]) };
             const stream = try buildStream(alloc, &items);
-            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, alloc);
-            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, alloc);
+            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, false, alloc);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), res_p.len);
             try testing.expectEqual(@as(usize, 1), res_b.len);
             try testing.expect(res_p[0].confidence >= res_b[0].confidence);
@@ -5372,8 +5410,8 @@ test "property: threshold interaction" {
 
             const items = [_]TestTokenItem{ idItem("fn"), idItem(vals[1]) };
             const stream = try buildStream(alloc, &items);
-            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, alloc);
-            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, alloc);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, false, alloc);
+            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, false, alloc);
             try testing.expectEqual(@as(usize, 1), res_b.len);
             const evidence = res_b[0].confidence;
             const final: f32 = std.math.clamp(evidence * prior, 0.0, 1.0);
@@ -5382,6 +5420,163 @@ test "property: threshold interaction" {
             } else {
                 try testing.expectEqual(@as(usize, 1), res_p.len);
                 try testing.expectApproxEqRel(final, res_p[0].confidence, 0.001);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Competing Candidate Emission (spec: competing-candidate-emission) ---
+
+fn makeCandidate(type_name: []const u8, confidence: f32, length: usize, index: usize) CandidateEvent {
+    return .{
+        .event = .{
+            .type_name = type_name,
+            .captures = &.{},
+            .start = 0,
+            .end = length,
+            .line = 1,
+            .col = 0,
+            .confidence = confidence,
+        },
+        .match_length = length,
+        .pattern_index = index,
+    };
+}
+
+test "flushCandidates: not collecting emits winner with no alternatives" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var result: std.ArrayList(StructuralEvent) = .empty;
+    var candidates: std.ArrayList(CandidateEvent) = .empty;
+    try candidates.append(alloc, makeCandidate("a", 0.6, 2, 0));
+    try candidates.append(alloc, makeCandidate("b", 0.9, 3, 1));
+    try flushCandidates(&result, &candidates, false, alloc);
+    try testing.expectEqual(@as(usize, 1), result.items.len);
+    try testing.expectEqualStrings("b", result.items[0].type_name);
+    try testing.expectEqual(@as(usize, 0), result.items[0].alternatives.len);
+}
+
+test "flushCandidates: collecting emits winner with ranked alternatives" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var result: std.ArrayList(StructuralEvent) = .empty;
+    var candidates: std.ArrayList(CandidateEvent) = .empty;
+    try candidates.append(alloc, makeCandidate("a", 0.6, 2, 0));
+    try candidates.append(alloc, makeCandidate("b", 0.9, 3, 1));
+    try candidates.append(alloc, makeCandidate("c", 0.9, 2, 2));
+    try flushCandidates(&result, &candidates, true, alloc);
+    try testing.expectEqual(@as(usize, 1), result.items.len);
+    try testing.expectEqualStrings("b", result.items[0].type_name);
+    try testing.expectEqual(@as(usize, 2), result.items[0].alternatives.len);
+    try testing.expectEqualStrings("c", result.items[0].alternatives[0].type_name);
+    try testing.expectEqualStrings("a", result.items[0].alternatives[1].type_name);
+}
+
+// Feature: competing-candidate-emission, Property 2: Winner unchanged by the flag
+// **Validates: Requirements 2.4, 9.3**
+test "property: winner unchanged by the flag" {
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        u8,
+        u8,
+        gen.intRange(u8, 0, 100),
+        gen.intRange(u8, 1, 10),
+        gen.intRange(u8, 0, 10),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var candidates: std.ArrayList(CandidateEvent) = .empty;
+            try candidates.append(alloc, makeCandidate("x", @as(f32, @floatFromInt(vals[0])) / 100.0, vals[1], vals[2]));
+            try candidates.append(alloc, makeCandidate("y", 0.5, 2, 3));
+            try candidates.append(alloc, makeCandidate("z", 0.8, 4, 5));
+
+            const expected = selectBestCandidate(candidates.items).?;
+            var result: std.ArrayList(StructuralEvent) = .empty;
+            try flushCandidates(&result, &candidates, true, alloc);
+            try testing.expectEqual(@as(usize, 1), result.items.len);
+            try testing.expectEqualStrings(expected.event.type_name, result.items[0].type_name);
+            try testing.expectApproxEqRel(expected.event.confidence, result.items[0].confidence, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: competing-candidate-emission, Property 3: Alternatives completeness
+// **Validates: Requirements 3.1, 3.4, 3.5**
+test "property: alternatives completeness" {
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        u8,
+        u8,
+        gen.intRange(u8, 0, 100),
+        gen.intRange(u8, 1, 10),
+        gen.intRange(u8, 0, 10),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var candidates: std.ArrayList(CandidateEvent) = .empty;
+            try candidates.append(alloc, makeCandidate("n", 0.4, 1, 0));
+            try candidates.append(alloc, makeCandidate("a", @as(f32, @floatFromInt(vals[0])) / 100.0, vals[1], vals[2]));
+            try candidates.append(alloc, makeCandidate("z", 0.8, 4, 5));
+
+            var result: std.ArrayList(StructuralEvent) = .empty;
+            try flushCandidates(&result, &candidates, true, alloc);
+            try testing.expectEqual(@as(usize, 1), result.items.len);
+            const ev = &result.items[0];
+            try testing.expectEqual(@as(usize, 2), ev.alternatives.len);
+            for (ev.alternatives) |alt| {
+                try testing.expect(!std.mem.eql(u8, alt.type_name, ev.type_name));
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: competing-candidate-emission, Property 4: Alternatives ordering
+// **Validates: Requirements 4.1, 4.2**
+test "property: alternatives ordering" {
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        u8,
+        u8,
+        gen.intRange(u8, 0, 100),
+        gen.intRange(u8, 1, 10),
+        gen.intRange(u8, 0, 10),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var candidates: std.ArrayList(CandidateEvent) = .empty;
+            try candidates.append(alloc, makeCandidate("n", 0.4, 1, 0));
+            try candidates.append(alloc, makeCandidate("a", @as(f32, @floatFromInt(vals[0])) / 100.0, vals[1], vals[2]));
+            try candidates.append(alloc, makeCandidate("z", 0.8, 4, 5));
+
+            var result: std.ArrayList(StructuralEvent) = .empty;
+            try flushCandidates(&result, &candidates, true, alloc);
+            const ev = result.items[0];
+            // Winner ranks ahead of every alternative.
+            for (ev.alternatives) |alt| {
+                try testing.expect(alt.confidence <= ev.confidence);
+            }
+            // Alternatives non-increasing in confidence.
+            for (ev.alternatives[1..], 0..) |alt, i| {
+                try testing.expect(alt.confidence <= ev.alternatives[i].confidence);
             }
         }
     }.prop, .{ .num_runs = 100 });

@@ -51,7 +51,14 @@ const StructuralEvent = events_mod.StructuralEvent;
 
 /// Serializes structural events to JSON format.
 /// Format: { "events": [ { "type": "...", "start": N, "end": N, "line": N, "confidence": F, ... } ] }
+/// When include_alternatives is true, every event also carries an "alternatives"
+/// array listing the non-winning candidates of its region (type, confidence,
+/// captures only).
 pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !void {
+    try serializeEventsWithAlternatives(events_list, false, writer);
+}
+
+pub fn serializeEventsWithAlternatives(events_list: []const StructuralEvent, include_alternatives: bool, writer: anytype) !void {
     try writer.writeAll("{ \"events\": [");
 
     for (events_list, 0..) |event, i| {
@@ -90,6 +97,27 @@ pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !v
             try writer.writeAll("\": \"");
             try writer.writeAll(cap.value);
             try writer.writeAll("\"");
+        }
+
+        if (include_alternatives) {
+            try writer.writeAll(", \"alternatives\": [");
+            for (event.alternatives, 0..) |alt, j| {
+                if (j > 0) try writer.writeAll(",");
+                try writer.writeAll(" { \"type\": \"");
+                try writer.writeAll(alt.type_name);
+                try writer.writeAll("\", \"confidence\": ");
+                try writer.print("{d:.2}", .{alt.confidence});
+                for (alt.captures) |cap| {
+                    try writer.writeAll(", \"");
+                    try writer.writeAll(cap.field_name);
+                    try writer.writeAll("\": \"");
+                    try writer.writeAll(cap.value);
+                    try writer.writeAll("\"");
+                }
+                try writer.writeAll(" }");
+            }
+            if (event.alternatives.len > 0) try writer.writeAll(" ");
+            try writer.writeAll("]");
         }
 
         try writer.writeAll(" }");
@@ -530,6 +558,130 @@ test "property: JSON serialization of extended fields" {
 
             // (d) block_end omitted when null
             try testing.expect(event.get("block_end") == null);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: competing-candidate-emission, Unit: alternatives serialization bytes
+// **Validates: Requirements 2.2, 2.4, 2.5**
+test "serializeEventsWithAlternatives: winner with two alternatives" {
+    const ev = StructuralEvent{
+        .type_name = "decl",
+        .captures = &.{.{ .field_name = "name", .value = "run" }},
+        .start = 0,
+        .end = 8,
+        .line = 1,
+        .col = 0,
+        .confidence = 0.9,
+        .alternatives = &.{
+            .{ .type_name = "call", .confidence = 0.5, .captures = &.{.{ .field_name = "callee", .value = "run" } } },
+            .{ .type_name = "ref", .confidence = 0.3, .captures = &.{} },
+        },
+    };
+    const result = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+    defer testing.allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"alternatives\": [ { \"type\": \"call\", \"confidence\": 0.50, \"callee\": \"run\" }, { \"type\": \"ref\", \"confidence\": 0.30 } ]") != null);
+    // Winner keeps its own fields.
+    try testing.expect(std.mem.indexOf(u8, result, "\"type\": \"decl\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"start\": 0") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\": \"run\"") != null);
+    // Alternatives carry no position fields.
+    try testing.expect(std.mem.indexOf(u8, result, "\"start\"") != null);
+}
+
+fn serializeEventsToStringWithAlternatives(events_list: []const StructuralEvent, include: bool) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try serializeEventsWithAlternatives(events_list, include, &aw.writer);
+    return aw.toOwnedSlice();
+}
+
+// Feature: competing-candidate-emission, Property 1: Flag-off byte-identical output
+// **Validates: Requirements 9.1, 9.2, 9.3**
+test "property: flag-off byte-identical output" {
+    const conf_gen = gen.intRange(u16, 0, 100);
+
+    try minish.check(testing.allocator, conf_gen, struct {
+        fn prop(c: u16) !void {
+            const ev = StructuralEvent{
+                .type_name = "t",
+                .captures = &.{},
+                .start = 0,
+                .end = 1,
+                .line = 1,
+                .col = 0,
+                .confidence = @as(f32, @floatFromInt(c)) / 100.0,
+                .alternatives = &.{.{
+                    .type_name = "x",
+                    .confidence = 0.2,
+                    .captures = &.{},
+                }},
+            };
+            const with_flag = try serializeEventsToStringWithAlternatives(&.{ev}, false);
+            defer testing.allocator.free(with_flag);
+            const old = try serializeEventsToString(&.{ev});
+            defer testing.allocator.free(old);
+            try testing.expectEqualStrings(old, with_flag);
+            try testing.expect(std.mem.indexOf(u8, with_flag, "alternatives") == null);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: competing-candidate-emission, Property 5: Empty-array invariant
+// **Validates: Requirements 5.1, 5.2, 10.3**
+test "property: empty-array invariant" {
+    const ev = StructuralEvent{
+        .type_name = "t",
+        .captures = &.{},
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+    };
+    const result = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+    defer testing.allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    const alts = event.get("alternatives").?;
+    try testing.expectEqual(@as(usize, 0), alts.array.items.len);
+}
+
+// Feature: competing-candidate-emission, Property 6: Alternative field set
+// **Validates: Requirements 2.3, 2.5**
+test "property: alternative field set" {
+    const name_gen = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha });
+
+    try minish.check(testing.allocator, name_gen, struct {
+        fn prop(name: []const u8) !void {
+            const ev = StructuralEvent{
+                .type_name = "t",
+                .captures = &.{},
+                .start = 0,
+                .end = 1,
+                .line = 1,
+                .col = 0,
+                .confidence = 1.0,
+                .alternatives = &.{.{
+                    .type_name = "other",
+                    .confidence = 0.4,
+                    .captures = &.{.{ .field_name = "callee", .value = name }},
+                }},
+            };
+            const result = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+            defer testing.allocator.free(result);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+            defer parsed.deinit();
+            const alt = parsed.value.object.get("events").?.array.items[0].object.get("alternatives").?.array.items[0].object;
+            try testing.expect(alt.get("type") != null);
+            try testing.expect(alt.get("confidence") != null);
+            try testing.expect(alt.get("callee") != null);
+            try testing.expect(alt.get("start") == null);
+            try testing.expect(alt.get("end") == null);
+            try testing.expect(alt.get("line") == null);
+            try testing.expect(alt.get("col") == null);
+            try testing.expect(alt.get("block_start") == null);
         }
     }.prop, .{ .num_runs = 100 });
 }
