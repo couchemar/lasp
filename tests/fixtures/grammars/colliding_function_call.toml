@@ -1,0 +1,14 @@
+[language]
+name = "erlang"
+
+[keywords]
+declaration = ["-module", "-export"]
+
+[[patterns]]
+type = "function"
+sequence = ["$name:IDENTIFIER", "("]
+position = "start"
+
+[[patterns]]
+type = "call"
+sequence = ["$callee:IDENTIFIER", "("]

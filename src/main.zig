@@ -1630,3 +1630,100 @@ test "integration: apostrophe-in-comment does not swallow Erlang function heads"
     }
     try std.testing.expectEqual(@as(usize, 6), count);
 }
+
+test "integration: colliding identical-sequence patterns emit both functions and calls" {
+    const allocator = std.testing.allocator;
+
+    // 1. --node function --names-only lists all 6 function heads
+    {
+        const result = try runLasp(allocator, &.{
+            "parse",
+            "tests/fixtures/colliding.erl",
+            "--grammar",
+            "tests/fixtures/grammars/colliding_function_call.toml",
+            "--node",
+            "function",
+            "--names-only",
+        });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+        const expected_heads = [_][]const u8{ "ann", "af_atom", "af_int", "af_var", "af_call", "af_list" };
+        var idx: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(idx < expected_heads.len);
+            try std.testing.expectEqualStrings(expected_heads[idx], line);
+            idx += 1;
+        }
+        try std.testing.expectEqual(expected_heads.len, idx);
+    }
+
+    // 2. --node call --names-only lists all 3 call sites
+    {
+        const result = try runLasp(allocator, &.{
+            "parse",
+            "tests/fixtures/colliding.erl",
+            "--grammar",
+            "tests/fixtures/grammars/colliding_function_call.toml",
+            "--node",
+            "call",
+            "--names-only",
+        });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+        const expected_calls = [_][]const u8{ "helper", "format", "done" };
+        var idx: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(idx < expected_calls.len);
+            try std.testing.expectEqualStrings(expected_calls[idx], line);
+            idx += 1;
+        }
+        try std.testing.expectEqual(expected_calls.len, idx);
+    }
+
+    // 3. query 'function[name="ann"]' and query 'call[callee="helper"]'
+    {
+        const result_fn = try runLasp(allocator, &.{
+            "query",
+            "function[name=\"ann\"]",
+            "tests/fixtures/colliding.erl",
+            "-g",
+            "tests/fixtures/grammars/colliding_function_call.toml",
+            "--names-only",
+        });
+        defer {
+            allocator.free(result_fn.stdout);
+            allocator.free(result_fn.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result_fn.term);
+        try std.testing.expectEqualStrings("ann\n", result_fn.stdout);
+
+        const result_call = try runLasp(allocator, &.{
+            "query",
+            "call[callee=\"helper\"]",
+            "tests/fixtures/colliding.erl",
+            "-g",
+            "tests/fixtures/grammars/colliding_function_call.toml",
+            "--names-only",
+        });
+        defer {
+            allocator.free(result_call.stdout);
+            allocator.free(result_call.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result_call.term);
+        try std.testing.expectEqualStrings("helper\n", result_call.stdout);
+    }
+}

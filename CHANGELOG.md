@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Patterns that share an identical token sequence no longer shadow each other. Previously, when two patterns compiled to the same terminal trie state (e.g. `function` with `position = "start"` and `call`, both matching `["$IDENT", "("]`), only the last one declared emitted — so `--node function` could return zero matches. The compiler now keeps every colliding pattern's event on the shared terminal state in grammar order, and the engine evaluates each as a competing candidate, so `position` and depth constraints route each match to the right pattern type. (Issue #17)
 - Erlang (and any `%`-comment language): an apostrophe inside a line comment no longer opens a spurious string literal that swallows all following code. Comment recognition now runs before string tokenization, so quote characters in comments stay comment content. Regression guard: all top-level function heads in a fixture with apostrophe-bearing `%%` comments are detected (6/6, previously 0/6). (Issues #9, #18)
 - Tokenizer integer overflow when computing the column of a multi-line block comment: the emitted token's `col`/`line` now reflect where the comment started, not where it ended.
 - `--names-only` output no longer emits a spurious trailing blank line. The unconditional end-of-main newline is now guarded on `!parsed.names_only`, fixing the off-by-one `wc -l` vs `grep -c .` mismatch and making zero-match names-only output exactly 0 bytes. (Issue #21)

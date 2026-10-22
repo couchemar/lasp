@@ -257,28 +257,31 @@ pub fn parse(
             }
 
             // Check terminal state
-            if (automaton.states[state].event) |event_info| {
-                // Try to buffer this candidate (constraint checks may reject it)
-                const buffered = try bufferCandidate(
-                    &candidates,
-                    event_info,
-                    patterns,
-                    &pending_captures,
-                    &matched_kinds,
-                    &matched_texts,
-                    &matched_qualities,
-                    pattern_start,
-                    pattern_col,
-                    match_start_prev_token,
-                    lookback,
-                    block_stack,
-                    tokens,
-                    token,
-                    weights,
-                    allocator,
-                );
+            if (automaton.states[state].events.len > 0) {
+                var any_buffered = false;
+                for (automaton.states[state].events) |event_info| {
+                    const buffered = try bufferCandidate(
+                        &candidates,
+                        event_info,
+                        patterns,
+                        &pending_captures,
+                        &matched_kinds,
+                        &matched_texts,
+                        &matched_qualities,
+                        pattern_start,
+                        pattern_col,
+                        match_start_prev_token,
+                        lookback,
+                        block_stack,
+                        tokens,
+                        token,
+                        weights,
+                        allocator,
+                    );
+                    if (buffered) any_buffered = true;
+                }
 
-                if (!buffered) {
+                if (!any_buffered) {
                     // Constraint check failed — flush any existing candidates and reset
                     if (candidates.items.len > 0) {
                         if (selectBestCandidate(candidates.items)) |winner| {
@@ -320,7 +323,7 @@ pub fn parse(
                     if (!found_optional) break;
 
                     // Check if the new state is a terminal state
-                    if (automaton.states[skip_state].event != null) {
+                    if (automaton.states[skip_state].events.len > 0) {
                         // We've reached a terminal state by skipping optionals
                         state = skip_state;
                         skipped = true;
@@ -381,8 +384,46 @@ pub fn parse(
                     }
 
                     // Check if this immediately reaches a terminal state
-                    if (automaton.states[state].event) |event_info| {
-                        const buffered = try bufferCandidate(
+                    if (automaton.states[state].events.len > 0) {
+                        var any_buffered = false;
+                        for (automaton.states[state].events) |event_info| {
+                            const buffered = try bufferCandidate(
+                                &candidates,
+                                event_info,
+                                patterns,
+                                &pending_captures,
+                                &matched_kinds,
+                                &matched_texts,
+                                &matched_qualities,
+                                pattern_start,
+                                pattern_col,
+                                match_start_prev_token,
+                                lookback,
+                                block_stack,
+                                tokens,
+                                token,
+                                weights,
+                                allocator,
+                            );
+                            if (buffered) any_buffered = true;
+                        }
+
+                        if (!any_buffered) {
+                            state = 0;
+                            noise_count = 0;
+                            pending_captures.clearRetainingCapacity();
+                            matched_kinds.clearRetainingCapacity();
+                            matched_texts.clearRetainingCapacity();
+                            matched_qualities.clearRetainingCapacity();
+                        }
+                    }
+                }
+            } else {
+                // After skipping, check if we landed on a terminal state
+                if (automaton.states[state].events.len > 0) {
+                    var any_buffered = false;
+                    for (automaton.states[state].events) |event_info| {
+                        const buffered = try bufferCandidateWithMinEvidence(
                             &candidates,
                             event_info,
                             patterns,
@@ -400,40 +441,10 @@ pub fn parse(
                             weights,
                             allocator,
                         );
-
-                        if (!buffered) {
-                            state = 0;
-                            noise_count = 0;
-                            pending_captures.clearRetainingCapacity();
-                            matched_kinds.clearRetainingCapacity();
-                            matched_texts.clearRetainingCapacity();
-                            matched_qualities.clearRetainingCapacity();
-                        }
+                        if (buffered) any_buffered = true;
                     }
-                }
-            } else {
-                // After skipping, check if we landed on a terminal state
-                if (automaton.states[state].event) |event_info| {
-                    const buffered = try bufferCandidateWithMinEvidence(
-                        &candidates,
-                        event_info,
-                        patterns,
-                        &pending_captures,
-                        &matched_kinds,
-                        &matched_texts,
-                        &matched_qualities,
-                        pattern_start,
-                        pattern_col,
-                        match_start_prev_token,
-                        lookback,
-                        block_stack,
-                        tokens,
-                        token,
-                        weights,
-                        allocator,
-                    );
 
-                    if (!buffered) {
+                    if (!any_buffered) {
                         // Constraint or minimum evidence check failed — flush and reset
                         if (candidates.items.len > 0) {
                             if (selectBestCandidate(candidates.items)) |winner| {
@@ -530,7 +541,10 @@ fn bufferCandidate(
     weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
 ) !bool {
-    const pattern = findPattern(patterns, event_info.type_name);
+    const pattern: ?loader.Pattern = if (event_info.pattern_index < patterns.len)
+        patterns[event_info.pattern_index]
+    else
+        findPattern(patterns, event_info.type_name);
 
     // Position constraint check
     if (pattern) |p| {
@@ -543,9 +557,26 @@ fn bufferCandidate(
         }
     }
 
+    // Build event captures from pattern definition using matched token texts
+    var event_captures: std.ArrayList(CaptureEntry) = .empty;
+    if (pattern) |p| {
+        for (p.captures) |cap| {
+            if (cap.position < matched_texts.items.len) {
+                try event_captures.append(allocator, .{
+                    .field_name = cap.field_name,
+                    .value = matched_texts.items[cap.position],
+                });
+            }
+        }
+    } else {
+        for (pending_captures.items) |cap| {
+            try event_captures.append(allocator, cap);
+        }
+    }
+
     // Unified constraint evaluation (replaces exclude + not_preceded_by)
     if (pattern) |p| {
-        if (!evaluateConstraints(p, pending_captures.items, match_start_prev_token, lookback)) {
+        if (!evaluateConstraints(p, event_captures.items, match_start_prev_token, lookback)) {
             return false;
         }
     }
@@ -568,7 +599,6 @@ fn bufferCandidate(
     const confidence = events_mod.computeConfidence(matched_weights, max_score, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
 
     if (confidence < 0.3) {
-        pending_captures.clearRetainingCapacity();
         return false;
     }
 
@@ -581,22 +611,9 @@ fn bufferCandidate(
         }
     }
 
-    // Rebuild captures from pattern definitions using matched token texts
-    pending_captures.clearRetainingCapacity();
-    if (pattern) |p| {
-        for (p.captures) |cap| {
-            if (cap.position < matched_texts.items.len) {
-                try pending_captures.append(allocator, .{
-                    .field_name = cap.field_name,
-                    .value = matched_texts.items[cap.position],
-                });
-            }
-        }
-    }
-
     const event = StructuralEvent{
         .type_name = event_info.type_name,
-        .captures = try pending_captures.toOwnedSlice(allocator),
+        .captures = try event_captures.toOwnedSlice(allocator),
         .start = pattern_start,
         .end = token.end,
         .line = pattern_line,
@@ -608,7 +625,7 @@ fn bufferCandidate(
     try candidates.append(allocator, .{
         .event = event,
         .match_length = matched_kinds.items.len,
-        .pattern_index = findPatternIndex(patterns, event_info.type_name),
+        .pattern_index = event_info.pattern_index,
     });
 
     return true;
@@ -634,7 +651,10 @@ fn bufferCandidateWithMinEvidence(
     weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
 ) !bool {
-    const pattern = findPattern(patterns, event_info.type_name);
+    const pattern = if (event_info.pattern_index < patterns.len)
+        patterns[event_info.pattern_index]
+    else
+        findPattern(patterns, event_info.type_name);
 
     // Minimum_Evidence: at least one required element must have matched
     var has_required_match = false;
@@ -3204,4 +3224,338 @@ test "parse: combined position + constraints evaluation order" {
         try testing.expectEqual(@as(usize, 1), result.len); // both checks pass
         try testing.expectEqualStrings("function", result[0].type_name);
     }
+}
+
+// Feature: identical-sequence-pattern-shadowing, Property 1: Bug Condition - Identical-Sequence Patterns Shadowing
+// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4, 2.5**
+test "property: identical-sequence patterns coexist and route correctly" {
+    const tuple_gen = comptime gen.tuple3(
+        []const u8,
+        []const u8,
+        u16,
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.intRange(u16, 1, 10),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8, u16 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const fn_name = vals[0];
+            const call_name = vals[1];
+            const indent_val: usize = @intCast(vals[2]);
+
+            // Two colliding patterns sharing identical sequence: IDENTIFIER "("
+            // Pattern 0: function with position = "start"
+            // Pattern 1: call without position
+            const patterns = &[_]loader.Pattern{
+                .{
+                    .type_name = "function",
+                    .sequence = &.{
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                        .{ .matcher = .{ .symbol_literal = "(" } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 0 }},
+                    .position = .start,
+                },
+                .{
+                    .type_name = "call",
+                    .sequence = &.{
+                        .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
+                        .{ .matcher = .{ .symbol_literal = "(" } },
+                    },
+                    .captures = &.{.{ .field_name = "callee", .position = 0 }},
+                },
+            };
+
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // Construct source: "fn_name(\n" + indent spaces + "call_name("
+            const indent_spaces = try alloc.alloc(u8, indent_val);
+            @memset(indent_spaces, ' ');
+            const source = try std.fmt.allocPrint(alloc, "{s}(\n{s}{s}(", .{ fn_name, indent_spaces, call_name });
+
+            const line1_len = fn_name.len + 2; // "fn_name(\n"
+            const call_start = line1_len + indent_val;
+            const tokens = &[_]Token{
+                .{ .kind = .identifier, .start = 0, .end = fn_name.len, .line = 1, .col = 0 },
+                .{ .kind = .delimiter, .start = fn_name.len, .end = fn_name.len + 1, .line = 1, .col = fn_name.len },
+                .{ .kind = .newline, .start = fn_name.len + 1, .end = line1_len, .line = 1, .col = fn_name.len + 1 },
+                .{ .kind = .identifier, .start = call_start, .end = call_start + call_name.len, .line = 2, .col = indent_val },
+                .{ .kind = .delimiter, .start = call_start + call_name.len, .end = call_start + call_name.len + 1, .line = 2, .col = indent_val + call_name.len },
+            };
+
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+
+            // Expected behavior (Property 1):
+            // Both patterns coexist and route correctly:
+            // 1. Column-0 foo( routes to "function"
+            // 2. Indented bar( routes to "call"
+            var fn_count: usize = 0;
+            var call_count: usize = 0;
+            for (result) |ev| {
+                if (std.mem.eql(u8, ev.type_name, "function")) {
+                    fn_count += 1;
+                    try testing.expect(ev.captures.len > 0);
+                    try testing.expectEqualStrings("name", ev.captures[0].field_name);
+                    try testing.expectEqualStrings(fn_name, ev.captures[0].value);
+                } else if (std.mem.eql(u8, ev.type_name, "call")) {
+                    call_count += 1;
+                    try testing.expect(ev.captures.len > 0);
+                    try testing.expectEqualStrings("callee", ev.captures[0].field_name);
+                    try testing.expectEqualStrings(call_name, ev.captures[0].value);
+                }
+            }
+
+            try testing.expectEqual(@as(usize, 1), fn_count);
+            try testing.expectEqual(@as(usize, 1), call_count);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: identical-sequence-pattern-shadowing, Property 2: Preservation - Non-colliding grammars event stream is preserved
+// **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5**
+test "preservation: non-colliding grammars event stream is preserved" {
+    const ident_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, ident_gen, struct {
+        fn prop(name: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Two non-colliding patterns with distinct terminal sequences:
+            // "fn" <name> "(" => function
+            // "struct" <name> "{" => struct_def
+            const patterns = &[_]loader.Pattern{
+                .{
+                    .type_name = "function",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "fn" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .symbol_literal = "(" } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                },
+                .{
+                    .type_name = "struct_def",
+                    .sequence = &.{
+                        .{ .matcher = .{ .keyword_literal = "struct" } },
+                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .symbol_literal = "{" } },
+                    },
+                    .captures = &.{.{ .field_name = "name", .position = 1 }},
+                },
+            };
+
+            const automaton = try compiler.compile(patterns, alloc);
+
+            const source = try std.fmt.allocPrint(alloc, "fn {s}(\nstruct {s}{{", .{ name, name });
+            const fn_len = 3 + name.len + 1; // "fn name("
+            const tokens = &[_]Token{
+                .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+                .{ .kind = .identifier, .start = 3, .end = 3 + name.len, .line = 1, .col = 3 },
+                .{ .kind = .delimiter, .start = 3 + name.len, .end = fn_len, .line = 1, .col = 3 + name.len },
+                .{ .kind = .newline, .start = fn_len, .end = fn_len + 1, .line = 1, .col = fn_len },
+                .{ .kind = .keyword, .start = fn_len + 1, .end = fn_len + 7, .line = 2, .col = 0 },
+                .{ .kind = .identifier, .start = fn_len + 8, .end = fn_len + 8 + name.len, .line = 2, .col = 7 },
+                .{ .kind = .delimiter, .start = fn_len + 8 + name.len, .end = fn_len + 9 + name.len, .line = 2, .col = 7 + name.len },
+            };
+
+            const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+
+            try testing.expectEqual(@as(usize, 2), result.len);
+            try testing.expectEqualStrings("function", result[0].type_name);
+            try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+            try testing.expectEqualStrings("name", result[0].captures[0].field_name);
+            try testing.expectEqualStrings(name, result[0].captures[0].value);
+            try testing.expectEqual(@as(usize, 1), result[0].line);
+            try testing.expectEqual(@as(usize, 0), result[0].col);
+            try testing.expect(result[0].confidence >= 0.99);
+
+            try testing.expectEqualStrings("struct_def", result[1].type_name);
+            try testing.expectEqual(@as(usize, 1), result[1].captures.len);
+            try testing.expectEqualStrings("name", result[1].captures[0].field_name);
+            try testing.expectEqualStrings(name, result[1].captures[0].value);
+            try testing.expectEqual(@as(usize, 2), result[1].line);
+            try testing.expectEqual(@as(usize, 0), result[1].col);
+            try testing.expect(result[1].confidence >= 0.99);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+test "preservation: single function pattern grammar event stream" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .symbol_literal = "(" } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 1 }},
+        .position = .start,
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "fn compute(";
+    const tokens = &[_]Token{
+        .{ .kind = .keyword, .start = 0, .end = 2, .line = 1, .col = 0 },
+        .{ .kind = .identifier, .start = 3, .end = 10, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 10, .end = 11, .line = 1, .col = 10 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("function", result[0].type_name);
+    try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+    try testing.expectEqualStrings("name", result[0].captures[0].field_name);
+    try testing.expectEqualStrings("compute", result[0].captures[0].value);
+    try testing.expectEqual(@as(usize, 1), result[0].line);
+    try testing.expectEqual(@as(usize, 0), result[0].col);
+    try testing.expect(result[0].confidence >= 0.99);
+}
+
+test "parse: function vs call colliding grammar emits function for col 0 and call for indented" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{
+        .{
+            .type_name = "function",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{.{ .field_name = "name", .position = 0 }},
+            .position = .start,
+        },
+        .{
+            .type_name = "call",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{.{ .field_name = "callee", .position = 0 }},
+        },
+    };
+
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const source =
+        \\foo()
+        \\  bar()
+        \\baz()
+        \\    qux()
+    ;
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 },
+        .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 4, .end = 5, .line = 1, .col = 4 },
+        .{ .kind = .newline, .start = 5, .end = 6, .line = 1, .col = 5 },
+
+        .{ .kind = .identifier, .start = 8, .end = 11, .line = 2, .col = 2 },
+        .{ .kind = .delimiter, .start = 11, .end = 12, .line = 2, .col = 5 },
+        .{ .kind = .delimiter, .start = 12, .end = 13, .line = 2, .col = 6 },
+        .{ .kind = .newline, .start = 13, .end = 14, .line = 2, .col = 7 },
+
+        .{ .kind = .identifier, .start = 14, .end = 17, .line = 3, .col = 0 },
+        .{ .kind = .delimiter, .start = 17, .end = 18, .line = 3, .col = 3 },
+        .{ .kind = .delimiter, .start = 18, .end = 19, .line = 3, .col = 4 },
+        .{ .kind = .newline, .start = 19, .end = 20, .line = 3, .col = 5 },
+
+        .{ .kind = .identifier, .start = 24, .end = 27, .line = 4, .col = 4 },
+        .{ .kind = .delimiter, .start = 27, .end = 28, .line = 4, .col = 7 },
+        .{ .kind = .delimiter, .start = 28, .end = 29, .line = 4, .col = 8 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 4), result.len);
+
+    try testing.expectEqualStrings("function", result[0].type_name);
+    try testing.expectEqualStrings("foo", result[0].captures[0].value);
+    try testing.expectEqual(@as(usize, 0), result[0].col);
+
+    try testing.expectEqualStrings("call", result[1].type_name);
+    try testing.expectEqualStrings("bar", result[1].captures[0].value);
+    try testing.expectEqual(@as(usize, 2), result[1].col);
+
+    try testing.expectEqualStrings("function", result[2].type_name);
+    try testing.expectEqualStrings("baz", result[2].captures[0].value);
+    try testing.expectEqual(@as(usize, 0), result[2].col);
+
+    try testing.expectEqualStrings("call", result[3].type_name);
+    try testing.expectEqualStrings("qux", result[3].captures[0].value);
+    try testing.expectEqual(@as(usize, 4), result[3].col);
+}
+
+test "parse: --node function on colliding grammar filters to only function heads" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{
+        .{
+            .type_name = "function",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{.{ .field_name = "name", .position = 0 }},
+            .position = .start,
+        },
+        .{
+            .type_name = "call",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{.{ .field_name = "callee", .position = 0 }},
+        },
+    };
+
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const source =
+        \\ann()
+        \\  call_site()
+        \\compute()
+    ;
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 },
+        .{ .kind = .delimiter, .start = 3, .end = 4, .line = 1, .col = 3 },
+        .{ .kind = .delimiter, .start = 4, .end = 5, .line = 1, .col = 4 },
+        .{ .kind = .newline, .start = 5, .end = 6, .line = 1, .col = 5 },
+
+        .{ .kind = .identifier, .start = 8, .end = 17, .line = 2, .col = 2 },
+        .{ .kind = .delimiter, .start = 17, .end = 18, .line = 2, .col = 11 },
+        .{ .kind = .delimiter, .start = 18, .end = 19, .line = 2, .col = 12 },
+        .{ .kind = .newline, .start = 19, .end = 20, .line = 2, .col = 13 },
+
+        .{ .kind = .identifier, .start = 20, .end = 27, .line = 3, .col = 0 },
+        .{ .kind = .delimiter, .start = 27, .end = 28, .line = 3, .col = 7 },
+        .{ .kind = .delimiter, .start = 28, .end = 29, .line = 3, .col = 8 },
+    };
+
+    const all_events = try parse(automaton, tokens, source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 3), all_events.len);
+
+    // Filter by node type "function"
+    var fn_events: std.ArrayList(StructuralEvent) = .empty;
+    for (all_events) |ev| {
+        if (std.mem.eql(u8, ev.type_name, "function")) {
+            try fn_events.append(alloc, ev);
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 2), fn_events.items.len);
+    try testing.expectEqualStrings("ann", fn_events.items[0].captures[0].value);
+    try testing.expectEqualStrings("compute", fn_events.items[1].captures[0].value);
 }

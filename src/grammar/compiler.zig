@@ -20,11 +20,12 @@ pub const Transition = struct {
 pub const EventInfo = struct {
     type_name: []const u8,
     capture_fields: []const []const u8,
+    pattern_index: usize,
 };
 
 pub const State = struct {
     transitions: []const Transition,
-    event: ?EventInfo = null,
+    events: []const EventInfo = &.{},
 };
 
 pub const CaptureValue = struct {
@@ -89,10 +90,10 @@ const MutableTransition = struct {
 
 const MutableState = struct {
     transitions: std.ArrayList(MutableTransition),
-    event: ?EventInfo,
+    events: std.ArrayList(EventInfo),
 
     fn init() MutableState {
-        return .{ .transitions = .empty, .event = null };
+        return .{ .transitions = .empty, .events = .empty };
     }
 };
 
@@ -104,7 +105,7 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
     // State 0 = root (no event)
     try builder.append(allocator, MutableState.init());
 
-    for (patterns) |pattern| {
+    for (patterns, 0..) |pattern, pattern_index| {
         var current: usize = 0;
 
         // Walk/create path through trie
@@ -136,10 +137,11 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
         for (pattern.captures) |c| {
             try cap_fields.append(allocator, c.field_name);
         }
-        builder.items[current].event = .{
+        try builder.items[current].events.append(allocator, .{
             .type_name = pattern.type_name,
             .capture_fields = try cap_fields.toOwnedSlice(allocator),
-        };
+            .pattern_index = pattern_index,
+        });
     }
 
     // Freeze mutable states into const slices
@@ -147,7 +149,7 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
     for (builder.items) |*ms| {
         try states.append(allocator, .{
             .transitions = try freezeTransitions(ms.transitions.items, allocator),
-            .event = ms.event,
+            .events = try ms.events.toOwnedSlice(allocator),
         });
     }
 
@@ -230,10 +232,10 @@ test "compile: single pattern produces correct state count" {
     const automaton = try compile(patterns, alloc);
     try testing.expectEqual(@as(usize, 4), automaton.states.len);
     // Root has no event
-    try testing.expect(automaton.states[0].event == null);
+    try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
     // Terminal state has event
-    try testing.expect(automaton.states[3].event != null);
-    try testing.expectEqualStrings("function", automaton.states[3].event.?.type_name);
+    try testing.expectEqual(@as(usize, 1), automaton.states[3].events.len);
+    try testing.expectEqualStrings("function", automaton.states[3].events[0].type_name);
 }
 
 test "compile: shared prefix" {
@@ -281,7 +283,7 @@ test "compile: empty patterns produces root-only automaton" {
 
     const automaton = try compile(&.{}, arena.allocator());
     try testing.expectEqual(@as(usize, 1), automaton.states.len);
-    try testing.expect(automaton.states[0].event == null);
+    try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
     try testing.expectEqual(@as(usize, 0), automaton.states[0].transitions.len);
 }
 
@@ -410,7 +412,7 @@ test "property: automaton structural invariants" {
             const automaton = try compile(patterns, alloc);
 
             // (a) Root has no event
-            try testing.expect(automaton.states[0].event == null);
+            try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
 
             // (b) No state has duplicate matchers
             for (automaton.states) |state| {
@@ -454,8 +456,8 @@ test "property: pattern path correctness" {
                 state = automaton.states[state].transitions[0].next_state;
             }
             // Terminal state
-            try testing.expect(automaton.states[state].event != null);
-            try testing.expectEqualStrings("test_type", automaton.states[state].event.?.type_name);
+            try testing.expectEqual(@as(usize, 1), automaton.states[state].events.len);
+            try testing.expectEqualStrings("test_type", automaton.states[state].events[0].type_name);
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -495,6 +497,126 @@ test "property: prefix sharing" {
             }
             // Divergence point: should have 2 transitions
             try testing.expectEqual(@as(usize, 2), automaton.states[state].transitions.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: identical-sequence-pattern-shadowing, Property 2: Preservation - Non-colliding grammars have one event per terminal
+// **Validates: Requirements 3.1, 3.5**
+test "preservation: non-colliding grammars terminal state carries one event and root zero" {
+    const prefix_gen = gen.intRange(u8, 1, 3);
+
+    try minish.check(testing.allocator, prefix_gen, struct {
+        fn prop(prefix_len: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Two patterns sharing a prefix of prefix_len keywords, then diverging to distinct terminals
+            var seq1: std.ArrayList(loader.SequenceElement) = .empty;
+            var seq2: std.ArrayList(loader.SequenceElement) = .empty;
+            for (0..prefix_len) |_| {
+                try seq1.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
+                try seq2.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
+            }
+            try seq1.append(alloc, .{ .matcher = .{ .symbol_literal = "(" } });
+            try seq2.append(alloc, .{ .matcher = .{ .symbol_literal = "{" } });
+
+            const patterns = &[_]Pattern{
+                .{ .type_name = "pattern_a", .sequence = seq1.items, .captures = &.{} },
+                .{ .type_name = "pattern_b", .sequence = seq2.items, .captures = &.{} },
+            };
+
+            const automaton = try compile(patterns, alloc);
+
+            // Root has no event
+            try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
+
+            // Walk to terminal a
+            var state_a: usize = 0;
+            for (seq1.items) |elem| {
+                const step_res = automaton.step(state_a, .{ .kind = if (elem.matcher == .symbol_literal) .delimiter else .keyword, .start = 0, .end = if (elem.matcher == .symbol_literal) 1 else 6, .line = 1, .col = 0 }, if (elem.matcher == .symbol_literal) "(" else "shared");
+                try testing.expect(step_res != null);
+                state_a = step_res.?.next;
+            }
+            try testing.expectEqual(@as(usize, 1), automaton.states[state_a].events.len);
+            try testing.expectEqualStrings("pattern_a", automaton.states[state_a].events[0].type_name);
+
+            // Walk to terminal b
+            var state_b: usize = 0;
+            for (seq2.items) |elem| {
+                const step_res = automaton.step(state_b, .{ .kind = if (elem.matcher == .symbol_literal) .delimiter else .keyword, .start = 0, .end = if (elem.matcher == .symbol_literal) 1 else 6, .line = 1, .col = 0 }, if (elem.matcher == .symbol_literal) "{" else "shared");
+                try testing.expect(step_res != null);
+                state_b = step_res.?.next;
+            }
+            try testing.expectEqual(@as(usize, 1), automaton.states[state_b].events.len);
+            try testing.expectEqualStrings("pattern_b", automaton.states[state_b].events[0].type_name);
+            try testing.expect(state_a != state_b);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: identical-sequence-pattern-shadowing, Property 1: Identical-sequence patterns retain all events in grammar order
+// **Validates: Requirements 2.1, 3.5**
+test "property: identical-sequence patterns retain all events on shared terminal" {
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        []const u8,
+        []const u8,
+        gen.intRange(u8, 1, 4),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, []const u8, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const seq_len = vals[0];
+            const type_a = vals[1];
+            const type_b = vals[2];
+
+            // Build identical sequence for both patterns
+            var seq: std.ArrayList(loader.SequenceElement) = .empty;
+            for (0..seq_len) |_| {
+                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
+            }
+
+            const patterns = &[_]Pattern{
+                .{ .type_name = type_a, .sequence = seq.items, .captures = &.{} },
+                .{ .type_name = type_b, .sequence = seq.items, .captures = &.{} },
+            };
+
+            const automaton = try compile(patterns, alloc);
+
+            // Root has 0 events
+            try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
+
+            // Walk to terminal
+            var state: usize = 0;
+            for (0..seq_len) |_| {
+                try testing.expectEqual(@as(usize, 1), automaton.states[state].transitions.len);
+                state = automaton.states[state].transitions[0].next_state;
+            }
+
+            // Shared terminal state must retain both events in grammar order
+            const term = automaton.states[state];
+            try testing.expectEqual(@as(usize, 2), term.events.len);
+            try testing.expectEqualStrings(type_a, term.events[0].type_name);
+            try testing.expectEqual(@as(usize, 0), term.events[0].pattern_index);
+            try testing.expectEqualStrings(type_b, term.events[1].type_name);
+            try testing.expectEqual(@as(usize, 1), term.events[1].pattern_index);
+
+            // Structural invariants: no state has duplicate transitions, root has 0 events
+            for (automaton.states) |st| {
+                for (st.transitions, 0..) |tr_a, i| {
+                    for (st.transitions[i + 1 ..]) |tr_b| {
+                        try testing.expect(!matchersEqual(tr_a.matcher, tr_b.matcher));
+                    }
+                }
+            }
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -584,4 +706,116 @@ test "step: non-keyword non-identifier token does not match keyword_literal" {
 
     const result = automaton.step(0, token, source);
     try testing.expect(result == null);
+}
+
+test "compile: two identical-sequence patterns produce shared terminal state with multiple events in grammar order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]Pattern{
+        .{
+            .type_name = "function",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{.{ .field_name = "name", .position = 0 }},
+        },
+        .{
+            .type_name = "call",
+            .sequence = &.{
+                .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{.{ .field_name = "callee", .position = 0 }},
+        },
+    };
+
+    const automaton = try compile(patterns, alloc);
+
+    // Root state 0 has 0 events
+    try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
+
+    // Terminal state should have 2 events in grammar order
+    try testing.expectEqual(@as(usize, 1), automaton.states[0].transitions.len);
+    const state_1 = automaton.states[0].transitions[0].next_state;
+    try testing.expectEqual(@as(usize, 1), automaton.states[state_1].transitions.len);
+    const terminal_state = automaton.states[state_1].transitions[0].next_state;
+
+    const term = automaton.states[terminal_state];
+    try testing.expectEqual(@as(usize, 2), term.events.len);
+
+    // Event 0: function
+    try testing.expectEqualStrings("function", term.events[0].type_name);
+    try testing.expectEqual(@as(usize, 0), term.events[0].pattern_index);
+    try testing.expectEqual(@as(usize, 1), term.events[0].capture_fields.len);
+    try testing.expectEqualStrings("name", term.events[0].capture_fields[0]);
+
+    // Event 1: call
+    try testing.expectEqualStrings("call", term.events[1].type_name);
+    try testing.expectEqual(@as(usize, 1), term.events[1].pattern_index);
+    try testing.expectEqual(@as(usize, 1), term.events[1].capture_fields.len);
+    try testing.expectEqualStrings("callee", term.events[1].capture_fields[0]);
+}
+
+test "compile: single pattern terminal carries exactly one event and root zero" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "function",
+        .sequence = &.{
+            .{ .matcher = .{ .keyword_literal = "fn" } },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compile(patterns, alloc);
+    try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
+    try testing.expectEqual(@as(usize, 1), automaton.states[1].events.len);
+    try testing.expectEqualStrings("function", automaton.states[1].events[0].type_name);
+    try testing.expectEqual(@as(usize, 0), automaton.states[1].events[0].pattern_index);
+}
+
+test "compile: shared-prefix patterns create distinct terminals each with one event" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]Pattern{
+        .{
+            .type_name = "func",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .symbol_literal = "(" } },
+            },
+            .captures = &.{},
+        },
+        .{
+            .type_name = "block",
+            .sequence = &.{
+                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .symbol_literal = "{" } },
+            },
+            .captures = &.{},
+        },
+    };
+
+    const automaton = try compile(patterns, alloc);
+    // Root state
+    try testing.expectEqual(@as(usize, 0), automaton.states[0].events.len);
+
+    // State 1 is shared "fn"
+    const fn_state = automaton.states[0].transitions[0].next_state;
+    try testing.expectEqual(@as(usize, 0), automaton.states[fn_state].events.len);
+    try testing.expectEqual(@as(usize, 2), automaton.states[fn_state].transitions.len);
+
+    const term_a = automaton.states[fn_state].transitions[0].next_state;
+    const term_b = automaton.states[fn_state].transitions[1].next_state;
+    try testing.expect(term_a != term_b);
+
+    try testing.expectEqual(@as(usize, 1), automaton.states[term_a].events.len);
+    try testing.expectEqual(@as(usize, 1), automaton.states[term_b].events.len);
 }
