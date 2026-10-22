@@ -62,6 +62,13 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
+    // 4.5 Help report: exits before version and before any file I/O (Req 3, 6).
+    if (parsed.command == .help) {
+        try stdout.writeAll(cli.helpText(parsed.help_topic));
+        try stdout.flush();
+        return;
+    }
+
     // 5. Version report: exits before any file I/O
     if (parsed.command == .version) {
         try stdout.print("lasp {s}\n", .{build_options.version});
@@ -199,6 +206,7 @@ pub fn main(init: std.process.Init) !void {
             }
         },
         .version => unreachable,
+        .help => unreachable,
     }
 
     if (!parsed.names_only) try stdout.writeAll("\n");

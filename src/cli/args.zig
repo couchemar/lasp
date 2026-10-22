@@ -5,6 +5,7 @@ pub const Command = enum {
     parse_dir,
     query,
     version,
+    help,
 };
 
 pub const ParsedArgs = struct {
@@ -15,6 +16,7 @@ pub const ParsedArgs = struct {
     node_filter: ?[]const u8 = null,
     names_only: bool = false,
     query_selector: ?[]const u8 = null,
+    help_topic: ?Command = null,
 };
 
 pub const CliError = error{
@@ -27,10 +29,98 @@ pub const CliError = error{
     MissingSelectorString,
 };
 
+pub const general_help_text =
+    \\lasp - Language-Agnostic Structural Parser
+    \\
+    \\Usage:
+    \\  lasp parse <file|-> [-g <grammar.toml>] [-n <type>] [--names-only]
+    \\  lasp parse-dir <dir> [--grammar-dir <dir>]
+    \\  lasp query <selector> <file|-> -g <grammar.toml> [--names-only]
+    \\  lasp version
+    \\  lasp help
+    \\
+    \\Commands:
+    \\  parse       Parse a single file into structural or token events
+    \\  parse-dir   Parse all files in a directory
+    \\  query       Filter structural events with a CSS-like selector
+    \\  version     Print the version and exit
+    \\  help        Print this help and exit
+    \\
+    \\Flags:
+    \\  -g, --grammar <path>   Grammar TOML file (structural parsing)
+    \\      --grammar-dir <d>  Grammar directory (parse-dir)
+    \\  -n, --node <type>      Emit only events of this type (case-insensitive)
+    \\      --names-only       Emit first capture value per event, one per line
+    \\  -V, --version          Print the version and exit
+    \\  -h, --help             Print help and exit
+    \\
+    \\Stdin: use '-' as the file path to read source from standard input.
+    \\
+    \\Grammars are TOML files with sections [language], [keywords], [[patterns]],
+    \\[blocks], [weights], [comments], and [[patterns.constraints]].
+    \\
+;
+
+pub const parse_help_text =
+    \\lasp parse - parse a single file into structural or token events
+    \\
+    \\Usage:
+    \\  lasp parse <file|-> [-g <grammar.toml>] [-n <type>] [--names-only]
+    \\
+    \\Arguments:
+    \\  <file|->   Source file path, or '-' to read from standard input
+    \\
+    \\Flags:
+    \\  -g, --grammar <path>   Grammar TOML file; omit for raw token output
+    \\  -n, --node <type>      Emit only events of this type (case-insensitive)
+    \\      --names-only       Emit first capture value per event, one per line
+    \\
+;
+
+pub const parse_dir_help_text =
+    \\lasp parse-dir - parse all files in a directory
+    \\
+    \\Usage:
+    \\  lasp parse-dir <dir> [--grammar-dir <dir>]
+    \\
+    \\Arguments:
+    \\  <dir>   Directory to parse
+    \\
+    \\Flags:
+    \\      --grammar-dir <dir>   Directory of grammar TOML files
+    \\
+;
+
+pub const query_help_text =
+    \\lasp query - filter structural events with a CSS-like selector
+    \\
+    \\Usage:
+    \\  lasp query <selector> <file|-> -g <grammar.toml> [--names-only]
+    \\
+    \\Arguments:
+    \\  <selector>   e.g. 'function', 'function[name="foo"]', '*[confidence>0.8]'
+    \\  <file|->     Source file path, or '-' to read from standard input
+    \\
+    \\Flags:
+    \\  -g, --grammar <path>   Grammar TOML file (required)
+    \\      --names-only       Emit first capture value per event, one per line
+    \\
+;
+
+/// Returns the help text for a given topic. null → general help.
+pub fn helpText(topic: ?Command) []const u8 {
+    return switch (topic orelse return general_help_text) {
+        .parse => parse_help_text,
+        .parse_dir => parse_dir_help_text,
+        .query => query_help_text,
+        else => general_help_text,
+    };
+}
+
 /// Returns a human-readable error message for a CliError.
 pub fn formatCliError(err: CliError) []const u8 {
     return switch (err) {
-        error.NoCommand => "error: no command provided. Usage: lasp <parse|parse-dir|query> <path> [flags]",
+        error.NoCommand => general_help_text,
         error.UnrecognizedCommand => "error: unrecognized command",
         error.UnrecognizedFlag => "error: unrecognized flag",
         error.MissingFilePath => "error: command requires a file path",
@@ -46,12 +136,25 @@ pub fn formatCliError(err: CliError) []const u8 {
 pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     if (args.len == 0) return error.NoCommand;
 
+    // Help pre-scan: a Help_Flag anywhere wins over everything except NoCommand,
+    // and takes precedence over Version_Flag (Requirement 5, 6).
+    if (helpScan(args)) {
+        return ParsedArgs{
+            .command = .help,
+            .target_path = "",
+            .help_topic = parseSubcommand(args[0]),
+        };
+    }
+
     // Parse command
     const command = parseCommand(args[0]) orelse return error.UnrecognizedCommand;
 
-    // Version is a global flag: report and exit before any positional parsing.
+    // Version and help are global commands: report and exit before any positional parsing.
     if (command == .version) {
         return ParsedArgs{ .command = .version, .target_path = "" };
+    }
+    if (command == .help) {
+        return ParsedArgs{ .command = .help, .target_path = "", .help_topic = null };
     }
 
     // Query command has different positional arg structure:
@@ -67,7 +170,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
         return switch (command) {
             .parse => error.MissingFilePath,
             .parse_dir => error.MissingDirectoryPath,
-            .query, .version => unreachable,
+            .query, .version, .help => unreachable,
         };
     }
 
@@ -168,6 +271,30 @@ fn parseCommand(arg: []const u8) ?Command {
     if (std.mem.eql(u8, arg, "version")) return .version;
     if (std.mem.eql(u8, arg, "--version")) return .version;
     if (std.mem.eql(u8, arg, "-V")) return .version;
+    if (std.mem.eql(u8, arg, "help")) return .help;
+    return null;
+}
+
+/// Returns true if `arg` is the `--help` or `-h` flag (exact string equality).
+pub fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+/// Returns true if any argument in `args` is a Help_Flag.
+/// Pure, allocation-free linear scan.
+pub fn helpScan(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return true;
+    }
+    return false;
+}
+
+/// Maps a token to a subcommand topic (only `parse`/`parse-dir`/`query`).
+/// Returns `null` for any other input (including `help`, `version`, `--help`, etc.).
+pub fn parseSubcommand(arg: []const u8) ?Command {
+    if (std.mem.eql(u8, arg, "parse")) return .parse;
+    if (std.mem.eql(u8, arg, "parse-dir")) return .parse_dir;
+    if (std.mem.eql(u8, arg, "query")) return .query;
     return null;
 }
 
@@ -539,4 +666,110 @@ test "--version accepted among query flags" {
     const args = &[_][]const u8{ "query", "function", "file.zig", "-V" };
     const result = try parseArgs(args);
     try testing.expectEqual(result.command, .version);
+}
+
+// --- Help Command Tests ---
+
+test "lasp help command returns help with no topic" {
+    const args = &[_][]const u8{"help"};
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == null);
+}
+
+test "lone -h flag returns help with no topic" {
+    const args = &[_][]const u8{"-h"};
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == null);
+}
+
+test "lone --help flag returns help with no topic" {
+    const args = &[_][]const u8{"--help"};
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == null);
+}
+
+test "parse --help returns help with parse topic" {
+    const args = &[_][]const u8{ "parse", "--help" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == .parse);
+}
+
+test "query --help returns help with query topic" {
+    const args = &[_][]const u8{ "query", "--help" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == .query);
+}
+
+test "parse-dir --help returns help with parse_dir topic" {
+    const args = &[_][]const u8{ "parse-dir", "--help" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == .parse_dir);
+}
+
+test "help flag after other flags returns correct topic" {
+    const args = &[_][]const u8{ "parse", "file.zig", "-g", "grammar.toml", "--help" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == .parse);
+}
+
+test "both flags --help --version returns help (help wins)" {
+    const args = &[_][]const u8{ "--help", "--version" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == null);
+}
+
+test "both flags --version --help returns help (help wins)" {
+    const args = &[_][]const u8{ "--version", "--help" };
+    const result = try parseArgs(args);
+    try testing.expectEqual(result.command, .help);
+    try testing.expect(result.help_topic == null);
+}
+
+test "parseArgs with empty array returns NoCommand" {
+    const args = &[_][]const u8{};
+    const result = parseArgs(args);
+    try testing.expectError(error.NoCommand, result);
+}
+
+test "formatCliError for NoCommand returns general help text" {
+    const error_text = formatCliError(error.NoCommand);
+    try testing.expectEqualStrings(error_text, general_help_text);
+}
+
+test "isHelpFlag recognizes --help and -h" {
+    try testing.expect(isHelpFlag("--help") == true);
+    try testing.expect(isHelpFlag("-h") == true);
+    try testing.expect(isHelpFlag("help") == false);
+    try testing.expect(isHelpFlag("--version") == false);
+    try testing.expect(isHelpFlag("parse") == false);
+    try testing.expect(isHelpFlag("") == false);
+}
+
+test "helpScan detects help flags in array" {
+    try testing.expect(helpScan(&.{"--help"}) == true);
+    try testing.expect(helpScan(&.{"-h"}) == true);
+    try testing.expect(helpScan(&.{ "parse", "--help" }) == true);
+    try testing.expect(helpScan(&.{ "parse", "file.zig", "-h", "-g", "grammar.toml" }) == true);
+    try testing.expect(helpScan(&.{ "parse", "file.zig" }) == false);
+    try testing.expect(helpScan(&.{"--version"}) == false);
+    try testing.expect(helpScan(&.{}) == false);
+}
+
+test "parseSubcommand maps subcommands correctly" {
+    try testing.expect(parseSubcommand("parse") == .parse);
+    try testing.expect(parseSubcommand("parse-dir") == .parse_dir);
+    try testing.expect(parseSubcommand("query") == .query);
+    try testing.expect(parseSubcommand("help") == null);
+    try testing.expect(parseSubcommand("version") == null);
+    try testing.expect(parseSubcommand("--help") == null);
+    try testing.expect(parseSubcommand("foo") == null);
+    try testing.expect(parseSubcommand("") == null);
 }

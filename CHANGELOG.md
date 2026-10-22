@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `--names-only` output no longer emits a spurious trailing blank line. The unconditional end-of-main newline is now guarded on `!parsed.names_only`, fixing the off-by-one `wc -l` vs `grep -c .` mismatch and making zero-match names-only output exactly 0 bytes. (Issue #21)
+
 ## [0.2.0] - 2026-08-21
 
 ### Changed
