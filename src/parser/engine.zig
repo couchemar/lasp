@@ -702,7 +702,12 @@ fn bufferCandidate(
             };
         }
     }
-    const confidence = events_mod.computeConfidence(matched_weights, max_score, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
+    // Compute evidence confidence, then apply the per-pattern prior as a multiplier
+    // clamped to [0, 1]. Prior defaults to 1.0 (no-op) when the pattern is not found
+    // or declares no prior.
+    const evidence_confidence = events_mod.computeConfidence(matched_weights, max_score, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
+    const prior: f32 = if (pattern) |p| p.prior else 1.0;
+    const confidence = std.math.clamp(evidence_confidence * prior, 0.0, 1.0);
 
     if (confidence < 0.3) {
         return false;
@@ -5165,6 +5170,219 @@ test "property: span scan advances the token index monotonically" {
                 try testing.expect(stream.tokens[scan.next_index].start >= scan.span_end);
             }
             try testing.expectEqual(stream.source.len, scan.span_end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Per-Pattern Priors (spec: per-pattern-priors) ---
+
+fn priorPattern(seq: *[2]loader.SequenceElement, prior: f32) loader.Pattern {
+    seq[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
+    seq[1] = .{ .matcher = .{ .identifier = {} } };
+    return .{ .type_name = "decl", .sequence = seq, .captures = &.{}, .prior = prior };
+}
+
+test "parse: prior 1.0 yields confidence identical to no prior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq_prior: [2]loader.SequenceElement = undefined;
+    var seq_bare: [2]loader.SequenceElement = undefined;
+    const patterns_prior = &[_]loader.Pattern{priorPattern(&seq_prior, 1.0)};
+    const patterns_bare = &[_]loader.Pattern{priorPattern(&seq_bare, 1.0)};
+    const auto_prior = try compiler.compile(patterns_prior, alloc);
+    const auto_bare = try compiler.compile(patterns_bare, alloc);
+
+    // Relaxed keyword (identifier token for "fn") so confidence < 1 and observable.
+    const items = [_]TestTokenItem{ idItem("fn"), idItem("x") };
+    const stream = try buildStream(alloc, &items);
+    const res_prior = try parse(auto_prior, stream.tokens, stream.source, patterns_prior, .{}, .{}, alloc);
+    const res_bare = try parse(auto_bare, stream.tokens, stream.source, patterns_bare, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), res_prior.len);
+    try testing.expectEqual(@as(usize, 1), res_bare.len);
+    try testing.expectApproxEqRel(res_bare[0].confidence, res_prior[0].confidence, 0.001);
+}
+
+test "parse: demoting prior drops match below 0.3" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [2]loader.SequenceElement = undefined;
+    const patterns = &[_]loader.Pattern{priorPattern(&seq, 0.4)};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{ idItem("fn"), idItem("x") };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    // Evidence ≈ 0.5 × 0.4 = 0.2 < 0.3 → dropped.
+    try testing.expectEqual(@as(usize, 0), result.len);
+
+    // Milder prior keeps it visible at reduced confidence.
+    const patterns_mild = &[_]loader.Pattern{priorPattern(&seq, 0.8)};
+    const auto_mild = try compiler.compile(patterns_mild, alloc);
+    const result_mild = try parse(auto_mild, stream.tokens, stream.source, patterns_mild, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result_mild.len);
+    try testing.expect(result_mild[0].confidence < 1.0);
+    try testing.expect(result_mild[0].confidence >= 0.3);
+}
+
+// Feature: per-pattern-priors, Property 1: Default prior is a no-op
+// **Validates: Requirements 1.2, 3.2, 7.1**
+test "property: default prior is a no-op" {
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: [2]loader.SequenceElement = undefined;
+            seq[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
+            seq[1] = .{ .matcher = .{ .identifier = {} } };
+            const patterns_implicit = &[_]loader.Pattern{.{
+                .type_name = "decl",
+                .sequence = &seq,
+                .captures = &.{},
+            }};
+            const patterns_explicit = &[_]loader.Pattern{.{
+                .type_name = "decl",
+                .sequence = &seq,
+                .captures = &.{},
+                .prior = 1.0,
+            }};
+            const auto_a = try compiler.compile(patterns_implicit, alloc);
+            const auto_b = try compiler.compile(patterns_explicit, alloc);
+
+            const items = [_]TestTokenItem{ idItem("fn"), idItem(word) };
+            const stream = try buildStream(alloc, &items);
+            const res_a = try parse(auto_a, stream.tokens, stream.source, patterns_implicit, .{}, .{}, alloc);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_explicit, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), res_a.len);
+            try testing.expectEqual(@as(usize, 1), res_b.len);
+            try testing.expectApproxEqRel(res_a[0].confidence, res_b[0].confidence, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: per-pattern-priors, Property 2: Monotonic demotion
+// **Validates: Requirements 3.1, 3.3**
+test "property: monotonic demotion" {
+    const tuple_gen = comptime gen.tuple2(
+        u16,
+        []const u8,
+        gen.intRange(u16, 1, 99),
+        gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+    );
+
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u16, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const prior: f32 = @as(f32, @floatFromInt(vals[0])) / 100.0;
+            var seq_p: [2]loader.SequenceElement = undefined;
+            var seq_b: [2]loader.SequenceElement = undefined;
+            const patterns_p = &[_]loader.Pattern{priorPattern(&seq_p, prior)};
+            const patterns_b = &[_]loader.Pattern{priorPattern(&seq_b, 1.0)};
+            const auto_p = try compiler.compile(patterns_p, alloc);
+            const auto_b = try compiler.compile(patterns_b, alloc);
+
+            const items = [_]TestTokenItem{ idItem("fn"), idItem(vals[1]) };
+            const stream = try buildStream(alloc, &items);
+            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, alloc);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), res_b.len);
+            if (res_p.len == 1) {
+                const evidence = res_b[0].confidence;
+                try testing.expect(res_p[0].confidence < evidence);
+            } else {
+                // Demoted below threshold: absent.
+                try testing.expect(0.3 > res_b[0].confidence * prior);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: per-pattern-priors, Property 3: Bounded boost
+// **Validates: Requirements 3.1, 3.4**
+test "property: bounded boost" {
+    const tuple_gen = comptime gen.tuple2(
+        u16,
+        []const u8,
+        gen.intRange(u16, 100, 200),
+        gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+    );
+
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u16, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const prior: f32 = @as(f32, @floatFromInt(vals[0])) / 100.0;
+            var seq_p: [2]loader.SequenceElement = undefined;
+            var seq_b: [2]loader.SequenceElement = undefined;
+            const patterns_p = &[_]loader.Pattern{priorPattern(&seq_p, prior)};
+            const patterns_b = &[_]loader.Pattern{priorPattern(&seq_b, 1.0)};
+            const auto_p = try compiler.compile(patterns_p, alloc);
+            const auto_b = try compiler.compile(patterns_b, alloc);
+
+            const items = [_]TestTokenItem{ idItem("fn"), idItem(vals[1]) };
+            const stream = try buildStream(alloc, &items);
+            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, alloc);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), res_p.len);
+            try testing.expectEqual(@as(usize, 1), res_b.len);
+            try testing.expect(res_p[0].confidence >= res_b[0].confidence);
+            try testing.expect(res_p[0].confidence <= 1.0);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: per-pattern-priors, Property 5: Threshold interaction
+// **Validates: Requirements 4.1, 4.2, 4.3, 9.2, 9.3**
+test "property: threshold interaction" {
+    const tuple_gen = comptime gen.tuple2(
+        u16,
+        []const u8,
+        gen.intRange(u16, 1, 200),
+        gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+    );
+
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u16, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const prior: f32 = @as(f32, @floatFromInt(vals[0])) / 100.0;
+            var seq_p: [2]loader.SequenceElement = undefined;
+            var seq_b: [2]loader.SequenceElement = undefined;
+            const patterns_p = &[_]loader.Pattern{priorPattern(&seq_p, prior)};
+            const patterns_b = &[_]loader.Pattern{priorPattern(&seq_b, 1.0)};
+            const auto_p = try compiler.compile(patterns_p, alloc);
+            const auto_b = try compiler.compile(patterns_b, alloc);
+
+            const items = [_]TestTokenItem{ idItem("fn"), idItem(vals[1]) };
+            const stream = try buildStream(alloc, &items);
+            const res_b = try parse(auto_b, stream.tokens, stream.source, patterns_b, .{}, .{}, alloc);
+            const res_p = try parse(auto_p, stream.tokens, stream.source, patterns_p, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), res_b.len);
+            const evidence = res_b[0].confidence;
+            const final: f32 = std.math.clamp(evidence * prior, 0.0, 1.0);
+            if (final < 0.3) {
+                try testing.expectEqual(@as(usize, 0), res_p.len);
+            } else {
+                try testing.expectEqual(@as(usize, 1), res_p.len);
+                try testing.expectApproxEqRel(final, res_p[0].confidence, 0.001);
+            }
         }
     }.prop, .{ .num_runs = 100 });
 }

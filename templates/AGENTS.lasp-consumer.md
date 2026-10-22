@@ -247,6 +247,15 @@ block = 0.3
 relaxed_keyword = 0.1
 ```
 
+### Per-pattern prior (optional)
+A `prior` key on a pattern multiplies its confidence: `final = clamp(evidence × prior, 0, 1)`. Range `(0.0, 2.0]`, default `1.0` (no-op). Use it to soft-demote a likely-false interpretation (below `1.0`) or boost a weak-but-likely one (above `1.0`) without hard blacklists — a strong-enough demotion drops the match below the `0.3` filter.
+```toml
+[[patterns]]
+type = "call"
+sequence = ["$callee:IDENTIFIER", "("]
+prior = 0.8
+```
+
 ### Grammar authoring tips
 1. Keep patterns short — `"fn" IDENTIFIER "("` is ideal; don't try to match full argument lists.
 2. Start patterns with a distinct keyword (`fn`, `class`, `import`) to avoid ambiguity.

@@ -313,6 +313,15 @@ sequence = ["Config:IDENTIFIER", ".", "$method:IDENTIFIER", "("]
 ```
 This matches only when the identifier text is exactly `"Config"`. Unlike keyword literals, this matches `.identifier` tokens — useful for names that aren't language keywords.
 
+### Prior (per-pattern confidence multiplier)
+An optional `prior` key on a `[[patterns]]` entry scales that pattern's evidence confidence: `final = clamp(evidence × prior, 0, 1)`, applied before the 0.3 filter and before competing-candidate selection. Range `(0.0, 2.0]`, default `1.0` (exact no-op). Below 1.0 demotes an interpretation (mild demotion keeps it visible at reduced confidence; strong demotion can drop it below the 0.3 filter); above 1.0 boosts toward — never past — 1.0. Use it to disambiguate identical-sequence interpretations (e.g. a column-0 `function` at `prior = 0.9` vs `call` at `0.5`) without hard blacklists.
+
+```toml
+[[patterns]]
+type = "call"
+sequence = ["$callee:IDENTIFIER", "("]
+prior = 0.5
+```
 ### Same-Type Pattern Union
 Multiple `[[patterns]]` entries sharing the same `type` name act as **alternatives of one type**: an occurrence matching any alternative emits a single event of that shared type. Overlapping alternatives collapse to one primary event (highest confidence → longest match → grammar order); if one alternative's sequence is a prefix of another's and the source matches the longer form, the longer form wins. A union of alternatives and an equivalent optional-tail pattern produce the same type, captures, and source region. Works for any type name — no new flags, grammar keys, or JSON fields.
 

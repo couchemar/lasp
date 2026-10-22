@@ -1,0 +1,4 @@
+[[patterns]]
+type = "t"
+sequence = ["identifier"]
+prior = 2.5

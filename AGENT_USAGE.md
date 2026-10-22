@@ -395,10 +395,20 @@ block_close = "-}"
 | `"$name:IDENTIFIER(sep=\".\")"` | Captures a separator-joined path (`A.B.C`); separator matched by source-byte adjacency, so `"::"` works whether or not the tokenizer splits it |
 | `"$name:IDENTIFIER(suffix=\"!?\")"` | Absorbs at most one trailing character from the set (`foo!`) |
 | `"$name:IDENTIFIER(sep=\".\", suffix=\"!?\")"` | Both — qualified path with optional trailing sigil |
-| `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
-| `"fn?"` | Optional keyword — boosts confidence when present |
-| `"(?"` | Optional symbol — boosts confidence when present |
 | Same `type` on multiple `[[patterns]]` | Alternatives of one type; overlap collapses to longest match → grammar order |
+
+### Prior (per-pattern confidence multiplier)
+
+An optional `prior` key on a `[[patterns]]` entry multiplies that pattern's evidence confidence: `final = clamp(evidence × prior, 0, 1)`, applied before the 0.3 filter and before competing-candidate selection. Valid range `(0.0, 2.0]`, default `1.0` (exact no-op). Below 1.0 demotes an interpretation (mild demotion keeps it visible at reduced confidence; strong demotion can drop it below the 0.3 filter); above 1.0 boosts toward — never past — 1.0.
+
+```toml
+[[patterns]]
+type = "call"
+sequence = ["$callee:IDENTIFIER", "("]
+prior = 0.5
+```
+
+Use it to disambiguate identical-sequence interpretations (e.g. a column-0 `function` at `prior = 0.9` vs `call` at `0.5`) without hard blacklists. Out-of-range or non-numeric values are grammar errors.
 
 ## Workflow: Analyze an Unfamiliar Codebase
 

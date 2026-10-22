@@ -52,6 +52,7 @@ pub const Pattern = struct {
     captures: []const Capture,
     position: ?PositionConstraint = null,
     constraints: []const Constraint = &.{},
+    prior: f32 = 1.0,
 };
 
 pub const TokenMatcher = union(enum) {
@@ -99,6 +100,7 @@ pub const GrammarError = error{
     InvalidCaptureFormat,
     InvalidPositionValue,
     InvalidWeightValue,
+    InvalidPriorValue,
     InvalidConstraintType,
     InvalidConstraintDepth,
     InvalidConstraintField,
@@ -319,6 +321,14 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
                     }
                 }
                 break :blk null;
+            },
+            .prior = blk: {
+                if (pattern_table.get("prior")) |v| {
+                    const val = tomlToF32(v) orelse return error.InvalidPriorValue;
+                    if (val <= 0.0 or val > 2.0) return error.InvalidPriorValue;
+                    break :blk val;
+                }
+                break :blk 1.0;
             },
             .constraints = blk: {
                 // Reject deprecated fields
@@ -565,6 +575,11 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
             switch (pos) {
                 .start => try w.writeAll("position = \"start\"\n"),
             }
+        }
+
+        // prior field (only when non-default)
+        if (pattern.prior != 1.0) {
+            try w.print("prior = {d}\n", .{pattern.prior});
         }
 
         // constraints
@@ -3473,4 +3488,147 @@ test "formatGrammar: emits canonical parameter lists" {
     try testing.expect(std.mem.indexOf(u8, formatted, "$d:IDENTIFIER(sep=\\\"::\\\", suffix=\\\"!?\\\")") != null);
     // Bare capture has no parameter list.
     try testing.expect(std.mem.indexOf(u8, formatted, "$a:IDENTIFIER(") == null);
+}
+
+// Feature: per-pattern-priors, Unit: prior parsing and validation
+// **Validates: Requirements 1.1, 1.2, 1.3, 2.1, 2.2, 2.3, 2.4**
+test "parseGrammar: prior parsing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        const source =
+            \\[[patterns]]
+            \\type = "t"
+            \\sequence = ["identifier"]
+            \\prior = 0.5
+        ;
+        const grammar = try parseGrammar(source, alloc);
+        try testing.expectApproxEqRel(@as(f32, 0.5), grammar.patterns[0].prior, 0.001);
+    }
+    {
+        const source =
+            \\[[patterns]]
+            \\type = "t"
+            \\sequence = ["identifier"]
+            \\prior = 2
+        ;
+        const grammar = try parseGrammar(source, alloc);
+        try testing.expectApproxEqRel(@as(f32, 2.0), grammar.patterns[0].prior, 0.001);
+    }
+    {
+        const source =
+            \\[[patterns]]
+            \\type = "t"
+            \\sequence = ["identifier"]
+        ;
+        const grammar = try parseGrammar(source, alloc);
+        try testing.expectApproxEqRel(@as(f32, 1.0), grammar.patterns[0].prior, 0.001);
+    }
+}
+
+test "parseGrammar: invalid prior values rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const bad = [_][]const u8{ "0.0", "-0.1", "2.5", "\"x\"" };
+    for (bad) |val| {
+        const source = try std.fmt.allocPrint(alloc,
+            "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {s}\n",
+            .{val});
+        const result = parseGrammar(source, alloc);
+        try testing.expectError(error.InvalidPriorValue, result);
+    }
+}
+
+// Feature: per-pattern-priors, Property 4: Prior validation accepts in-range and rejects out-of-range
+// **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
+test "property: prior validation accepts in-range and rejects out-of-range" {
+    const tuple_gen = comptime gen.tuple2(
+        i32,
+        u8,
+        gen.intRange(i32, -50, 50),
+        gen.intRange(u8, 0, 2),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { i32, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const value: f32 = 1.0 + @as(f32, @floatFromInt(vals[0])) / 50.0;
+            const text: []const u8 = switch (vals[1]) {
+                0 => try std.fmt.allocPrint(alloc, "{d}", .{value}),
+                1 => try std.fmt.allocPrint(alloc, "0", .{}),
+                else => "\"x\"",
+            };
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {s}\n",
+                .{text});
+            const result = parseGrammar(source, alloc);
+            const valid = vals[1] == 0 and value > 0.0 and value <= 2.0;
+            if (valid) {
+                const grammar = try result;
+                try testing.expectApproxEqRel(value, grammar.patterns[0].prior, 0.001);
+            } else {
+                try testing.expectError(error.InvalidPriorValue, result);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: per-pattern-priors, Property 6: Round-trip preserves prior
+// **Validates: Requirements 6.1, 6.2, 6.3**
+test "property: round-trip preserves prior" {
+    const prior_val_gen = gen.intRange(u16, 1, 200);
+
+    try minish.check(testing.allocator, prior_val_gen, struct {
+        fn prop(pct: u16) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const prior: f32 = @as(f32, @floatFromInt(pct)) / 100.0;
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {d}\n",
+                .{prior});
+            const grammar = try parseGrammar(source, alloc);
+            const formatted = try formatGrammar(grammar, alloc);
+            const re = try parseGrammar(formatted, alloc);
+            try testing.expectApproxEqRel(prior, re.patterns[0].prior, 0.001);
+
+            // Default prior omits the key; re-parse restores 1.0.
+            const source_default = "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n";
+            const def = try parseGrammar(source_default, alloc);
+            const formatted_def = try formatGrammar(def, alloc);
+            try testing.expect(std.mem.indexOf(u8, formatted_def, "prior =") == null);
+            const re_def = try parseGrammar(formatted_def, alloc);
+            try testing.expectApproxEqRel(@as(f32, 1.0), re_def.patterns[0].prior, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+test "formatGrammar: prior emitted before constraints and only when non-default" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\prior = 0.4
+        \\[[patterns.constraints]]
+        \\type = "not"
+        \\depth = 1
+        \\values = ["fun"]
+    ;
+    const grammar = try parseGrammar(source, alloc);
+    const formatted = try formatGrammar(grammar, alloc);
+    const prior_pos = std.mem.indexOf(u8, formatted, "prior = 0.4").?;
+    const constraints_pos = std.mem.indexOf(u8, formatted, "[[patterns.constraints]]").?;
+    try testing.expect(prior_pos < constraints_pos);
 }

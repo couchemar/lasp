@@ -109,6 +109,7 @@ pub fn main(init: std.process.Init) !void {
                     error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
                     error.InvalidPositionValue => "invalid position value, expected 'start'",
                     error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+                    error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
                     error.InvalidConstraintType => "invalid constraint type",
                     error.InvalidConstraintDepth => "invalid constraint depth",
                     error.InvalidConstraintField => "invalid constraint field",
@@ -178,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
                         error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
                         error.InvalidPositionValue => "invalid position value, expected 'start'",
                         error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
-                        error.InvalidConstraintType => "invalid constraint type",
+                        error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
                         error.InvalidConstraintDepth => "invalid constraint depth",
                         error.InvalidConstraintField => "invalid constraint field",
                         error.InvalidConstraintValues => "invalid constraint values",
@@ -1793,4 +1794,47 @@ test "integration: number primitive emits events end-to-end" {
     try std.testing.expectEqualStrings("decl", json_events.array.items[1].object.get("type").?.string);
     try std.testing.expectEqual(@as(f64, 1.0), json_events.array.items[1].object.get("confidence").?.float);
     try std.testing.expectEqualStrings("x", json_events.array.items[1].object.get("name").?.string);
+}
+
+// Feature: per-pattern-priors, Integration: out-of-range prior is rejected with a
+// descriptive message for both parse and query (Requirement 2.5).
+test "integration: invalid prior value rejected with descriptive message" {
+    const allocator = std.testing.allocator;
+
+    {
+        const result = try runLasp(allocator, &.{
+            "parse",
+            "tests/fixtures/sample.zig",
+            "--grammar",
+            "tests/fixtures/grammars/bad_prior.toml",
+        });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        switch (result.term) {
+            .exited => |code| try std.testing.expect(code != 0),
+            else => {},
+        }
+        try std.testing.expect(std.mem.containsAtLeast(u8, result.stderr, 1, "prior must be greater than 0.0 and at most 2.0"));
+    }
+
+    {
+        const result = try runLasp(allocator, &.{
+            "query",
+            "function",
+            "tests/fixtures/sample.zig",
+            "-g",
+            "tests/fixtures/grammars/bad_prior.toml",
+        });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        switch (result.term) {
+            .exited => |code| try std.testing.expect(code != 0),
+            else => {},
+        }
+        try std.testing.expect(std.mem.containsAtLeast(u8, result.stderr, 1, "prior must be greater than 0.0 and at most 2.0"));
+    }
 }
