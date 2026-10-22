@@ -342,6 +342,27 @@ relaxed_keyword = 0.1
 
 Omitted keys use defaults. Negative values are rejected.
 
+### Comment syntax
+
+Declare the language's comment prefixes so the tokenizer recognizes comments at runtime. Omit the section for default C-style comments (`//`, `#`, `/* */`):
+
+```toml
+[comments]
+line = ["%"]              # Erlang: % line comments
+```
+
+```toml
+[comments]
+line = ["--"]             # Lua / SQL
+block_open = "{-"         # Haskell block comments
+block_close = "-}"
+```
+
+- `line`: up to 16 prefixes, each 1–8 chars; a line comment runs to end-of-line.
+- `block_open`/`block_close`: 1–8 chars, must be supplied together (one alone is an error); unclosed block comments extend to EOF.
+- Longest match wins for overlapping prefixes (`-` vs `--`).
+- Declaring the right prefix (e.g. Erlang `%`) fixes the apostrophe-in-comment bug — a `'` inside a comment no longer opens a spurious string that swallows later code.
+
 ### Sequence elements
 
 | Element | Matches |
@@ -416,6 +437,11 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | Missing `[[patterns]]` | stderr message, non-zero exit |
 | Invalid `position` value | stderr message, non-zero exit |
 | Negative weight value | stderr message, non-zero exit |
+| `[comments] line` not an array of strings | stderr message, non-zero exit |
+| `[comments]` block delimiter with wrong type | stderr message, non-zero exit |
+| `[comments]` only one of `block_open`/`block_close` | stderr message, non-zero exit |
+| `[comments]` prefix or delimiter longer than 8 chars | stderr message, non-zero exit |
+| `[comments]` more than 16 line prefixes | stderr message, non-zero exit |
 | Deprecated `exclude`/`not_preceded_by` field | stderr message, non-zero exit |
 | `--node` without value | stderr message, non-zero exit |
 | `query` without selector | stderr message, non-zero exit |

@@ -13,7 +13,7 @@ LASP is a language-agnostic structural parser CLI ("jq for code structure"). It 
 ```bash
 nix develop          # dev shell (Zig 0.16.0)
 zig build            # binary at zig-out/bin/lasp
-zig build test       # ALL tests (308) — bare `zig test src/*.zig` does NOT work
+zig build test       # ALL tests (405) — bare `zig test src/*.zig` does NOT work
 nix build            # ReleaseSafe build at ./result/bin/lasp
 lasp --version       # semver, sourced from build.zig.zon
 ```

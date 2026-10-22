@@ -109,13 +109,24 @@ pub fn main(init: std.process.Init) !void {
                     error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
                     error.InvalidPositionValue => "invalid position value, expected 'start'",
                     error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+                    error.InvalidConstraintType => "invalid constraint type",
+                    error.InvalidConstraintDepth => "invalid constraint depth",
+                    error.InvalidConstraintField => "invalid constraint field",
+                    error.InvalidConstraintValues => "invalid constraint values",
+                    error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
+                    error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
+                    error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
+                    error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
+                    error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
+                    error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
+                    error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
                     error.OutOfMemory => "out of memory",
                     else => "unknown grammar error",
                 };
                 std.process.fatal("error: {s}: {s}", .{ msg, gp });
             };
             const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-            const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
+            const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
             const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
 
             // Parse selector string into QueryFilter
@@ -167,13 +178,24 @@ pub fn main(init: std.process.Init) !void {
                         error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
                         error.InvalidPositionValue => "invalid position value, expected 'start'",
                         error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+                        error.InvalidConstraintType => "invalid constraint type",
+                        error.InvalidConstraintDepth => "invalid constraint depth",
+                        error.InvalidConstraintField => "invalid constraint field",
+                        error.InvalidConstraintValues => "invalid constraint values",
+                        error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
+                        error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
+                        error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
+                        error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
+                        error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
+                        error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
+                        error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
                         error.OutOfMemory => "out of memory",
                         else => "unknown grammar error",
                     };
                     std.process.fatal("error: {s}: {s}", .{ msg, gp });
                 };
                 const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-                const tokens = try tokenizer.tokenize(source, grammar.keyword_table, allocator);
+                const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
                 var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, allocator);
 
                 // Apply node filter if specified
@@ -201,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             } else {
                 // No grammar: raw token output
-                const tokens = try tokenizer.tokenize(source, null, allocator);
+                const tokens = try tokenizer.tokenize(source, null, .{}, allocator);
                 try json.serializeTokens(tokens, stdout);
             }
         },
@@ -1454,4 +1476,157 @@ test "preservation: --version prints 'lasp ' prefix ending in exactly one newlin
     try std.testing.expect(std.mem.startsWith(u8, out, "lasp "));
     try std.testing.expect(std.mem.endsWith(u8, out, "\n"));
     try std.testing.expect(!std.mem.endsWith(u8, out, "\n\n"));
+}
+
+// --- Integration Tests for Configurable Comment Prefixes (Erlang) ---
+
+// Helper: load a grammar file and tokenize source through the real
+// loader -> tokenizer path, returning tokens. Uses an arena owned by the caller.
+fn tokenizeWithGrammarFile(
+    arena: std.mem.Allocator,
+    grammar_path: []const u8,
+    source: []const u8,
+) ![]tokenizer.Token {
+    const grammar_source = try readSourceFile(std.testing.io, arena, grammar_path);
+    const grammar = try grammar_loader.parseGrammar(grammar_source, arena);
+    return try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, arena);
+}
+
+test "integration: Erlang % lines produce comment tokens with erlang.toml" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const source = "% first comment\nfoo() -> ok.\n% second comment\n";
+    const tokens = try tokenizeWithGrammarFile(a, "examples/grammars/erlang.toml", source);
+
+    var comment_count: usize = 0;
+    for (tokens) |tok| {
+        if (tok.kind == .comment) comment_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), comment_count);
+}
+
+test "integration: Erlang % comment line is a single token, not many operators" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A single comment line. Pre-fix, `%` was tokenized as many operator tokens.
+    const comment_line = "% a longer comment line with many words and symbols: foo/1 bar/2";
+    const source = comment_line ++ "\n";
+    const tokens = try tokenizeWithGrammarFile(a, "examples/grammars/erlang.toml", source);
+
+    // Exactly one comment token, no operator tokens from the comment content.
+    var comment_count: usize = 0;
+    var operator_count: usize = 0;
+    var comment_tok: ?tokenizer.Token = null;
+    for (tokens) |tok| {
+        switch (tok.kind) {
+            .comment => {
+                comment_count += 1;
+                comment_tok = tok;
+            },
+            .operator => operator_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), comment_count);
+    try std.testing.expectEqual(@as(usize, 0), operator_count);
+
+    // The single comment token spans the whole comment line.
+    try std.testing.expect(comment_tok != null);
+    try std.testing.expectEqualStrings(comment_line, source[comment_tok.?.start..comment_tok.?.end]);
+}
+
+test "integration: Zig grammar (no [comments]) does not treat % as a comment" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Zig grammar has no [comments] section -> default C-style prefixes.
+    // A line beginning with `%` must NOT become a comment token.
+    const source = "% not a comment in zig\n";
+    const tokens = try tokenizeWithGrammarFile(a, "examples/grammars/zig.toml", source);
+
+    for (tokens) |tok| {
+        try std.testing.expect(tok.kind != .comment);
+    }
+}
+
+test "integration: Zig grammar still parses sample.zig (no regression)" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "examples/grammars/zig.toml" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const json_events = parsed.value.object.get("events").?;
+    try std.testing.expect(json_events.array.items.len > 0);
+}
+
+test "integration: Erlang % comment via stdin tokenizes as single comment token" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Mirror the stdin-fed source `% hello` through the real loader+tokenizer
+    // path (the CLI emits structural events, never tokens, when a grammar is set).
+    const source = "% hello";
+    const tokens = try tokenizeWithGrammarFile(a, "examples/grammars/erlang.toml", source);
+
+    var comment_count: usize = 0;
+    for (tokens) |tok| {
+        if (tok.kind == .comment) comment_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), comment_count);
+}
+
+test "integration: Erlang % comment via CLI stdin pipe does not break parsing" {
+    // Complementary CLI-level assertion for the actual `echo '...' | lasp parse -`
+    // pipe. With a grammar set the CLI emits structural events, so we assert the
+    // end-to-end effect: a leading `%` comment line is consumed (not mis-parsed)
+    // and the following column-0 function head is still detected.
+    const allocator = std.testing.allocator;
+    const source = "% hello\nfoo() -> ok.\n";
+
+    const result = try runLaspWithStdin(allocator, &.{ "parse", "-", "--grammar", "examples/grammars/erlang.toml", "--node", "function", "--names-only" }, source);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    // Exactly one function head (`foo`) survives the comment line.
+    var count: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "integration: apostrophe-in-comment does not swallow Erlang function heads" {
+    // CORE REGRESSION (TODO Issues #9/#18): comments containing apostrophes
+    // must not open a string that swallows the following code. With the
+    // `%`-comment erlang.toml, ALL column-0 function heads must be detected.
+    // The fixture authors exactly 6 function definitions at column 0.
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/comments.erl", "--grammar", "examples/grammars/erlang.toml", "--node", "function", "--names-only" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    // Count non-empty lines (one function name per line).
+    var count: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), count);
 }

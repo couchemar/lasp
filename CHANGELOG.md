@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Configurable comment prefixes via a `[comments]` grammar section: `line` (array of 1–8-char line-comment prefixes, up to 16) and paired `block_open`/`block_close` delimiters. The tokenizer uses these at runtime instead of hardcoded `//`/`#`/`/* */`, so any language's comment syntax (e.g. Erlang `%`, Lua `--`, Haskell `{- -}`) can be declared without recompiling. Grammars with no `[comments]` section keep the default C-style behavior byte-for-byte. `formatGrammar` round-trips the section. (Issues #9, #18)
+- `[comments] line = ["%"]` added to the example Erlang grammar.
+
 ### Fixed
 
+- Erlang (and any `%`-comment language): an apostrophe inside a line comment no longer opens a spurious string literal that swallows all following code. Comment recognition now runs before string tokenization, so quote characters in comments stay comment content. Regression guard: all top-level function heads in a fixture with apostrophe-bearing `%%` comments are detected (6/6, previously 0/6). (Issues #9, #18)
+- Tokenizer integer overflow when computing the column of a multi-line block comment: the emitted token's `col`/`line` now reflect where the comment started, not where it ended.
 - `--names-only` output no longer emits a spurious trailing blank line. The unconditional end-of-main newline is now guarded on `!parsed.names_only`, fixing the off-by-one `wc -l` vs `grep -c .` mismatch and making zero-match names-only output exactly 0 bytes. (Issue #21)
 
 ## [0.2.0] - 2026-08-21

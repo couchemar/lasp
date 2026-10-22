@@ -48,3 +48,6 @@ sequence = ["-record", "(", "$name:IDENTIFIER"]
 [blocks]
 open = "begin"
 close = "end"
+
+[comments]
+line = ["%"]

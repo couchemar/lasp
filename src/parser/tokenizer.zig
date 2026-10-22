@@ -1,4 +1,5 @@
 const std = @import("std");
+const CommentConfig = @import("../grammar/loader.zig").CommentConfig;
 
 pub const TokenKind = enum {
     identifier,
@@ -20,6 +21,125 @@ pub const Token = struct {
     line: usize,
     col: usize,
 };
+
+/// Result of a comment match attempt
+const CommentMatch = struct {
+    /// End position (exclusive) of the comment
+    end: usize,
+    /// True if this was a block comment (spans multiple lines)
+    is_block: bool,
+    /// Number of newline characters within the comment
+    newline_count: usize,
+};
+
+/// Try to match a comment starting at position `start` in `source`.
+/// Returns `null` if no comment matches at this position, or a `CommentMatch`
+/// with the end position (exclusive) and whether it's a block comment.
+/// Implements longest-match semantics: returns the match with longest prefix.
+/// For ties of equal length, prefers line prefixes over block delimiter.
+fn tryMatchComment(source: []const u8, start: usize, config: CommentConfig) ?CommentMatch {
+    // Short-circuit if we're at EOF
+    if (start >= source.len) return null;
+
+    var best_match: ?CommentMatch = null;
+    var best_len: usize = 0;
+    var best_priority: u32 = 0; // Lower number = higher priority (0=line[0], 1=line[1], ..., large=block)
+
+    // Check all line comment prefixes first (in array order, lower priority number)
+    for (config.line_prefixes, 0..) |prefix, idx| {
+        if (std.mem.startsWith(u8, source[start..], prefix)) {
+            // Found a line comment - scan to end of line or EOF
+            var pos = start + prefix.len;
+            while (pos < source.len and source[pos] != '\n') : (pos += 1) {}
+            // Include the newline in the comment? No - line comment ends at newline exclusive
+            const end = pos; // Don't include newline
+
+            // Priority: idx (0 for first line prefix, 1 for second, etc.)
+            const priority = @as(u32, @intCast(idx));
+
+            // Check if this is better than current best
+            // Longer prefix wins, or same length and lower priority number wins
+            const is_better = if (prefix.len > best_len) true else if (prefix.len == best_len and priority < best_priority) true else false;
+
+            if (is_better) {
+                best_len = prefix.len;
+                best_priority = priority;
+                best_match = CommentMatch{
+                    .end = end,
+                    .is_block = false,
+                    .newline_count = 0,
+                };
+            }
+        }
+    }
+
+    // Check block comment (has lower priority than all line prefixes)
+    if (config.block_open) |open| {
+        if (std.mem.startsWith(u8, source[start..], open)) {
+            const open_len = open.len;
+            const open_end = start + open_len;
+            var pos = open_end;
+            var newline_count: usize = 0;
+            var found_close = false;
+
+            if (config.block_close) |close| {
+                // Find matching close delimiter
+                while (pos <= source.len - close.len) {
+                    if (source[pos] == '\n') {
+                        newline_count += 1;
+                    }
+                    if (std.mem.startsWith(u8, source[pos..], close)) {
+                        // Found closing delimiter
+                        const end = pos + close.len;
+                        found_close = true;
+                        // Block priority is after all line prefixes
+                        const priority = @as(u32, @intCast(config.line_prefixes.len)) + 1;
+
+                        // Check if this is better than current best
+                        // Longer prefix wins, or same length and this has lower priority number
+                        // (but block always has higher priority number than line prefixes)
+                        const is_better = if (open_len > best_len) true else if (open_len == best_len and priority < best_priority) true else false;
+
+                        if (is_better) {
+                            best_len = open_len;
+                            best_priority = priority;
+                            best_match = CommentMatch{
+                                .end = end,
+                                .is_block = true,
+                                .newline_count = newline_count,
+                            };
+                        }
+                        break;
+                    }
+                    pos += 1;
+                }
+            }
+
+            if (!found_close) {
+                // No closing delimiter found - extend to EOF
+                // Count any newlines that we scanned before giving up
+                while (pos < source.len) {
+                    if (source[pos] == '\n') newline_count += 1;
+                    pos += 1;
+                }
+                const end = source.len;
+                const priority = @as(u32, @intCast(config.line_prefixes.len)) + 1;
+
+                if (open_len > best_len or (open_len == best_len and priority < best_priority)) {
+                    best_len = open_len;
+                    best_priority = priority;
+                    best_match = CommentMatch{
+                        .end = end,
+                        .is_block = true,
+                        .newline_count = newline_count,
+                    };
+                }
+            }
+        }
+    }
+
+    return best_match;
+}
 
 // --- Character classification helpers ---
 
@@ -69,10 +189,12 @@ fn isKeyword(text: []const u8, keyword_table: []const []const u8) bool {
 
 /// Tokenizes source bytes into an array of Tokens.
 /// Keywords are recognized via the optional keyword_table.
+/// Comment recognition uses the provided CommentConfig.
 /// All allocations use the provided allocator (arena).
 pub fn tokenize(
     source: []const u8,
     keyword_table: ?[]const []const u8,
+    comments: CommentConfig,
     allocator: std.mem.Allocator,
 ) ![]Token {
     if (source.len == 0) return &[_]Token{};
@@ -118,29 +240,34 @@ pub fn tokenize(
 
         at_line_start = false;
 
-        // Line comment: // or #
-        if (c == '#' or (c == '/' and i + 1 < source.len and source[i + 1] == '/')) {
+        // Try to match a comment (configurable)
+        if (tryMatchComment(source, i, comments)) |match| {
             const start = i;
-            while (i < source.len and source[i] != '\n') : (i += 1) {}
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line, .col = start - line_start });
-            continue;
-        }
+            i = match.end;
 
-        // Block comment: /* ... */
-        if (c == '/' and i + 1 < source.len and source[i + 1] == '*') {
-            const start = i;
-            i += 2;
-            while (i + 1 < source.len) {
-                if (source[i] == '*' and source[i + 1] == '/') {
-                    i += 2;
-                    break;
+            // Save the original line start and current line BEFORE updating them
+            const token_line_start = line_start;
+            const token_line = current_line;
+
+            // Update line tracking for block comments spanning multiple lines
+            if (match.is_block) {
+                current_line += match.newline_count;
+                // Need to find the start of the current line after the comment
+                // Start scanning from end of comment
+                var scan_pos = i;
+                line_start = i;
+                // Scan backwards to find the last newline before end of comment
+                while (scan_pos > 0) {
+                    scan_pos -= 1;
+                    if (source[scan_pos] == '\n') {
+                        line_start = scan_pos + 1;
+                        break;
+                    }
                 }
-                i += 1;
-            } else {
-                // Unclosed block comment — extend to end
-                i = source.len;
+                // If we didn't find a newline, line_start stays at i (start of line after comment)
             }
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = current_line, .col = start - line_start });
+
+            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = token_line, .col = start - token_line_start });
             continue;
         }
 
@@ -223,7 +350,17 @@ pub fn tokenize(
 const testing = std.testing;
 
 fn expectTokens(source: []const u8, keyword_table: ?[]const []const u8, expected: []const struct { kind: TokenKind, text: []const u8 }) !void {
-    const tokens = try tokenize(source, keyword_table, testing.allocator);
+    const tokens = try tokenize(source, keyword_table, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(expected.len, tokens.len);
+    for (expected, 0..) |exp, idx| {
+        try testing.expectEqual(exp.kind, tokens[idx].kind);
+        try testing.expectEqualStrings(exp.text, source[tokens[idx].start..tokens[idx].end]);
+    }
+}
+
+fn expectTokensWithConfig(source: []const u8, keyword_table: ?[]const []const u8, comments: CommentConfig, expected: []const struct { kind: TokenKind, text: []const u8 }) !void {
+    const tokens = try tokenize(source, keyword_table, comments, testing.allocator);
     defer testing.allocator.free(tokens);
     try testing.expectEqual(expected.len, tokens.len);
     for (expected, 0..) |exp, idx| {
@@ -352,7 +489,7 @@ test "tokenize indent at start of input" {
 }
 
 test "tokenize empty input" {
-    const tokens = try tokenize("", null, testing.allocator);
+    const tokens = try tokenize("", null, CommentConfig.default, testing.allocator);
     try testing.expectEqual(@as(usize, 0), tokens.len);
 }
 
@@ -385,11 +522,155 @@ test "tokenize mixed expression" {
     });
 }
 
+// --- Configurable Comment Unit Tests ---
+
+test "tokenize Erlang % line comment" {
+    const config = CommentConfig{ .line_prefixes = &.{"%"} };
+    try expectTokensWithConfig("% comment\nx", null, config, &.{
+        .{ .kind = .comment, .text = "% comment" },
+        .{ .kind = .newline, .text = "\n" },
+        .{ .kind = .identifier, .text = "x" },
+    });
+}
+
+test "tokenize Lua -- line comment" {
+    const config = CommentConfig{ .line_prefixes = &.{"--"} };
+    try expectTokensWithConfig("-- comment\nx", null, config, &.{
+        .{ .kind = .comment, .text = "-- comment" },
+        .{ .kind = .newline, .text = "\n" },
+        .{ .kind = .identifier, .text = "x" },
+    });
+}
+
+test "tokenize Haskell {- -} block comment" {
+    const config = CommentConfig{ .block_open = "{-", .block_close = "-}" };
+    try expectTokensWithConfig("{- block -}x", null, config, &.{
+        .{ .kind = .comment, .text = "{- block -}" },
+        .{ .kind = .identifier, .text = "x" },
+    });
+}
+
+test "tokenize mixed line + block config" {
+    const config = CommentConfig{ .line_prefixes = &.{ "%", "--" }, .block_open = "/*", .block_close = "*/" };
+    try expectTokensWithConfig("% line\n/* block */x", null, config, &.{
+        .{ .kind = .comment, .text = "% line" },
+        .{ .kind = .newline, .text = "\n" },
+        .{ .kind = .comment, .text = "/* block */" },
+        .{ .kind = .identifier, .text = "x" },
+    });
+}
+
+test "tokenize with CommentConfig.none produces zero comment tokens" {
+    const source = "// not a comment\n# also not";
+    const tokens = try tokenize(source, null, CommentConfig.none, testing.allocator);
+    defer testing.allocator.free(tokens);
+    for (tokens) |tok| {
+        try testing.expect(tok.kind != .comment);
+    }
+}
+
+test "tokenize comment with quote characters does not open string" {
+    const config = CommentConfig{ .line_prefixes = &.{"%"} };
+    try expectTokensWithConfig("% it's a comment with 'quotes'", null, config, &.{
+        .{ .kind = .comment, .text = "% it's a comment with 'quotes'" },
+    });
+}
+
+test "tokenize comment prefix inside string stays string content" {
+    const config = CommentConfig{ .line_prefixes = &.{"%"} };
+    try expectTokensWithConfig("\"foo % bar\"", null, config, &.{
+        .{ .kind = .string, .text = "\"foo % bar\"" },
+    });
+}
+
+test "tokenize unbalanced apostrophe in comment does not swallow subsequent code" {
+    const config = CommentConfig{ .line_prefixes = &.{"%"} };
+    try expectTokensWithConfig("% it's\nx = 1", null, config, &.{
+        .{ .kind = .comment, .text = "% it's" },
+        .{ .kind = .newline, .text = "\n" },
+        .{ .kind = .identifier, .text = "x" },
+        .{ .kind = .operator, .text = "=" },
+        .{ .kind = .number, .text = "1" },
+    });
+}
+
+test "tokenize real string literal unaffected by comment recognition" {
+    const config = CommentConfig{ .line_prefixes = &.{"%"} };
+    try expectTokensWithConfig("'atom'", null, config, &.{
+        .{ .kind = .string, .text = "'atom'" },
+    });
+}
+
+test "tokenize trailing line comment after code" {
+    const config = CommentConfig{ .line_prefixes = &.{"%"} };
+    try expectTokensWithConfig("foo() %% note", null, config, &.{
+        .{ .kind = .identifier, .text = "foo" },
+        .{ .kind = .delimiter, .text = "(" },
+        .{ .kind = .delimiter, .text = ")" },
+        .{ .kind = .comment, .text = "%% note" },
+    });
+}
+
+test "tokenize block comment at EOF without close delimiter" {
+    const config = CommentConfig{ .block_open = "/*", .block_close = "*/" };
+    try expectTokensWithConfig("/* stuff", null, config, &.{
+        .{ .kind = .comment, .text = "/* stuff" },
+    });
+}
+
+test "tokenize multi-line block comment increments line counter" {
+    const config = CommentConfig{ .block_open = "/*", .block_close = "*/" };
+    const source = "/* line1\n  line2\n  */x";
+    const tokens = try tokenize(source, null, config, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+    try testing.expectEqual(@as(usize, 0), tokens[0].start);
+    try testing.expectEqual(@as(usize, 21), tokens[0].end); // "/* line1\n  line2\n  */"
+    try testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+    try testing.expectEqual(@as(usize, 21), tokens[1].start); // "x" starts after comment
+}
+
+test "tokenize multi-line block comment col is relative to starting line" {
+    const config = CommentConfig{ .block_open = "/*", .block_close = "*/" };
+    // Comment starts at column 2 on line 1 and ends on line 3.
+    // The col/line must reflect where the token STARTED, not where it ended.
+    const source = "x /* a\nb\nc */ y";
+    const tokens = try tokenize(source, null, config, testing.allocator);
+    defer testing.allocator.free(tokens);
+    // tokens: identifier("x"), comment, identifier("y")
+    try testing.expectEqual(@as(usize, 3), tokens.len);
+    try testing.expectEqual(TokenKind.comment, tokens[1].kind);
+    try testing.expectEqual(@as(usize, 2), tokens[1].start);
+    try testing.expectEqual(@as(usize, 1), tokens[1].line); // starting line, not ending line
+    try testing.expectEqual(@as(usize, 2), tokens[1].col); // column on the starting line
+    // "y" sits on line 3 after "c */ "
+    try testing.expectEqual(TokenKind.identifier, tokens[2].kind);
+    try testing.expectEqual(@as(usize, 3), tokens[2].line);
+}
+
+test "tokenize partial prefix match does not trigger comment" {
+    const config = CommentConfig{ .line_prefixes = &.{"--"} };
+    try expectTokensWithConfig("- x", null, config, &.{
+        .{ .kind = .operator, .text = "-" },
+        .{ .kind = .identifier, .text = "x" },
+    });
+}
+
+test "tokenize longest match when overlapping prefixes" {
+    const config = CommentConfig{ .line_prefixes = &.{ "-", "--", "---" } };
+    try expectTokensWithConfig("--- comment\nx", null, config, &.{
+        .{ .kind = .comment, .text = "--- comment" },
+        .{ .kind = .newline, .text = "\n" },
+        .{ .kind = .identifier, .text = "x" },
+    });
+}
+
 // --- Column Tracking Unit Tests ---
 
 test "column tracking: first line tokens have col equal to start offset" {
     const source = "hello world";
-    const tokens = try tokenize(source, null, testing.allocator);
+    const tokens = try tokenize(source, null, CommentConfig.default, testing.allocator);
     defer testing.allocator.free(tokens);
     try testing.expectEqual(@as(usize, 2), tokens.len);
     // "hello" starts at byte 0
@@ -400,7 +681,7 @@ test "column tracking: first line tokens have col equal to start offset" {
 
 test "column tracking: tokens after newline have col relative to newline" {
     const source = "a\n  bc";
-    const tokens = try tokenize(source, null, testing.allocator);
+    const tokens = try tokenize(source, null, CommentConfig.default, testing.allocator);
     defer testing.allocator.free(tokens);
     // tokens: identifier("a"), newline, indent("  "), identifier("bc")
     try testing.expectEqual(@as(usize, 4), tokens.len);
@@ -412,7 +693,7 @@ test "column tracking: tokens after newline have col relative to newline" {
 
 test "column tracking: tab counts as 1 column (byte-level)" {
     const source = "\tx";
-    const tokens = try tokenize(source, null, testing.allocator);
+    const tokens = try tokenize(source, null, CommentConfig.default, testing.allocator);
     defer testing.allocator.free(tokens);
     // tokens: indent("\t"), identifier("x")
     try testing.expectEqual(@as(usize, 2), tokens.len);
@@ -422,7 +703,7 @@ test "column tracking: tab counts as 1 column (byte-level)" {
 
 test "column tracking: multiple lines with varying indentation" {
     const source = "fn add\n    x\n  y";
-    const tokens = try tokenize(source, null, testing.allocator);
+    const tokens = try tokenize(source, null, CommentConfig.default, testing.allocator);
     defer testing.allocator.free(tokens);
     // Line 1: "fn"(col=0) "add"(col=3)
     // newline(col=6)
@@ -451,7 +732,7 @@ test "property: column tracking correctness" {
 
     try minish.check(testing.allocator, source_gen, struct {
         fn prop(source: []const u8) !void {
-            const tokens = try tokenize(source, null, testing.allocator);
+            const tokens = try tokenize(source, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             for (tokens) |tok| {
@@ -483,7 +764,7 @@ test "property: token bounds invariant" { // For any source bytes, every token s
 
     try minish.check(testing.allocator, source_gen, struct {
         fn prop(source: []const u8) !void {
-            const tokens = try tokenize(source, null, testing.allocator);
+            const tokens = try tokenize(source, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             for (tokens) |tok| {
@@ -506,7 +787,7 @@ test "property: identifier classification" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "x {s} x", .{ident}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // Expect: identifier("x"), identifier(ident), identifier("x")
@@ -528,7 +809,7 @@ test "property: keyword classification correctness" {
             const input = std.fmt.bufPrint(&buf, "x {s} x", .{word}) catch return;
 
             const kw_table = &[_][]const u8{word};
-            const tokens = try tokenize(input, kw_table, testing.allocator);
+            const tokens = try tokenize(input, kw_table, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // Expect: identifier("x"), keyword(word), identifier("x")
@@ -543,7 +824,7 @@ test "property: keyword classification correctness" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "x {s} x", .{word}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             for (tokens) |tok| {
@@ -564,7 +845,7 @@ test "property: comment recognition" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "//{s}\n", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // First token should be .comment spanning from // to before \n
@@ -581,7 +862,7 @@ test "property: comment recognition" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "#{s}\n", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             try testing.expect(tokens.len >= 1);
@@ -597,7 +878,7 @@ test "property: comment recognition" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "/*{s}*/", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             try testing.expectEqual(@as(usize, 1), tokens.len);
@@ -619,7 +900,7 @@ test "property: string literal recognition" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "\"{s}\"", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             try testing.expectEqual(@as(usize, 1), tokens.len);
@@ -635,7 +916,7 @@ test "property: string literal recognition" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "'{s}'", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             try testing.expectEqual(@as(usize, 1), tokens.len);
@@ -652,7 +933,7 @@ test "property: string literal recognition" {
             // Build: "content\"content"
             const input = std.fmt.bufPrint(&buf, "\"{s}\\\"{s}\"", .{ content, content }) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             try testing.expectEqual(@as(usize, 1), tokens.len);
@@ -674,7 +955,7 @@ test "property: number literal recognition" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "x {s} x", .{digits}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // Expect: identifier("x"), number(digits), identifier("x")
@@ -697,7 +978,7 @@ test "property: number literal recognition" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "x {s}.{s} x", .{ parts[0], parts[1] }) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // Expect: identifier("x"), number(N.N), identifier("x")
@@ -723,7 +1004,7 @@ test "property: indent recognition" {
             // "\n<whitespace>x" — indent after newline
             const input = std.fmt.bufPrint(&buf, "\n{s}x", .{ws}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // Expect: newline, indent, identifier
@@ -749,7 +1030,7 @@ test "property: non-indentation whitespace skipping" {
             // "a<whitespace>b" — whitespace between tokens, not at line start
             const input = std.fmt.bufPrint(&buf, "a{s}b", .{ws}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // Should produce exactly two identifier tokens, no whitespace tokens
@@ -770,7 +1051,7 @@ test "property: unclosed construct resilience" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "\"{s}", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             // Should produce a string token extending to end of input
@@ -787,7 +1068,7 @@ test "property: unclosed construct resilience" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "'{s}", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             try testing.expect(tokens.len >= 1);
@@ -803,13 +1084,244 @@ test "property: unclosed construct resilience" {
             var buf: [256]u8 = undefined;
             const input = std.fmt.bufPrint(&buf, "/*{s}", .{content}) catch return;
 
-            const tokens = try tokenize(input, null, testing.allocator);
+            const tokens = try tokenize(input, null, CommentConfig.default, testing.allocator);
             defer testing.allocator.free(tokens);
 
             try testing.expect(tokens.len >= 1);
             const last = tokens[tokens.len - 1];
             try testing.expectEqual(TokenKind.comment, last.kind);
             try testing.expectEqual(input.len, last.end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 2: Line Comment Single Token Emission
+// **Validates: Requirements 3.1, 3.5**
+test "property: line comment single token emission" {
+    // Alphanumeric body keeps the comment on one line and avoids accidental
+    // secondary prefixes, so the "exactly one .comment token" assertion is deterministic.
+    const body_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, body_gen, struct {
+        fn prop(body: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "%{s}\n", .{body}) catch return;
+
+            const config = CommentConfig{ .line_prefixes = &.{"%"} };
+            const tokens = try tokenize(input, null, config, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // First token is the single comment, spanning prefix to EOL (exclusive of \n).
+            try testing.expect(tokens.len >= 1);
+            try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(1 + body.len, tokens[0].end); // "%" (len 1) + body
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 3: Default Config Behavioral Equivalence
+// **Validates: Requirements 2.1, 2.2**
+test "property: default config behavioral equivalence" {
+    // Invariant check against the DOCUMENTED default behavior (// and # line comments to EOL,
+    // /* */ block comments). There is no removed hardcoded path to diff against — the
+    // assertions describe default comment semantics structurally. If a generated source makes
+    // the tokenizer disagree with this invariant, that is a possible production bug — report,
+    // do NOT patch.
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 256, .charset = .ascii });
+
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(source: []const u8) !void {
+            const tokens = try tokenize(source, null, CommentConfig.default, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            for (tokens) |tok| {
+                if (tok.kind != .comment) continue;
+                const text = source[tok.start..tok.end];
+                const is_line = std.mem.startsWith(u8, text, "//") or std.mem.startsWith(u8, text, "#");
+                const is_block = std.mem.startsWith(u8, text, "/*");
+                // Every comment token must begin with a default prefix.
+                try testing.expect(is_line or is_block);
+
+                if (is_line) {
+                    // Line comment is EOL-exclusive: it must not contain a newline.
+                    try testing.expect(std.mem.indexOfScalar(u8, text, '\n') == null);
+                } else {
+                    // Block comment either ends just past a */ close or extends to EOF (unclosed).
+                    const closed = std.mem.endsWith(u8, text, "*/") and text.len >= 4;
+                    const unclosed = tok.end == source.len;
+                    try testing.expect(closed or unclosed);
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 4: Block Comment Line Tracking
+// **Validates: Requirements 4.5**
+test "property: block comment line tracking" {
+    // N internal newlines inside a block comment; the token after the comment must sit N lines
+    // below the comment's starting line.
+    const n_gen = gen.intRange(u8, 0, 8);
+
+    try minish.check(testing.allocator, n_gen, struct {
+        fn prop(n: u8) !void {
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            const w = &aw.writer;
+            try w.writeAll("/*");
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                try w.writeByte('\n');
+            }
+            try w.writeAll("*/x");
+            const input = aw.written();
+
+            const config = CommentConfig{ .block_open = "/*", .block_close = "*/" };
+            const tokens = try tokenize(input, null, config, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Locate the comment token and the following identifier ("x").
+            try testing.expectEqual(@as(usize, 2), tokens.len);
+            try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+            try testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+            try testing.expectEqual(tokens[0].line + n, tokens[1].line);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 5: Longest Match Priority
+// **Validates: Requirements 7.2, 7.3**
+test "property: longest match priority" {
+    // Config lists both a short prefix and a longer superset; a source starting with the longer
+    // prefix must select the longer one and emit a single comment token.
+    const body_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, body_gen, struct {
+        fn prop(body: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "--{s}\n", .{body}) catch return;
+
+            const config = CommentConfig{ .line_prefixes = &.{ "-", "--" } };
+            const tokens = try tokenize(input, null, config, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Single leading comment token spanning the "--" prefix plus body (EOL-exclusive).
+            try testing.expect(tokens.len >= 1);
+            try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(2 + body.len, tokens[0].end); // "--" (len 2) + body
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 6: Empty Config Produces No Comment Tokens
+// **Validates: Requirements 3.4, 4.3**
+test "property: empty config produces no comment tokens" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 256, .charset = .ascii });
+
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(source: []const u8) !void {
+            const tokens = try tokenize(source, null, CommentConfig.none, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            for (tokens) |tok| {
+                try testing.expect(tok.kind != .comment);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 8: Token Count Reduction for Configured Languages
+// **Validates: Requirements 3.1**
+test "property: token count reduction" {
+    // A comment line with >=2 content tokens collapses to a single comment token when the
+    // prefix is configured, so the configured run yields strictly fewer tokens than CommentConfig.none.
+    const body_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alpha });
+
+    try minish.check(testing.allocator, body_gen, struct {
+        fn prop(body: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "% {s} {s} {s}\n", .{ body, body, body }) catch return;
+
+            const config = CommentConfig{ .line_prefixes = &.{"%"} };
+            const configured = try tokenize(input, null, config, testing.allocator);
+            defer testing.allocator.free(configured);
+
+            const none = try tokenize(input, null, CommentConfig.none, testing.allocator);
+            defer testing.allocator.free(none);
+
+            try testing.expect(configured.len < none.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 9: Quote-in-Comment Does Not Open a String
+// **Validates: Requirements 8.1, 8.2, 7.2**
+test "property: quote in comment does not open string" {
+    // Body is alphanumeric-ish plus quote characters (', ", backtick) but no newline, so the
+    // comment stays one line. Quotes inside a comment must not open a string token.
+    const body_gen = gen.string(.{ .min_len = 0, .max_len = 48, .charset = .custom, .custom_chars = "abc '\"`" });
+
+    try minish.check(testing.allocator, body_gen, struct {
+        fn prop(body: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            // Single leading space exercises the optional-leading-whitespace case.
+            const input = std.fmt.bufPrint(&buf, "% {s}\n", .{body}) catch return;
+
+            const config = CommentConfig{ .line_prefixes = &.{"%"} };
+            const tokens = try tokenize(input, null, config, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Exactly one comment token for the line, and zero string tokens from the quotes.
+            var comment_count: usize = 0;
+            for (tokens) |tok| {
+                if (tok.kind == .comment) comment_count += 1;
+                try testing.expect(tok.kind != .string);
+            }
+            try testing.expectEqual(@as(usize, 1), comment_count);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 10: Comment Does Not Swallow Subsequent Code
+// **Validates: Requirements 8.3, 8.4**
+// NOTE: asserted at the TOKEN level. tokenizer.zig cannot import engine.zig without creating an
+// import cycle (engine imports tokenizer), so the parse-level assertion is intentionally omitted;
+// token-level resumption still validates Requirements 8.3/8.4.
+test "property: comment does not swallow subsequent code" {
+    // An odd number of apostrophes in a comment line must not open a string that swallows the
+    // following code line.
+    const n_gen = gen.intRange(u8, 1, 9);
+
+    try minish.check(testing.allocator, n_gen, struct {
+        fn prop(n_raw: u8) !void {
+            const odd: usize = @as(usize, n_raw) | 1; // force odd count of apostrophes
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            const w = &aw.writer;
+            try w.writeAll("% ");
+            var i: usize = 0;
+            while (i < odd) : (i += 1) {
+                try w.writeByte('\'');
+            }
+            try w.writeAll("\nx = 1");
+            const input = aw.written();
+
+            const config = CommentConfig{ .line_prefixes = &.{"%"} };
+            const tokens = try tokenize(input, null, config, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Expect: comment, newline, identifier("x"), operator("="), number("1").
+            try testing.expectEqual(@as(usize, 5), tokens.len);
+            try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+            try testing.expectEqual(TokenKind.newline, tokens[1].kind);
+            try testing.expectEqual(TokenKind.identifier, tokens[2].kind);
+            try testing.expectEqualStrings("x", input[tokens[2].start..tokens[2].end]);
+            try testing.expectEqual(TokenKind.operator, tokens[3].kind);
+            try testing.expectEqualStrings("=", input[tokens[3].start..tokens[3].end]);
+            try testing.expectEqual(TokenKind.number, tokens[4].kind);
+            try testing.expectEqualStrings("1", input[tokens[4].start..tokens[4].end]);
         }
     }.prop, .{ .num_runs = 100 });
 }

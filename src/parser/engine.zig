@@ -1389,7 +1389,7 @@ test "e2e: Erlang grammar still detects real function definitions" {
 
     // Erlang source: a real function definition at column 0
     const source = "handle_call(Request, From, State) ->\n    {reply, ok, State}.";
-    const tokens = try tokenizer.tokenize(source, grammar.keyword_table, alloc);
+    const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, alloc);
     const events = try parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, alloc);
 
     // "handle_call" SHOULD be detected as a function definition

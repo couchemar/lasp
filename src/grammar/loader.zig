@@ -18,6 +18,7 @@ pub const Grammar = struct {
     patterns: []const Pattern,
     blocks: BlockConfig,
     weights: EvidenceWeights = .{},
+    comments: CommentConfig = .{},
 };
 
 pub const KeywordCategory = struct {
@@ -72,6 +73,21 @@ pub const BlockConfig = struct {
     indentation: bool = false,
 };
 
+pub const CommentConfig = struct {
+    line_prefixes: []const []const u8 = &.{ "//", "#" },
+    block_open: ?[]const u8 = "/*",
+    block_close: ?[]const u8 = "*/",
+
+    pub const default = CommentConfig{};
+
+    /// Returns a config with no comment recognition at all.
+    pub const none = CommentConfig{
+        .line_prefixes = &.{},
+        .block_open = null,
+        .block_close = null,
+    };
+};
+
 pub const GrammarError = error{
     FileNotFound,
     InvalidToml,
@@ -85,6 +101,12 @@ pub const GrammarError = error{
     InvalidConstraintField,
     InvalidConstraintValues,
     DeprecatedField,
+    InvalidCommentLineType,
+    InvalidCommentBlockType,
+    UnpairedBlockDelimiter,
+    CommentPrefixTooLong,
+    TooManyLinePrefixes,
+    BlockDelimiterTooLong,
     OutOfMemory,
 };
 
@@ -287,6 +309,69 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         if (blocks_table.get("indentation")) |v| blocks.indentation = v.bool;
     }
 
+    // --- [comments] (optional) ---
+    var comments = CommentConfig{};
+    if (root.get("comments")) |comments_table| {
+        // Explicit [comments] section exists, so we start with empty config
+        // (overrides defaults)
+        comments = .{
+            .line_prefixes = &.{}, // Will be set below if line key exists
+            .block_open = null, // Will be set below if block keys exist
+            .block_close = null, // Will be set below if block keys exist
+        };
+
+        // Parse line comment prefixes
+        if (comments_table.get("line")) |line_val| {
+            if (line_val.* != .array) return error.InvalidCommentLineType;
+            if (line_val.array.items.items.len > 16) return error.TooManyLinePrefixes;
+
+            var line_prefixes: std.ArrayList([]const u8) = .empty;
+            for (line_val.array.items.items) |item| {
+                if (item != .string) return error.InvalidCommentLineType;
+                const prefix = item.string;
+                if (prefix.len == 0) continue; // Skip empty entries
+                if (prefix.len > 8) return error.CommentPrefixTooLong;
+                try line_prefixes.append(allocator, try allocator.dupe(u8, prefix));
+            }
+            comments.line_prefixes = try line_prefixes.toOwnedSlice(allocator);
+        }
+        // else: no line key -> line_prefixes stays empty (already set above)
+
+        // Parse block comment delimiters
+        const has_open = comments_table.get("block_open") != null;
+        const has_close = comments_table.get("block_close") != null;
+
+        if (has_open and !has_close) return error.UnpairedBlockDelimiter;
+        if (!has_open and has_close) return error.UnpairedBlockDelimiter;
+
+        if (has_open and has_close) {
+            const open_val = comments_table.get("block_open").?;
+            const close_val = comments_table.get("block_close").?;
+
+            if (open_val.* != .string) return error.InvalidCommentBlockType;
+            if (close_val.* != .string) return error.InvalidCommentBlockType;
+
+            const open = open_val.string;
+            const close = close_val.string;
+
+            if (open.len == 0 and close.len == 0) {
+                // Both empty strings -> treat as absent (already null)
+            } else {
+                if (open.len == 0 or close.len == 0) {
+                    // Only one is empty -> treat as absent pair (already null)
+                } else {
+                    if (open.len > 8) return error.BlockDelimiterTooLong;
+                    if (close.len > 8) return error.BlockDelimiterTooLong;
+
+                    comments.block_open = try allocator.dupe(u8, open);
+                    comments.block_close = try allocator.dupe(u8, close);
+                }
+            }
+        }
+        // else: no block keys -> null (already set above)
+    }
+    // else: no [comments] section -> use default CommentConfig{}
+
     return Grammar{
         .language_name = language_name,
         .keyword_categories = try categories.toOwnedSlice(allocator),
@@ -324,6 +409,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
             }
             break :blk w;
         },
+        .comments = comments,
     };
 }
 
@@ -433,6 +519,54 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
         }
         if (grammar.blocks.indentation) {
             try w.writeAll("indentation = true\n");
+        }
+    }
+
+    // [comments] — always serialize when present (even if equals default)
+    if (grammar.comments.line_prefixes.len > 0 or grammar.comments.block_open != null) {
+        try w.writeAll("\n[comments]\n");
+
+        // line prefixes
+        if (grammar.comments.line_prefixes.len > 0) {
+            try w.writeAll("line = [");
+            for (grammar.comments.line_prefixes, 0..) |prefix, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll("\"");
+                // Escape backslash and double-quote characters
+                for (prefix) |ch| {
+                    switch (ch) {
+                        '\\' => try w.writeAll("\\\\"),
+                        '"' => try w.writeAll("\\\""),
+                        else => try w.writeByte(ch),
+                    }
+                }
+                try w.writeAll("\"");
+            }
+            try w.writeAll("]\n");
+        }
+
+        // block delimiters
+        if (grammar.comments.block_open) |open| {
+            try w.writeAll("block_open = \"");
+            for (open) |ch| {
+                switch (ch) {
+                    '\\' => try w.writeAll("\\\\"),
+                    '"' => try w.writeAll("\\\""),
+                    else => try w.writeByte(ch),
+                }
+            }
+            try w.writeAll("\"\n");
+        }
+        if (grammar.comments.block_close) |close| {
+            try w.writeAll("block_close = \"");
+            for (close) |ch| {
+                switch (ch) {
+                    '\\' => try w.writeAll("\\\\"),
+                    '"' => try w.writeAll("\\\""),
+                    else => try w.writeByte(ch),
+                }
+            }
+            try w.writeAll("\"\n");
         }
     }
 
@@ -1081,6 +1215,118 @@ test "property: grammar TOML round-trip" {
             try testing.expectEqual(original.patterns[0].captures.len, parsed.patterns[0].captures.len);
             try testing.expectEqualStrings("{", parsed.blocks.open.?);
             try testing.expectEqualStrings("}", parsed.blocks.close.?);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 1: Comment Config Round-Trip
+// **Validates: Requirements 6.4**
+test "property: comment config round-trip" {
+    // Generate a random valid CommentConfig: prefix count seed, per-prefix length seed,
+    // and whether block delimiters are present. Map seeds into valid ranges inside the body.
+    const cfg_gen = comptime gen.tuple3(u8, u8, bool, gen.intRange(u8, 0, 255), gen.intRange(u8, 0, 255), gen.boolean());
+
+    try minish.check(testing.allocator, cfg_gen, struct {
+        fn prop(vals: struct { u8, u8, bool }) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // 0-16 prefixes
+            const count: usize = @as(usize, vals[0]) % 17;
+            // per-prefix length 1-8
+            const prefix_len: usize = @as(usize, vals[1]) % 8 + 1;
+            const has_block: bool = vals[2];
+
+            // An all-empty config (no prefixes AND no block delimiters) is intentionally
+            // serialized as NO [comments] section, which parses back as CommentConfig.default
+            // (documented behavior). That case is not a faithful round-trip of the empty config,
+            // so skip it here — it is covered by the dedicated formatGrammar unit test.
+            if (count == 0 and !has_block) return;
+
+            // Build arena-allocated ASCII prefixes. Avoid `"` and `\` so escaping is not
+            // under test here (a separate unit test already covers escaping).
+            const prefixes = try alloc.alloc([]const u8, count);
+            for (prefixes, 0..) |*p, i| {
+                const buf = try alloc.alloc(u8, prefix_len);
+                for (buf) |*ch| {
+                    // Deterministic printable ASCII letters based on index
+                    ch.* = 'a' + @as(u8, @intCast(i % 26));
+                }
+                p.* = buf;
+            }
+
+            const cfg = CommentConfig{
+                .line_prefixes = prefixes,
+                .block_open = if (has_block) "/*" else null,
+                .block_close = if (has_block) "*/" else null,
+            };
+
+            // Assemble a minimal Grammar (one pattern, required) carrying the config.
+            const original = Grammar{
+                .language_name = "test",
+                .keyword_categories = &.{},
+                .keyword_table = &.{},
+                .patterns = &.{
+                    .{
+                        .type_name = "function",
+                        .sequence = &.{
+                            .{ .matcher = .{ .keyword_literal = "fn" } },
+                        },
+                        .captures = &.{},
+                    },
+                },
+                .blocks = .{},
+                .weights = .{},
+                .comments = cfg,
+            };
+
+            const toml_str = try formatGrammar(original, alloc);
+            const parsed = try parseGrammar(toml_str, alloc);
+
+            // Line prefixes round-trip exactly.
+            try testing.expectEqual(cfg.line_prefixes.len, parsed.comments.line_prefixes.len);
+            for (cfg.line_prefixes, 0..) |p, i| {
+                try testing.expectEqualStrings(p, parsed.comments.line_prefixes[i]);
+            }
+
+            // Block delimiters: both null or both equal.
+            if (cfg.block_open) |open| {
+                try testing.expect(parsed.comments.block_open != null);
+                try testing.expectEqualStrings(open, parsed.comments.block_open.?);
+                try testing.expectEqualStrings(cfg.block_close.?, parsed.comments.block_close.?);
+            } else {
+                try testing.expect(parsed.comments.block_open == null);
+                try testing.expect(parsed.comments.block_close == null);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-comment-prefixes, Property 7: Unpaired Block Delimiter Rejection
+// **Validates: Requirements 1.5**
+test "property: unpaired block delimiter rejection" {
+    // Choose which single block key to emit: true = block_open only, false = block_close only.
+    const which_gen = comptime gen.boolean();
+
+    try minish.check(testing.allocator, which_gen, struct {
+        fn prop(open_only: bool) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            const w = &aw.writer;
+            // Minimal [[patterns]] block so parseGrammar does not fail with MissingPatterns.
+            try w.writeAll("[[patterns]]\ntype = \"x\"\nsequence = [\"identifier\"]\n\n[comments]\n");
+            if (open_only) {
+                try w.writeAll("block_open = \"/*\"\n");
+            } else {
+                try w.writeAll("block_close = \"*/\"\n");
+            }
+            const source = aw.written();
+
+            try testing.expectError(error.UnpairedBlockDelimiter, parseGrammar(source, alloc));
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -2212,4 +2458,449 @@ test "property: grammar TOML round-trip with constraints" {
             }
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// --- Phase 6: Configurable Comment Prefixes Unit Tests ---
+
+test "parseGrammar: valid line array with single prefix" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = ["%"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), grammar.comments.line_prefixes.len);
+    try testing.expectEqualStrings("%", grammar.comments.line_prefixes[0]);
+    try testing.expect(grammar.comments.block_open == null);
+    try testing.expect(grammar.comments.block_close == null);
+}
+
+test "parseGrammar: valid line array with multiple prefixes" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = ["//", "#", "--"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 3), grammar.comments.line_prefixes.len);
+    try testing.expectEqualStrings("//", grammar.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("#", grammar.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("--", grammar.comments.line_prefixes[2]);
+    try testing.expect(grammar.comments.block_open == null);
+    try testing.expect(grammar.comments.block_close == null);
+}
+
+test "parseGrammar: valid block_open/block_close pair" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\block_open = "/*"
+        \\block_close = "*/"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 0), grammar.comments.line_prefixes.len); // no line key -> empty
+    try testing.expectEqualStrings("/*", grammar.comments.block_open.?);
+    try testing.expectEqualStrings("*/", grammar.comments.block_close.?);
+}
+
+test "parseGrammar: missing [comments] section produces default config" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    const default = CommentConfig.default;
+    try testing.expectEqual(default.line_prefixes.len, grammar.comments.line_prefixes.len);
+    try testing.expectEqualStrings("//", grammar.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("#", grammar.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("/*", grammar.comments.block_open.?);
+    try testing.expectEqualStrings("*/", grammar.comments.block_close.?);
+}
+
+test "parseGrammar: empty line array produces empty prefixes" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = []
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 0), grammar.comments.line_prefixes.len);
+    try testing.expect(grammar.comments.block_open == null);
+    try testing.expect(grammar.comments.block_close == null);
+}
+
+test "parseGrammar: empty string entries treated as absent" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = ["//", "", "#"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), grammar.comments.line_prefixes.len);
+    try testing.expectEqualStrings("//", grammar.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("#", grammar.comments.line_prefixes[1]);
+    // Empty string should be skipped, not included
+    try testing.expect(!std.mem.eql(u8, "", grammar.comments.line_prefixes[0]));
+    try testing.expect(!std.mem.eql(u8, "", grammar.comments.line_prefixes[1]));
+}
+
+test "parseGrammar: UnpairedBlockDelimiter when only block_open present" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\block_open = "/*"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.UnpairedBlockDelimiter, result);
+}
+
+test "parseGrammar: UnpairedBlockDelimiter when only block_close present" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\block_close = "*/"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.UnpairedBlockDelimiter, result);
+}
+
+test "parseGrammar: CommentPrefixTooLong for prefix > 8 chars" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = ["//", "123456789"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.CommentPrefixTooLong, result);
+}
+
+test "parseGrammar: TooManyLinePrefixes for > 16 entries" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.TooManyLinePrefixes, result);
+}
+
+test "parseGrammar: BlockDelimiterTooLong for delimiter > 8 chars" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\block_open = "123456789"
+        \\block_close = "*/"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.BlockDelimiterTooLong, result);
+}
+
+test "parseGrammar: multi-character prefixes accepted" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = ["--", "%%", "<!--"]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 3), grammar.comments.line_prefixes.len);
+    try testing.expectEqualStrings("--", grammar.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("%%", grammar.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("<!--", grammar.comments.line_prefixes[2]);
+}
+
+test "parseGrammar: invalid line type returns InvalidCommentLineType" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\line = 123
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.InvalidCommentLineType, result);
+}
+
+test "parseGrammar: invalid block type returns InvalidCommentBlockType" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+        \\[comments]
+        \\block_open = 123
+        \\block_close = "*/"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseGrammar(source, arena.allocator());
+    try testing.expectError(error.InvalidCommentBlockType, result);
+}
+
+test "formatGrammar: round-trip with comments section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const original = Grammar{
+        .language_name = "test",
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "function",
+                .sequence = &.{
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .identifier = {} } },
+                },
+                .captures = &.{},
+            },
+        },
+        .blocks = .{},
+        .weights = .{},
+        .comments = .{
+            .line_prefixes = &.{ "%", "--" },
+            .block_open = "/*",
+            .block_close = "*/",
+        },
+    };
+
+    const toml_str = try formatGrammar(original, alloc);
+    const parsed = try parseGrammar(toml_str, alloc);
+
+    try testing.expectEqual(@as(usize, 2), parsed.comments.line_prefixes.len);
+    try testing.expectEqualStrings("%", parsed.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("--", parsed.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("/*", parsed.comments.block_open.?);
+    try testing.expectEqualStrings("*/", parsed.comments.block_close.?);
+}
+
+test "formatGrammar: comments with special characters escaped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const original = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "test",
+                .sequence = &.{
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                },
+                .captures = &.{},
+            },
+        },
+        .blocks = .{},
+        .weights = .{},
+        .comments = .{
+            .line_prefixes = &.{ "\"q\"", "b\\s" },
+            .block_open = "o\"q",
+            .block_close = "c\\s",
+        },
+    };
+
+    const toml_str = try formatGrammar(original, alloc);
+    // Should contain escaped versions
+    try testing.expect(std.mem.indexOf(u8, toml_str, "\\\"q\\\"") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "b\\\\s") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "o\\\"q") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "c\\\\s") != null);
+
+    // Round-trip should work
+    const parsed = try parseGrammar(toml_str, alloc);
+    try testing.expectEqual(@as(usize, 2), parsed.comments.line_prefixes.len);
+    try testing.expectEqualStrings("\"q\"", parsed.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("b\\s", parsed.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("o\"q", parsed.comments.block_open.?);
+    try testing.expectEqualStrings("c\\s", parsed.comments.block_close.?);
+}
+
+test "formatGrammar: empty config omits [comments] section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const original = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "test",
+                .sequence = &.{
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                },
+                .captures = &.{},
+            },
+        },
+        .blocks = .{},
+        .weights = .{},
+        .comments = .{
+            .line_prefixes = &.{},
+            .block_open = null,
+            .block_close = null,
+        },
+    };
+
+    const toml_str = try formatGrammar(original, alloc);
+    // Should NOT contain [comments] section
+    try testing.expect(std.mem.indexOf(u8, toml_str, "[comments]") == null);
+
+    // Parse back - with no [comments] section, we get defaults
+    const parsed = try parseGrammar(toml_str, alloc);
+    try testing.expectEqual(@as(usize, 2), parsed.comments.line_prefixes.len); // defaults
+    try testing.expectEqualStrings("//", parsed.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("#", parsed.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("/*", parsed.comments.block_open.?);
+    try testing.expectEqualStrings("*/", parsed.comments.block_close.?);
+}
+
+test "formatGrammar: default config produces explicit section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const original = Grammar{
+        .language_name = null,
+        .keyword_categories = &.{},
+        .keyword_table = &.{},
+        .patterns = &.{
+            .{
+                .type_name = "test",
+                .sequence = &.{
+                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                },
+                .captures = &.{},
+            },
+        },
+        .blocks = .{},
+        .weights = .{},
+        .comments = CommentConfig.default,
+    };
+
+    const toml_str = try formatGrammar(original, alloc);
+    // Should contain [comments] section even though it's the default
+    try testing.expect(std.mem.indexOf(u8, toml_str, "[comments]") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "line = [\"//\", \"#\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "block_open = \"/*\"") != null);
+    try testing.expect(std.mem.indexOf(u8, toml_str, "block_close = \"*/\"") != null);
+}
+
+test "parseGrammar + formatGrammar round-trip without [comments] section" {
+    const source =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Parse grammar without [comments] section
+    const grammar = try parseGrammar(source, alloc);
+    // Should have default comment config
+    const default = CommentConfig.default;
+    try testing.expectEqual(default.line_prefixes.len, grammar.comments.line_prefixes.len);
+    try testing.expectEqualStrings("//", grammar.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("#", grammar.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("/*", grammar.comments.block_open.?);
+    try testing.expectEqualStrings("*/", grammar.comments.block_close.?);
+
+    // Format it back - should now have explicit [comments] section
+    const formatted = try formatGrammar(grammar, alloc);
+    try testing.expect(std.mem.indexOf(u8, formatted, "[comments]") != null);
+
+    // Parse the formatted version
+    const parsed2 = try parseGrammar(formatted, alloc);
+    // Should still have the same config
+    try testing.expectEqual(grammar.comments.line_prefixes.len, parsed2.comments.line_prefixes.len);
+    try testing.expectEqualStrings("//", parsed2.comments.line_prefixes[0]);
+    try testing.expectEqualStrings("#", parsed2.comments.line_prefixes[1]);
+    try testing.expectEqualStrings("/*", parsed2.comments.block_open.?);
+    try testing.expectEqualStrings("*/", parsed2.comments.block_close.?);
 }
