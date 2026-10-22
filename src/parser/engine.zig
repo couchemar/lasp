@@ -168,6 +168,70 @@ fn computeMaxConstraintDepth(patterns: []const loader.Pattern) usize {
 // reset the state while we advance a match from a fixed pattern_start (state
 // never returns to 0); the region flushes only at a true reset, a new match
 // start, a post-buffer constraint rejection, or end-of-stream.
+const SpanResult = struct {
+    span_end: usize,
+    next_index: usize,
+    value: []const u8,
+};
+
+fn firstTokenWithStartGE(tokens: []const Token, from: usize, byte: usize) ?usize {
+    var j = from;
+    while (j < tokens.len) : (j += 1) {
+        if (tokens[j].start >= byte) return j;
+    }
+    return null;
+}
+
+fn memberOf(c: u8, set: []const u8) bool {
+    for (set) |s| if (c == s) return true;
+    return false;
+}
+
+// Greedy span scan for a parameterized capture ($name:IDENTIFIER(sep="...", suffix="...")).
+// Separator continuation uses source-byte adjacency; the captured value is the exact source
+// span. Forward-only: next_index is always >= first_token_index + 1.
+fn spanScan(
+    tokens: []const Token,
+    source: []const u8,
+    first_token_index: usize,
+    separator: ?[]const u8,
+    suffix_set: ?[]const u8,
+) SpanResult {
+    const first = tokens[first_token_index];
+    var last_end = first.end;
+    var cursor = first_token_index;
+
+    if (separator) |sep| {
+        while (true) {
+            const sep_start = last_end;
+            const sep_end = sep_start + sep.len;
+            if (sep_end > source.len) break;
+            if (!std.mem.eql(u8, source[sep_start..sep_end], sep)) break;
+            const next_tok_index = firstTokenWithStartGE(tokens, cursor + 1, sep_end) orelse break;
+            const nt = tokens[next_tok_index];
+            if (nt.start != sep_end) break;
+            if (nt.kind != .identifier) break;
+            cursor = next_tok_index;
+            last_end = nt.end;
+        }
+    }
+
+    if (suffix_set) |set| {
+        if (last_end < source.len and memberOf(source[last_end], set)) {
+            last_end += 1;
+        }
+    }
+
+    var next_index = cursor + 1;
+    while (next_index < tokens.len and tokens[next_index].end <= last_end) : (next_index += 1) {}
+
+    return .{
+        .span_end = last_end,
+        .next_index = next_index,
+        .value = source[first.start..last_end],
+    };
+}
+
 pub fn parse(
     automaton: Automaton,
     tokens: []const Token,
@@ -203,7 +267,9 @@ pub fn parse(
     var noise_count: u32 = 0;
     var delim_depth: u32 = 0;
 
-    for (tokens) |token| {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
         const text = source[token.start..token.end];
 
         // Block tracking (before skip check)
@@ -265,6 +331,12 @@ pub fn parse(
                     .field_name = cap.field_name,
                     .value = cap.value,
                 });
+                if (cap.separator != null or cap.suffix_set != null) {
+                    const span = spanScan(tokens, source, i, cap.separator, cap.suffix_set);
+                    matched_texts.items[matched_texts.items.len - 1] = span.value;
+                    last_matched_end = span.span_end;
+                    i = span.next_index - 1;
+                }
             }
 
             // Check terminal state
@@ -359,6 +431,12 @@ pub fn parse(
                                 .field_name = cap.field_name,
                                 .value = cap.value,
                             });
+                            if (cap.separator != null or cap.suffix_set != null) {
+                                const span = spanScan(tokens, source, i, cap.separator, cap.suffix_set);
+                                matched_texts.items[matched_texts.items.len - 1] = span.value;
+                                last_matched_end = span.span_end;
+                                i = span.next_index - 1;
+                            }
                         }
                         skipped = true;
                         break;
@@ -399,6 +477,12 @@ pub fn parse(
                             .field_name = cap.field_name,
                             .value = cap.value,
                         });
+                        if (cap.separator != null or cap.suffix_set != null) {
+                            const span = spanScan(tokens, source, i, cap.separator, cap.suffix_set);
+                            matched_texts.items[matched_texts.items.len - 1] = span.value;
+                            last_matched_end = span.span_end;
+                            i = span.next_index - 1;
+                        }
                     }
 
                     // Check if this immediately reaches a terminal state
@@ -4703,6 +4787,384 @@ test "property: a lone required number match scores 1.0 with the symbol weight" 
             const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, weights, alloc);
             try testing.expectEqual(@as(usize, 1), result.len);
             try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// --- Multi-Token Captures (spec: multi-token-captures) ---
+
+fn capturePattern(seq: *[1]loader.SequenceElement, captures: *[1]loader.Capture, cap: loader.Capture) loader.Pattern {
+    seq[0] = .{ .matcher = .{ .capture = cap } };
+    captures[0] = cap;
+    return .{ .type_name = "span", .sequence = seq, .captures = captures };
+}
+
+// Feature: multi-token-captures, Unit: engine edge cases
+// **Validates: Requirements 2.2, 2.3, 2.4, 2.6, 4.4, 9.1, 9.2, 9.3**
+test "parse: parameterized capture spans dotted path and trailing sigil" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [1]loader.SequenceElement = undefined;
+    const cap = loader.Capture{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = "!?" };
+    var caps: [1]loader.Capture = undefined;
+    const patterns = &[_]loader.Pattern{capturePattern(&seq, &caps, cap)};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    {
+        const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." }, idItem("B"), .{ .kind = .symbol, .text = "." }, idItem("C") };
+        const stream = try buildStream(alloc, &items);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        try testing.expectEqualStrings("A.B.C", result[0].captures[0].value);
+        try testing.expectEqual(stream.tokens[4].end, result[0].end);
+    }
+    {
+        const items = [_]TestTokenItem{ idItem("foo"), opItem("!") };
+        const stream = try buildStream(alloc, &items);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        try testing.expectEqualStrings("foo!", result[0].captures[0].value);
+    }
+}
+
+test "parse: parameterized capture stops at non-continuation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [1]loader.SequenceElement = undefined;
+    const cap = loader.Capture{ .field_name = "name", .position = 0, .separator = "." };
+    var caps: [1]loader.Capture = undefined;
+    const patterns = &[_]loader.Pattern{capturePattern(&seq, &caps, cap)};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    // Dangling trailing separator at EOF: no identifier follows, span ends at "A".
+    {
+        const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." } };
+        const stream = try buildStream(alloc, &items);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        try testing.expectEqualStrings("A", result[0].captures[0].value);
+    }
+    // Separator matches but is not immediately followed by an identifier (space gap).
+    {
+        const src = "A. B";
+        // Insert a gap byte between "." and "B": rebuild manually.
+        const tokens = [_]Token{
+            .{ .kind = .identifier, .start = 0, .end = 1, .line = 1, .col = 0 },
+            .{ .kind = .symbol, .start = 1, .end = 2, .line = 1, .col = 1 },
+            .{ .kind = .identifier, .start = 3, .end = 4, .line = 1, .col = 3 },
+        };
+        const result = try parse(automaton, tokens[0..], src, patterns, .{}, .{}, alloc);
+        // The gap prevents spanning: "A" is captured alone; the later "B" is its own match.
+        try testing.expectEqual(@as(usize, 2), result.len);
+        try testing.expectEqualStrings("A", result[0].captures[0].value);
+        try testing.expectEqualStrings("B", result[1].captures[0].value);
+    }
+}
+
+test "parse: later element matches the first token after the span" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [2]loader.SequenceElement = undefined;
+    seq[0] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0, .separator = "." } } };
+    seq[1] = .{ .matcher = .{ .keyword_literal = "fn" } };
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "decl",
+        .sequence = &seq,
+        .captures = &.{.{ .field_name = "name", .position = 0, .separator = "." }},
+    }};
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." }, idItem("B"), kwItem("fn") };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("decl", result[0].type_name);
+    try testing.expectEqualStrings("A.B", result[0].captures[0].value);
+}
+
+test "parse: depth-0 constraint evaluates against the full span value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: [1]loader.SequenceElement = undefined;
+    const cap = loader.Capture{ .field_name = "name", .position = 0, .separator = "." };
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "span",
+        .sequence = &seq,
+        .captures = &.{cap},
+        .constraints = &.{.{
+            .type = .not,
+            .depth = 0,
+            .field = "name",
+            .values = &.{"A.B"},
+        }},
+    }};
+    seq[0] = .{ .matcher = .{ .capture = cap } };
+    const automaton = try compiler.compile(patterns, alloc);
+
+    const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." }, idItem("B") };
+    const stream = try buildStream(alloc, &items);
+    const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+    try testing.expectEqual(@as(usize, 0), result.len); // full-span value "A.B" rejected
+}
+
+// Feature: multi-token-captures, Property 3: greedy separator span captures the exact source span
+// **Validates: Requirements 2.1, 2.2, 3.2, 4.1, 4.2**
+test "property: greedy separator span captures the exact source span" {
+    const P3Input = struct {
+        segments: u8,
+        sep_idx: u8,
+    };
+    const seps3 = [_][]const u8{ ".", ":", "::" };
+    const p3_gen = gen.structure(P3Input, .{
+        .segments = gen.intRange(u8, 2, 4),
+        .sep_idx = gen.intRange(u8, 0, seps3.len - 1),
+    });
+
+    try minish.check(testing.allocator, p3_gen, struct {
+        fn prop(inp: P3Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: [1]loader.SequenceElement = undefined;
+            const cap = loader.Capture{ .field_name = "name", .position = 0, .separator = seps3[inp.sep_idx] };
+            var caps: [1]loader.Capture = undefined;
+            const patterns = &[_]loader.Pattern{capturePattern(&seq, &caps, cap)};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            var expected: std.ArrayList(u8) = .empty;
+            for (0..inp.segments) |k| {
+                if (k > 0) {
+                    try items.append(alloc, TestTokenItem{ .kind = .symbol, .text = seps3[inp.sep_idx] });
+                    try expected.appendSlice(alloc, seps3[inp.sep_idx]);
+                }
+                const name = try std.fmt.allocPrint(alloc, "s{d}", .{k});
+                try items.append(alloc, idItem(name));
+                try expected.appendSlice(alloc, name);
+            }
+            const stream = try buildStream(alloc, items.items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectEqualSlices(u8, expected.items, result[0].captures[0].value);
+            try testing.expectEqual(stream.tokens[stream.tokens.len - 1].end, result[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Property 4: multi-character separator is tokenizer-split-agnostic
+// **Validates: Requirements 3.1, 3.3, 3.4**
+test "property: multi-character separator is tokenizer-split-agnostic" {
+    const P4Input = struct {
+        segments: u8,
+    };
+    const p4_gen = gen.structure(P4Input, .{
+        .segments = gen.intRange(u8, 2, 4),
+    });
+
+    try minish.check(testing.allocator, p4_gen, struct {
+        fn prop(inp: P4Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: [1]loader.SequenceElement = undefined;
+            const cap = loader.Capture{ .field_name = "name", .position = 0, .separator = "::" };
+            var caps: [1]loader.Capture = undefined;
+            const patterns = &[_]loader.Pattern{capturePattern(&seq, &caps, cap)};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // "::" splits into two operator tokens.
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            var expected: std.ArrayList(u8) = .empty;
+            for (0..inp.segments) |k| {
+                if (k > 0) {
+                    try items.append(alloc, opItem(":"));
+                    try items.append(alloc, opItem(":"));
+                    try expected.appendSlice(alloc, "::");
+                }
+                const name = try std.fmt.allocPrint(alloc, "m{d}", .{k});
+                try items.append(alloc, idItem(name));
+                try expected.appendSlice(alloc, name);
+            }
+            const stream = try buildStream(alloc, items.items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectEqualSlices(u8, expected.items, result[0].captures[0].value);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Property 6: suffix absorption takes exactly one adjacent set member
+// **Validates: Requirements 2.3, 2.4, 4.3**
+test "property: suffix absorption takes exactly one adjacent set member" {
+    const P6Input = struct {
+        mode: u8, // 0 no suffix, 1 in set, 2 not in set, 3 double suffix
+    };
+    const p6_gen = gen.structure(P6Input, .{
+        .mode = gen.intRange(u8, 0, 3),
+    });
+
+    try minish.check(testing.allocator, p6_gen, struct {
+        fn prop(inp: P6Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq: [1]loader.SequenceElement = undefined;
+            const cap = loader.Capture{ .field_name = "name", .position = 0, .suffix_set = "!?" };
+            var caps: [1]loader.Capture = undefined;
+            const patterns = &[_]loader.Pattern{capturePattern(&seq, &caps, cap)};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            const src_items: [3]TestTokenItem = switch (inp.mode) {
+                0 => .{ idItem("foo"), .{ .kind = .symbol, .text = "" }, .{ .kind = .symbol, .text = "" } },
+                1 => .{ idItem("foo"), opItem("!"), .{ .kind = .symbol, .text = "" } },
+                2 => .{ idItem("foo"), .{ .kind = .symbol, .text = "." }, .{ .kind = .symbol, .text = "" } },
+                else => .{ idItem("foo"), opItem("!"), opItem("!") },
+            };
+            const expected_value: []const u8 = switch (inp.mode) {
+                0 => "foo",
+                1 => "foo!",
+                2 => "foo",
+                else => "foo!",
+            };
+            const count: usize = switch (inp.mode) { 0 => 1, 1 => 2, 2 => 2, else => 3 };
+            const items = src_items[0..count];
+            const stream = try buildStream(alloc, items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            try testing.expectEqual(@as(usize, 1), result.len);
+            try testing.expectEqualStrings(expected_value, result[0].captures[0].value);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Property 7: confidence is contributed once regardless of span length
+// **Validates: Requirements 5.1, 5.2, 5.3**
+test "property: confidence is contributed once regardless of span length" {
+    const P7Input = struct {
+        segments: u8,
+    };
+    const p7_gen = gen.structure(P7Input, .{
+        .segments = gen.intRange(u8, 2, 4),
+    });
+
+    try minish.check(testing.allocator, p7_gen, struct {
+        fn prop(inp: P7Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var seq_span: [1]loader.SequenceElement = undefined;
+            var seq_bare: [1]loader.SequenceElement = undefined;
+            const cap_span = loader.Capture{ .field_name = "name", .position = 0, .separator = "." };
+            const cap_bare = loader.Capture{ .field_name = "name", .position = 0 };
+            var caps_span: [1]loader.Capture = undefined;
+            var caps_bare: [1]loader.Capture = undefined;
+            const patterns_span = &[_]loader.Pattern{capturePattern(&seq_span, &caps_span, cap_span)};
+            const patterns_bare = &[_]loader.Pattern{capturePattern(&seq_bare, &caps_bare, cap_bare)};
+            const auto_span = try compiler.compile(patterns_span, alloc);
+            const auto_bare = try compiler.compile(patterns_bare, alloc);
+
+            var items_span: std.ArrayList(TestTokenItem) = .empty;
+            for (0..inp.segments) |k| {
+                if (k > 0) try items_span.append(alloc, TestTokenItem{ .kind = .symbol, .text = "." });
+                try items_span.append(alloc, idItem("x"));
+            }
+            const stream_span = try buildStream(alloc, items_span.items);
+            const res_span = try parse(auto_span, stream_span.tokens, stream_span.source, patterns_span, .{}, .{}, alloc);
+
+            const items_bare = [_]TestTokenItem{idItem("x")};
+            const stream_bare = try buildStream(alloc, &items_bare);
+            const res_bare = try parse(auto_bare, stream_bare.tokens, stream_bare.source, patterns_bare, .{}, .{}, alloc);
+
+            try testing.expectEqual(@as(usize, 1), res_span.len);
+            try testing.expectEqual(@as(usize, 1), res_bare.len);
+            try testing.expectApproxEqRel(res_bare[0].confidence, res_span[0].confidence, 0.001);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Property 8: single-token backward compatibility is byte-identical
+// **Validates: Requirements 4.4, 8.1, 8.2, 8.3**
+test "property: single-token backward compatibility is byte-identical" {
+    const P8Input = struct {
+        value: []const u8,
+    };
+    const p8_gen = gen.structure(P8Input, .{
+        .value = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+    });
+
+    try minish.check(testing.allocator, p8_gen, struct {
+        fn prop(inp: P8Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            var seq: [1]loader.SequenceElement = undefined;
+            const cap = loader.Capture{ .field_name = "name", .position = 0 };
+            var caps: [1]loader.Capture = undefined;
+            const patterns = &[_]loader.Pattern{capturePattern(&seq, &caps, cap)};
+            const automaton = try compiler.compile(patterns, alloc);
+
+            // A bare capture captures exactly one token even when separator-like bytes follow.
+            const items = [_]TestTokenItem{ idItem(inp.value), .{ .kind = .symbol, .text = "." }, idItem("B") };
+            const stream = try buildStream(alloc, &items);
+            const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, alloc);
+            // Two identifier matches: first is the bare capture of inp.value; second is "B".
+            try testing.expectEqual(@as(usize, 2), result.len);
+            try testing.expectEqualStrings(inp.value, result[0].captures[0].value);
+            try testing.expectEqual(stream.tokens[0].end, result[0].end);
+            try testing.expectEqualStrings("B", result[1].captures[0].value);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Property 10: span scan advances the token index monotonically
+// **Validates: Requirements 6.1, 6.2, 6.3**
+test "property: span scan advances the token index monotonically" {
+    const P10Input = struct {
+        segments: u8,
+        sep_idx: u8,
+    };
+    const seps10 = [_][]const u8{ ".", "::" };
+    const p10_gen = gen.structure(P10Input, .{
+        .segments = gen.intRange(u8, 2, 4),
+        .sep_idx = gen.intRange(u8, 0, seps10.len - 1),
+    });
+
+    try minish.check(testing.allocator, p10_gen, struct {
+        fn prop(inp: P10Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var items: std.ArrayList(TestTokenItem) = .empty;
+            for (0..inp.segments) |k| {
+                if (k > 0) {
+                    if (seps10[inp.sep_idx].len == 1) {
+                        try items.append(alloc, TestTokenItem{ .kind = .symbol, .text = seps10[inp.sep_idx] });
+                    } else {
+                        try items.append(alloc, opItem(":"));
+                        try items.append(alloc, opItem(":"));
+                    }
+                }
+                try items.append(alloc, idItem("x"));
+            }
+            const stream = try buildStream(alloc, items.items);
+            const scan = spanScan(stream.tokens, stream.source, 0, seps10[inp.sep_idx], null);
+            try testing.expect(scan.next_index >= 1);
+            if (scan.next_index < stream.tokens.len) {
+                try testing.expect(stream.tokens[scan.next_index].start >= scan.span_end);
+            }
+            try testing.expectEqual(stream.source.len, scan.span_end);
         }
     }.prop, .{ .num_runs = 100 });
 }

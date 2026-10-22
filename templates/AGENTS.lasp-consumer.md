@@ -184,7 +184,10 @@ close = "}"
 | `"("` | Exact punctuation — symbol, delimiter, or operator (`+ - * / = < > ! & \| ^ % ~`) by exact text. Single-character only: a multi-char literal like `"->"` compiles but never matches |
 | `"-"` | Anchor sigil constructs on their leading operator — e.g. `["-", "module", "("]` for Erlang `-module(...)`, `["@", ...]` for Elixir attributes, `["&", ...]` for capture refs |
 | `"identifier"` | Any identifier token |
-| `"$name:IDENTIFIER"` | Identifier, captured into the `name` field |
+| `"$name:IDENTIFIER"` | Identifier, captured into the `name` field (single token) |
+| `"$name:IDENTIFIER(sep=\".\")"` | Captures a separator-joined span in full (`A.B.C`); `sep` is author-supplied, matched by source-byte adjacency (`::` works too) |
+| `"$name:IDENTIFIER(suffix=\"!?\")"` | Captures the identifier plus at most one trailing char from the author-supplied set (`resolve_type!`) |
+| `"number"` | Any numeric token (kind wildcard; supports `number?`; captures nothing) |
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
 | `"fn?"` / `"(?"` | Optional element — boosts confidence when present, doesn't block when absent |
 

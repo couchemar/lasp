@@ -66,6 +66,8 @@ pub const TokenMatcher = union(enum) {
 pub const Capture = struct {
     field_name: []const u8,
     position: usize,
+    separator: ?[]const u8 = null,
+    suffix_set: ?[]const u8 = null,
 };
 
 pub const BlockConfig = struct {
@@ -136,6 +138,65 @@ fn tomlToF32(v: anytype) ?f32 {
     };
 }
 
+// Writes a string with TOML basic-string escaping (backslash and double quote).
+fn writeEscaped(w: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '\\' => try w.writeAll("\\\\"),
+            '"' => try w.writeAll("\\\""),
+            else => try w.writeByte(c),
+        }
+    }
+}
+const CaptureParams = struct {
+    separator: ?[]const u8,
+    suffix_set: ?[]const u8,
+};
+
+// Parses the tail of a $field:... sequence element: either bare "IDENTIFIER"
+// (single-token capture) or "IDENTIFIER(sep="...", suffix="...")".
+fn parseCaptureTail(tail: []const u8, allocator: std.mem.Allocator) GrammarError!CaptureParams {
+    const kind = "IDENTIFIER";
+    if (std.mem.eql(u8, tail, kind)) {
+        return .{ .separator = null, .suffix_set = null };
+    }
+    if (tail.len > kind.len + 2 and std.mem.startsWith(u8, tail, kind) and tail[kind.len] == '(' and tail[tail.len - 1] == ')') {
+        const params = tail[kind.len + 1 .. tail.len - 1];
+        return parseParamList(params, allocator);
+    }
+    return error.InvalidCaptureFormat;
+}
+
+fn parseParamList(params: []const u8, allocator: std.mem.Allocator) GrammarError!CaptureParams {
+    var separator: ?[]const u8 = null;
+    var suffix_set: ?[]const u8 = null;
+
+    if (params.len == 0) return error.InvalidCaptureFormat; // empty "()"
+    var it = std.mem.splitScalar(u8, params, ',');
+    while (it.next()) |raw_seg| {
+        const seg = std.mem.trim(u8, raw_seg, " \t");
+        if (seg.len == 0) return error.InvalidCaptureFormat;
+        const eq = std.mem.indexOfScalar(u8, seg, '=') orelse return error.InvalidCaptureFormat;
+        const key = std.mem.trim(u8, seg[0..eq], " \t");
+        const raw_val = std.mem.trim(u8, seg[eq + 1 ..], " \t");
+        if (raw_val.len < 2 or raw_val[0] != '"' or raw_val[raw_val.len - 1] != '"') return error.InvalidCaptureFormat;
+        const val = raw_val[1 .. raw_val.len - 1];
+        if (val.len == 0) return error.InvalidCaptureFormat; // empty separator / suffix
+        if (std.mem.eql(u8, key, "sep")) {
+            if (separator != null) return error.InvalidCaptureFormat; // duplicate
+            separator = try allocator.dupe(u8, val);
+        } else if (std.mem.eql(u8, key, "suffix")) {
+            if (suffix_set != null) return error.InvalidCaptureFormat; // duplicate
+            suffix_set = try allocator.dupe(u8, val);
+        } else {
+            return error.InvalidCaptureFormat; // unknown parameter
+        }
+    }
+    if (separator == null and suffix_set == null) return error.InvalidCaptureFormat;
+    return .{ .separator = separator, .suffix_set = suffix_set };
+}
+
+
 /// Parses a single pattern sequence string into a SequenceElement.
 /// Handles trailing `?` suffix for optional elements.
 fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.Allocator) GrammarError!struct { element: SequenceElement, capture: ?Capture } {
@@ -147,14 +208,19 @@ fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.All
         s = s[0 .. s.len - 1];
     }
 
-    // Capture: $name:IDENTIFIER
+    // Capture: $name:IDENTIFIER or $name:IDENTIFIER(sep="...", suffix="...")
     if (s.len > 0 and s[0] == '$') {
         const colon_idx = std.mem.indexOf(u8, s, ":") orelse return error.InvalidCaptureFormat;
         if (colon_idx < 2) return error.InvalidCaptureFormat; // need at least $x
-        const suffix = s[colon_idx + 1 ..];
-        if (!std.mem.eql(u8, suffix, "IDENTIFIER")) return error.InvalidCaptureFormat;
         const field_name = try allocator.dupe(u8, s[1..colon_idx]);
-        const cap = Capture{ .field_name = field_name, .position = position };
+        const tail = s[colon_idx + 1 ..];
+        const params = try parseCaptureTail(tail, allocator);
+        const cap = Capture{
+            .field_name = field_name,
+            .position = position,
+            .separator = params.separator,
+            .suffix_set = params.suffix_set,
+        };
         return .{ .element = .{ .matcher = .{ .capture = cap }, .is_optional = optional }, .capture = cap };
     }
     // Identifier wildcard
@@ -467,6 +533,21 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                     try w.writeAll("$");
                     try w.writeAll(cap.field_name);
                     try w.writeAll(":IDENTIFIER");
+                    if (cap.separator != null or cap.suffix_set != null) {
+                        try w.writeAll("(");
+                        if (cap.separator) |sep| {
+                            try w.writeAll("sep=\\\"");
+                            try writeEscaped(w, sep);
+                            try w.writeAll("\\\"");
+                        }
+                        if (cap.suffix_set) |suf| {
+                            if (cap.separator != null) try w.writeAll(", ");
+                            try w.writeAll("suffix=\\\"");
+                            try writeEscaped(w, suf);
+                            try w.writeAll("\\\"");
+                        }
+                        try w.writeAll(")");
+                    }
                 },
                 .identifier_literal => |id| {
                     try w.writeAll(id);
@@ -3202,4 +3283,194 @@ test "property: grammars without number are stable through formatting" {
             try testing.expectEqual(grammar.patterns[0].sequence.len, re.patterns[0].sequence.len);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Unit: parseSequenceElement parameter list
+// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8**
+test "parseSequenceElement: parameterized capture forms" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        const res = try parseSequenceElement("$name:IDENTIFIER", 0, alloc);
+        try testing.expect(res.element.matcher == .capture);
+        try testing.expect(res.element.matcher.capture.separator == null);
+        try testing.expect(res.element.matcher.capture.suffix_set == null);
+        try testing.expectEqualStrings("name", res.element.matcher.capture.field_name);
+    }
+    {
+        const res = try parseSequenceElement("$name:IDENTIFIER(sep=\".\")", 0, alloc);
+        try testing.expectEqualStrings(".", res.element.matcher.capture.separator.?);
+        try testing.expect(res.element.matcher.capture.suffix_set == null);
+    }
+    {
+        const res = try parseSequenceElement("$name:IDENTIFIER(suffix=\"!?\")", 0, alloc);
+        try testing.expect(res.element.matcher.capture.separator == null);
+        try testing.expectEqualStrings("!?", res.element.matcher.capture.suffix_set.?);
+    }
+    {
+        const res = try parseSequenceElement("$name:IDENTIFIER(sep=\"::\", suffix=\"!?\")", 0, alloc);
+        try testing.expectEqualStrings("::", res.element.matcher.capture.separator.?);
+        try testing.expectEqualStrings("!?", res.element.matcher.capture.suffix_set.?);
+    }
+    {
+        const res = try parseSequenceElement("$name:IDENTIFIER(suffix=\"!?\", sep=\".\")", 0, alloc);
+        try testing.expectEqualStrings(".", res.element.matcher.capture.separator.?);
+        try testing.expectEqualStrings("!?", res.element.matcher.capture.suffix_set.?);
+    }
+    {
+        const res = try parseSequenceElement("$name:IDENTIFIER(sep=\".\")?", 0, alloc);
+        try testing.expect(res.element.is_optional);
+        try testing.expectEqualStrings(".", res.element.matcher.capture.separator.?);
+    }
+}
+
+test "parseSequenceElement: parameterized capture error cases" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const bad = [_][]const u8{
+        "$name:IDENTIFIER(sep=\"\")",
+        "$name:IDENTIFIER(suffix=\"\")",
+        "$name:IDENTIFIER(foo=\"x\")",
+        "$name:IDENTIFIER(sep)",
+        "$name:IDENTIFIER(sep=x)",
+        "$name:IDENTIFIER(sep=\".\"",
+        "$name:IDENTIFIER()",
+        "$name:IDENTIFIER(sep=\".\", sep=\",\")",
+        "$name:IDENTIFIER(sep=\".\", suffix=\"!\", suffix=\"?\")",
+        "$name:IDENTIFIER(sep=\".\",)",
+    };
+    for (bad) |elem| {
+        const res = parseSequenceElement(elem, 0, alloc);
+        try testing.expectError(error.InvalidCaptureFormat, res);
+    }
+}
+
+// Feature: multi-token-captures, Property 1: parameter list parses to the correct Capture fields
+// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5**
+test "property: parameter list parses to the correct capture fields" {
+    const P1Input = struct {
+        field: []const u8,
+        sep: []const u8,
+        suffix: []const u8,
+        mode: u8, // 0 bare, 1 sep, 2 suffix, 3 both
+    };
+    const p1_gen = gen.structure(P1Input, .{
+        .field = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+        .sep = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+        .suffix = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+        .mode = gen.intRange(u8, 0, 3),
+    });
+
+    try minish.check(testing.allocator, p1_gen, struct {
+        fn prop(inp: P1Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const elem: []const u8 = switch (inp.mode) {
+                0 => try std.fmt.allocPrint(alloc, "${s}:IDENTIFIER", .{inp.field}),
+                1 => try std.fmt.allocPrint(alloc, "${s}:IDENTIFIER(sep=\"{s}\")", .{ inp.field, inp.sep }),
+                2 => try std.fmt.allocPrint(alloc, "${s}:IDENTIFIER(suffix=\"{s}\")", .{ inp.field, inp.suffix }),
+                else => try std.fmt.allocPrint(alloc, "${s}:IDENTIFIER(sep=\"{s}\", suffix=\"{s}\")", .{ inp.field, inp.sep, inp.suffix }),
+            };
+            const res = try parseSequenceElement(elem, 0, alloc);
+            const cap = res.element.matcher.capture;
+            try testing.expectEqualStrings(inp.field, cap.field_name);
+            try testing.expectEqual(inp.mode == 0 or inp.mode == 2, cap.separator == null);
+            try testing.expectEqual(inp.mode == 0 or inp.mode == 1, cap.suffix_set == null);
+            if (inp.mode == 1 or inp.mode == 3) {
+                try testing.expectEqualStrings(inp.sep, cap.separator.?);
+            }
+            if (inp.mode == 2 or inp.mode == 3) {
+                try testing.expectEqualStrings(inp.suffix, cap.suffix_set.?);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Property 2: malformed, empty, or unknown parameters are rejected
+// **Validates: Requirements 1.6, 1.7, 1.8**
+test "property: malformed, empty, or unknown parameters are rejected" {
+    const bad = [_][]const u8{
+        "$n:IDENTIFIER(sep=\"\")",
+        "$n:IDENTIFIER(suffix=\"\")",
+        "$n:IDENTIFIER(unknown=\"x\")",
+        "$n:IDENTIFIER(sep)",
+        "$n:IDENTIFIER(sep=x)",
+        "$n:IDENTIFIER(sep=\".\"",
+        "$n:IDENTIFIER()",
+        "$n:IDENTIFIER(sep=\".\", sep=\",\")",
+        "$n:IDENTIFIER(sep=\".\",)",
+    };
+    const idx_gen = gen.intRange(u8, 0, bad.len - 1);
+
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idx: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const res = parseSequenceElement(bad[idx], 0, arena.allocator());
+            try testing.expectError(error.InvalidCaptureFormat, res);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Property 9: capture parameters survive the round-trip
+// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+test "property: capture parameters survive the round-trip" {
+    const P9Input = struct {
+        sep: []const u8,
+        suffix: []const u8,
+    };
+    const p9_gen = gen.structure(P9Input, .{
+        .sep = gen.string(.{ .min_len = 1, .max_len = 4, .charset = .alphanumeric }),
+        .suffix = gen.string(.{ .min_len = 1, .max_len = 4, .charset = .alphanumeric }),
+    });
+
+    try minish.check(testing.allocator, p9_gen, struct {
+        fn prop(inp: P9Input) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"$a:IDENTIFIER\", \"$b:IDENTIFIER(sep=\\\"{s}\\\")\", \"$c:IDENTIFIER(suffix=\\\"{s}\\\")\", \"$d:IDENTIFIER(sep=\\\"{s}\\\", suffix=\\\"{s}\\\")\"]\n",
+                .{ inp.sep, inp.suffix, inp.sep, inp.suffix });
+            const grammar = try parseGrammar(source, alloc);
+            const formatted = try formatGrammar(grammar, alloc);
+            const re = try parseGrammar(formatted, alloc);
+
+            try testing.expectEqual(grammar.patterns[0].captures.len, re.patterns[0].captures.len);
+            for (grammar.patterns[0].captures, re.patterns[0].captures) |a, b| {
+                try testing.expectEqualStrings(a.field_name, b.field_name);
+                try testing.expectEqual(a.separator != null, b.separator != null);
+                try testing.expectEqual(a.suffix_set != null, b.suffix_set != null);
+                if (a.separator) |sep| try testing.expectEqualStrings(sep, b.separator.?);
+                if (a.suffix_set) |suf| try testing.expectEqualStrings(suf, b.suffix_set.?);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+test "formatGrammar: emits canonical parameter lists" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["$a:IDENTIFIER", "$b:IDENTIFIER(sep=\".\")", "$c:IDENTIFIER(suffix=\"!?\")", "$d:IDENTIFIER(sep=\"::\", suffix=\"!?\")"]
+    ;
+    const grammar = try parseGrammar(source, alloc);
+    const formatted = try formatGrammar(grammar, alloc);
+    try testing.expect(std.mem.indexOf(u8, formatted, "$a:IDENTIFIER\"") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "$b:IDENTIFIER(sep=\\\".\\\")") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "$c:IDENTIFIER(suffix=\\\"!?\\\")") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "$d:IDENTIFIER(sep=\\\"::\\\", suffix=\\\"!?\\\")") != null);
+    // Bare capture has no parameter list.
+    try testing.expect(std.mem.indexOf(u8, formatted, "$a:IDENTIFIER(") == null);
 }

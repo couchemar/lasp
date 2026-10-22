@@ -391,8 +391,10 @@ block_close = "-}"
 | `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
 | `"("` | Exact punctuation character — operator, symbol, or delimiter (`+ - * / = < > ! & \| ^ % ~ ( ) { } [ ] , ; : . @ ?`) |
 | `"identifier"` | Any identifier token |
-| `"number"` | Any numeric token; supports `number?`; captures nothing; scores with the symbol weight |
 | `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
+| `"$name:IDENTIFIER(sep=\".\")"` | Captures a separator-joined path (`A.B.C`); separator matched by source-byte adjacency, so `"::"` works whether or not the tokenizer splits it |
+| `"$name:IDENTIFIER(suffix=\"!?\")"` | Absorbs at most one trailing character from the set (`foo!`) |
+| `"$name:IDENTIFIER(sep=\".\", suffix=\"!?\")"` | Both — qualified path with optional trailing sigil |
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
 | `"fn?"` | Optional keyword — boosts confidence when present |
 | `"(?"` | Optional symbol — boosts confidence when present |

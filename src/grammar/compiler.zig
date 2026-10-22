@@ -31,6 +31,8 @@ pub const State = struct {
 pub const CaptureValue = struct {
     field_name: []const u8,
     value: []const u8,
+    separator: ?[]const u8 = null,
+    suffix_set: ?[]const u8 = null,
 };
 
 pub const MatchResult = enum {
@@ -55,7 +57,12 @@ pub const Automaton = struct {
             const quality = matchesTransition(tr.matcher, token.kind, text);
             if (quality != .no_match) {
                 const cap: ?CaptureValue = if (tr.capture) |c|
-                    .{ .field_name = c.field_name, .value = text }
+                    .{
+                        .field_name = c.field_name,
+                        .value = text,
+                        .separator = c.separator,
+                        .suffix_set = c.suffix_set,
+                    }
                 else
                     null;
                 return .{ .next = tr.next_state, .capture = cap, .match_quality = quality };
@@ -1069,4 +1076,41 @@ test "property: number-matcher equality" {
             }
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: multi-token-captures, Unit: compiled transition retains sep/suffix
+// **Validates: Requirements 2.1**
+test "compile: parameterized capture transition carries sep/suffix" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]Pattern{.{
+        .type_name = "t",
+        .sequence = &.{
+            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = "!?" } } },
+        },
+        .captures = &.{.{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = "!?" }},
+    }};
+    const automaton = try compile(patterns, alloc);
+    const cap = automaton.states[0].transitions[0].capture.?;
+    try testing.expectEqualStrings("name", cap.field_name);
+    try testing.expectEqualStrings(".", cap.separator.?);
+    try testing.expectEqualStrings("!?", cap.suffix_set.?);
+}
+
+test "automaton step: surfaces capture metadata on the transition" {
+    const auto = Automaton{ .states = &.{
+        .{ .transitions = &.{.{
+            .matcher = .{ .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = null } },
+            .next_state = 1,
+            .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = null },
+        }}, .events = &.{} },
+        .{ .transitions = &.{}, .events = &.{} },
+    } };
+    const res = auto.step(0, .{ .kind = .identifier, .start = 0, .end = 1, .line = 1, .col = 0 }, "A");
+    try testing.expect(res != null);
+    try testing.expectEqualStrings("A", res.?.capture.?.value);
+    try testing.expectEqualStrings(".", res.?.capture.?.separator.?);
+    try testing.expect(res.?.capture.?.suffix_set == null);
 }
