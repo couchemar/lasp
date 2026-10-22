@@ -406,7 +406,24 @@ echo 'fn add() {}' | lasp parse - -g grammars/rust.toml --node function --names-
 lasp --version
 lasp -V
 lasp version
+
+# Help and discoverability
+lasp help
+lasp --help
+lasp -h
+lasp parse --help
+lasp query --help
 ```
+
+### Help Command and Flags
+LASP provides built-in help for discoverability:
+- **`lasp help`** - Shows general usage help
+- **`lasp --help`** or **`lasp -h`** - Same as `lasp help`
+- **`lasp parse --help`** - Shows help for the parse subcommand
+- **`lasp query --help`** - Shows help for the query subcommand
+- **`lasp parse-dir --help`** - Shows help for the parse-dir subcommand
+
+Help takes precedence over other flags: `lasp --help --version` shows help, not version. When no arguments are given (`lasp`), general help is printed to stderr with a non-zero exit code.
 
 **Output JSON Code snippet Events:**
 ```json

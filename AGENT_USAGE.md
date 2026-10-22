@@ -121,6 +121,20 @@ lasp 0.2.0
 
 The version is embedded at build time from `build.zig.zon` (semver). To release a new version: bump `version` in `build.zig.zon` and add a `CHANGELOG.md` entry (Keep a Changelog format). `--version`/`-V` is also accepted among other flags and exits before reading any file.
 
+### Help
+
+LASP provides built-in help for discoverability:
+
+```bash
+.bin/lasp help          # General usage help
+.bin/lasp --help        # Same as help
+.bin/lasp -h            # Same as help
+.bin/lasp parse --help  # Help for parse subcommand
+.bin/lasp query --help  # Help for query subcommand
+```
+
+Help takes precedence over other flags: `.bin/lasp --help --version` shows help, not version. When no arguments are given (`.bin/lasp`), general help is printed to stderr with a non-zero exit code.
+
 ## Structural Query (`lasp query`)
 
 Query events using CSS-selector-inspired syntax. Requires a grammar (`-g`).
@@ -407,4 +421,4 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | `query` without selector | stderr message, non-zero exit |
 | `query` without grammar | stderr message, non-zero exit |
 | Malformed query selector | stderr message, non-zero exit |
-| No args | Usage message on stderr, non-zero exit |
+| No args | Usage message on stderr, non-zero exit (same as `--help`) |

@@ -872,3 +872,211 @@ test "helpText function edge cases" {
     const null_help = helpText(null);
     try testing.expect(std.mem.eql(u8, null_help, general_help_text));
 }
+
+// --- CLI Help Text Property Tests ---
+
+// Feature: cli-help-text, Property 1: Help flag short-circuits to the help command
+test "property: help flag short-circuits to the help command" {
+    const string_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, string_gen, struct {
+        fn prop(random_string: []const u8) !void {
+            // Generate a random position for help flag (0-2)
+            // Use a deterministic hash of the string to choose position
+            var hash: u32 = 0;
+            for (random_string) |c| {
+                hash = hash *% 31 + @as(u32, c);
+            }
+            const help_pos = hash % 3; // 0, 1, or 2
+
+            // Choose which help flag to use
+            const use_long_help = (hash >> 8) % 2 == 0;
+            const help_flag = if (use_long_help) "--help" else "-h";
+
+            // Build args array with help flag at chosen position
+            var args_buf: [4][]const u8 = undefined;
+            var args_len: usize = 0;
+
+            // Add some dummy tokens
+            const dummy1 = "dummy1";
+            const dummy2 = "dummy2";
+
+            switch (help_pos) {
+                0 => {
+                    args_buf[0] = help_flag;
+                    args_buf[1] = dummy1;
+                    args_buf[2] = dummy2;
+                    args_len = 3;
+                },
+                1 => {
+                    args_buf[0] = dummy1;
+                    args_buf[1] = help_flag;
+                    args_buf[2] = dummy2;
+                    args_len = 3;
+                },
+                2 => {
+                    args_buf[0] = dummy1;
+                    args_buf[1] = dummy2;
+                    args_buf[2] = help_flag;
+                    args_len = 3;
+                },
+                else => unreachable,
+            }
+
+            const args = args_buf[0..args_len];
+            const result = try parseArgs(args);
+            try testing.expectEqual(result.command, .help);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: cli-help-text, Property 2: Per-subcommand help routing
+test "property: per-subcommand help routing" {
+    const subcommand_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, subcommand_gen, struct {
+        fn prop(random_string: []const u8) !void {
+            // Map random string to one of the subcommands
+            var hash: u32 = 0;
+            for (random_string) |c| {
+                hash = hash *% 31 + @as(u32, c);
+            }
+
+            const subcommands = [_][]const u8{ "parse", "parse-dir", "query" };
+            const sub_idx = hash % subcommands.len;
+            const subcommand = subcommands[sub_idx];
+
+            // Choose which help flag to use
+            const use_long_help = (hash >> 8) % 2 == 0;
+            const help_flag = if (use_long_help) "--help" else "-h";
+
+            // Build args: subcommand followed by help flag
+            const args = &[_][]const u8{ subcommand, help_flag };
+
+            // Parse and verify
+            const result = try parseArgs(args);
+            try testing.expectEqual(result.command, .help);
+
+            // Check help_topic matches subcommand
+            const expected_topic = switch (sub_idx) {
+                0 => Command.parse,
+                1 => Command.parse_dir,
+                2 => Command.query,
+                else => unreachable,
+            };
+            try testing.expect(result.help_topic == expected_topic);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: cli-help-text, Property 3: Help takes precedence over version
+test "property: help takes precedence over version" {
+    const string_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, string_gen, struct {
+        fn prop(random_string: []const u8) !void {
+            // Use hash to determine flag choices and order
+            var hash: u32 = 0;
+            for (random_string) |c| {
+                hash = hash *% 31 + @as(u32, c);
+            }
+
+            // Choose flag types
+            const use_long_help = (hash >> 8) % 2 == 0;
+            const use_long_version = (hash >> 9) % 2 == 0;
+            const help_first = (hash >> 10) % 2 == 0;
+
+            const help_flag = if (use_long_help) "--help" else "-h";
+            const version_flag = if (use_long_version) "--version" else "-V";
+
+            // Build args with both flags
+            const args = if (help_first)
+                &[_][]const u8{ help_flag, version_flag }
+            else
+                &[_][]const u8{ version_flag, help_flag };
+
+            // Parse and verify help takes precedence
+            const result = try parseArgs(args);
+            try testing.expectEqual(result.command, .help);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: cli-help-text, Property 4: Non-subcommand help requests yield general help
+test "property: non-subcommand help requests yield general help" {
+    const string_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, string_gen, struct {
+        fn prop(random_string: []const u8) !void {
+            // Use hash to determine type of help request
+            var hash: u32 = 0;
+            for (random_string) |c| {
+                hash = hash *% 31 + @as(u32, c);
+            }
+
+            const request_type = hash % 3; // 0, 1, or 2
+
+            const args = switch (request_type) {
+                0 => &[_][]const u8{"--help"},
+                1 => &[_][]const u8{"-h"},
+                2 => &[_][]const u8{"help"},
+                else => unreachable,
+            };
+
+            // Parse and verify
+            const result = try parseArgs(args);
+            try testing.expectEqual(result.command, .help);
+            try testing.expect(result.help_topic == null);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: cli-help-text, Property 5: Non-help parsing is preserved
+test "property: non-help parsing is preserved" {
+    const string_gen = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, string_gen, struct {
+        fn prop(random_string: []const u8) !void {
+            // Use hash to generate different argument patterns
+            var hash: u32 = 0;
+            for (random_string) |c| {
+                hash = hash *% 31 + @as(u32, c);
+            }
+
+            // Generate different argument patterns that don't contain help flags
+            // and don't start with "help"
+            const pattern = hash % 4;
+
+            switch (pattern) {
+                0 => {
+                    // Empty args -> NoCommand error
+                    const args = &[_][]const u8{};
+                    const result = parseArgs(args);
+                    try testing.expectError(error.NoCommand, result);
+                },
+                1 => {
+                    // Valid parse command
+                    const args = &[_][]const u8{ "parse", "file.zig" };
+                    const result = try parseArgs(args);
+                    try testing.expectEqual(result.command, .parse);
+                    try testing.expect(result.help_topic == null);
+                },
+                2 => {
+                    // Valid parse-dir command
+                    const args = &[_][]const u8{ "parse-dir", "src/" };
+                    const result = try parseArgs(args);
+                    try testing.expectEqual(result.command, .parse_dir);
+                    try testing.expect(result.help_topic == null);
+                },
+                3 => {
+                    // Valid query command
+                    const args = &[_][]const u8{ "query", "function", "file.zig", "-g", "grammar.toml" };
+                    const result = try parseArgs(args);
+                    try testing.expectEqual(result.command, .query);
+                    try testing.expect(result.help_topic == null);
+                },
+                else => unreachable,
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}

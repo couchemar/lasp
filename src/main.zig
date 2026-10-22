@@ -344,6 +344,182 @@ test "integration: --version prints version and exits zero" {
     try std.testing.expect(std.mem.startsWith(u8, result.stdout, "lasp "));
 }
 
+// --- Integration Tests for CLI Help Text Feature ---
+
+test "integration: help command prints usage and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{"help"});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain basic help text
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp - Language-Agnostic Structural Parser"));
+}
+
+test "integration: --help flag prints usage and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{"--help"});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp - Language-Agnostic Structural Parser"));
+}
+
+test "integration: -h flag prints usage and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{"-h"});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp - Language-Agnostic Structural Parser"));
+}
+
+test "integration: parse --help prints parse-specific help and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "--help" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain parse-specific help
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp parse - parse a single file"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "<file|->"));
+}
+
+test "integration: parse -h prints parse-specific help and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "-h" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp parse - parse a single file"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "<file|->"));
+}
+
+test "integration: query --help prints query-specific help and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "--help" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain query-specific help
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp query - filter structural events"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "<selector>"));
+}
+
+test "integration: parse-dir --help prints parse-dir-specific help and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse-dir", "--help" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain parse-dir-specific help
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp parse-dir - parse all files in a directory"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "<dir>"));
+}
+
+test "integration: query -h prints query-specific help and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "query", "-h" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain query-specific help
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp query - filter structural events"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "<selector>"));
+}
+
+test "integration: parse-dir -h prints parse-dir-specific help and exits zero" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse-dir", "-h" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain parse-dir-specific help
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp parse-dir - parse all files in a directory"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "<dir>"));
+}
+
+test "integration: help with invalid files/grammar prints usage and exits zero (no file error)" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "parse", "nonexistent.zig", "-g", "nope.toml", "--help" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain help text
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
+    // Should NOT contain file/grammar error messages on stderr
+    try std.testing.expect(result.stderr.len == 0);
+}
+
+test "integration: help takes precedence over version (--help --version)" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "--help", "--version" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should be help text, not version
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
+    // Help text starts with "lasp - Language-Agnostic Structural Parser", not "lasp 0.2.0"
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp - Language-Agnostic Structural Parser"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, result.stdout, 1, "lasp 0.2.0"));
+}
+
+test "integration: help takes precedence over version (--version --help)" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{ "--version", "--help" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should be help text, not version
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "lasp - Language-Agnostic Structural Parser"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, result.stdout, 1, "lasp 0.2.0"));
+}
+
+test "integration: help with stdin short-circuits before reading stdin" {
+    const allocator = std.testing.allocator;
+    const source = "fn add() void {}\n"; // Some valid code
+
+    const result = try runLaspWithStdin(allocator, &.{ "parse", "-", "--help" }, source);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    // Should contain help text, not parse output
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, result.stdout, 1, "\"type\": \"function\""));
+}
+
 test "integration: parse with TOML grammar produces structural events" {
     const allocator = std.testing.allocator;
     const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--grammar", "tests/fixtures/grammars/zig.toml" });

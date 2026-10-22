@@ -17,6 +17,7 @@ Use it to map a file's structure before editing, locate definitions and call sit
   lasp --version
   ```
 - If the command is not found, install LASP and re-run the check before relying on it.
+- For command discovery and syntax help, use `lasp --help` or `lasp help`.
 
 ## Project layout for LASP
 
@@ -121,6 +122,24 @@ Use `-` as the file path to read source from stdin:
 ```bash
 echo 'def add(a, b): return a + b' | lasp parse - -g .lasp/grammars/python.toml
 ```
+
+### Parse directory (batch processing)
+```bash
+lasp parse-dir <directory> --grammar-dir .lasp/grammars/
+```
+Parses all files in a directory using grammars from the specified directory. Useful for batch analysis of an entire codebase.
+
+### Help
+```bash
+lasp help          # General usage help
+lasp --help        # Same as help
+lasp -h            # Same as help
+lasp parse --help  # Help for parse subcommand
+lasp query --help  # Help for query subcommand
+lasp parse-dir --help  # Help for parse-dir subcommand
+```
+
+Help takes precedence over other flags: `lasp --help --version` shows help, not version. When no arguments are given (`lasp`), general help is printed to stderr with a non-zero exit code.
 
 ### Version
 ```bash
