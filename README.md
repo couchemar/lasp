@@ -406,7 +406,10 @@ Confidence scores allow agents operating autonomously over massive unknown depen
 - **Frequency-based thresholds**: Repeated similar structures build dynamic confidence over a repository
 
 ### Alternatives output (`--alternatives`)
-Opt-in parse-only flag: every winning event carries an `alternatives` JSON array listing the losing competitors from the same overlapping region (each with only `type`, `confidence`, and captures). Flag off ⇒ byte-identical output with no `alternatives` key. Rejected on `query`; ignored by `--names-only`. Designed as the probabilistic front-end for an LLM disambiguator (`request deeper analysis where confidence < 0.8`).
+
+
+### Resemblance output (`--resemble`)
+Opt-in parse-only flag: scores each token's partial membership against the grammar's own `char_class_run` kinds (relaxed recognition) and surfaces the best above-floor match as an advisory alternative. `0x01` under a `number` kind whose set is `0-9` surfaces as a low-confidence `number` candidate — the grammar is the feature basis, the binary supplies only the scoring. Implies alternatives collection; resemblance candidates carry `"source": "resemblance"`, `"resembled_kind"`, and `"membership"` (score == confidence). Never changes the winner or emits structure the grammar did not license. Rejected on `query`; ignored by `--names-only`; no char-class kinds ⇒ no resemblance; flag off ⇒ byte-identical output.
 
 ---
 

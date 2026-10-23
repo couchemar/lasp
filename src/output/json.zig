@@ -118,6 +118,15 @@ pub fn serializeEventsWithAlternatives(events_list: []const StructuralEvent, inc
                 try writer.writeAll(alt.type_name);
                 try writer.writeAll("\", \"confidence\": ");
                 try writer.print("{d:.2}", .{alt.confidence});
+                if (alt.source == .resemblance) {
+                    // Advisory grammar-projected resemblance: mark the source and
+                    // repeat the resembled kind name + membership score (the
+                    // score IS the confidence).
+                    try writer.writeAll(", \"source\": \"resemblance\", \"resembled_kind\": \"");
+                    try writer.writeAll(alt.type_name);
+                    try writer.writeAll("\", \"membership\": ");
+                    try writer.print("{d:.2}", .{alt.confidence});
+                }
                 for (alt.captures) |cap| {
                     try writer.writeAll(", \"");
                     try writer.writeAll(cap.field_name);
@@ -695,4 +704,79 @@ test "property: alternative field set" {
             try testing.expect(alt.get("block_start") == null);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: grammar-projected-resemblance, Unit: alternatives serialization
+// **Validates: Requirements 6.2, 6.3, 6.4**
+test "serializeEventsWithAlternatives: resemblance alternative carries source marker" {
+    const ev = StructuralEvent{
+        .type_name = "literal",
+        .captures = &.{},
+        .start = 0,
+        .end = 4,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .alternatives = &.{
+            .{ .type_name = "number", .confidence = 0.83, .captures = &.{}, .source = .resemblance },
+        },
+    };
+    const result = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+    defer testing.allocator.free(result);
+
+    // Exact bytes: resemblance alternative carries type, confidence, source,
+    // resembled kind name, and membership score.
+    try testing.expect(std.mem.indexOf(u8, result,
+        "\"alternatives\": [ { \"type\": \"number\", \"confidence\": 0.83, \"source\": \"resemblance\", \"resembled_kind\": \"number\", \"membership\": 0.83 } ]") != null);
+}
+
+test "serializeEventsWithAlternatives: resemblance marker absent when flag off or grammar-sourced" {
+    const ev = StructuralEvent{
+        .type_name = "decl",
+        .captures = &.{},
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .alternatives = &.{
+            .{ .type_name = "call", .confidence = 0.5, .captures = &.{} },
+        },
+    };
+    const off = try serializeEventsToStringWithAlternatives(&.{ev}, false);
+    defer testing.allocator.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "source") == null);
+    try testing.expect(std.mem.indexOf(u8, off, "resemblance") == null);
+
+    const on = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+    defer testing.allocator.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "source") == null);
+}
+
+test "serializeEventsWithAlternatives: resemblance output is valid JSON" {
+    const ev = StructuralEvent{
+        .type_name = "literal",
+        .captures = &.{},
+        .start = 0,
+        .end = 4,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .alternatives = &.{
+            .{ .type_name = "number", .confidence = 0.83, .captures = &.{}, .source = .resemblance },
+            .{ .type_name = "other", .confidence = 0.4, .captures = &.{} },
+        },
+    };
+    const result = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+    defer testing.allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const alts = parsed.value.object.get("events").?.array.items[0].object.get("alternatives").?.array.items;
+    try testing.expectEqual(@as(usize, 2), alts.len);
+    const resemblance_alt = alts[0].object;
+    try testing.expectEqualStrings("resemblance", resemblance_alt.get("source").?.string);
+    try testing.expectEqualStrings("number", resemblance_alt.get("resembled_kind").?.string);
+    try testing.expectApproxEqRel(@as(f64, 0.83), resemblance_alt.get("membership").?.float, 0.001);
+    const grammar_alt = alts[1].object;
+    try testing.expect(grammar_alt.get("source") == null);
 }

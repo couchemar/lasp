@@ -1,0 +1,11 @@
+[[patterns]]
+type = "literal"
+sequence = ["hexlit"]
+
+[[patterns]]
+type = "num"
+sequence = ["number"]
+
+[tokens]
+hexlit = { literal_set = ["0x01", "0b10"] }
+number = { char_class_run = { start = "0-9", continue = "0-9" } }

@@ -6,11 +6,11 @@ pub const grammar_loader = @import("grammar/loader.zig");
 pub const grammar_compiler = @import("grammar/compiler.zig");
 pub const events = @import("parser/events.zig");
 pub const engine = @import("parser/engine.zig");
+pub const resemblance = @import("parser/resemblance.zig");
 pub const query_filter = @import("query/filter.zig");
 pub const query_parser = @import("query/parser.zig");
 pub const query_evaluator = @import("query/evaluator.zig");
 const build_options = @import("build_options");
-
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
 /// Prints descriptive error messages to stderr for FileNotFound and AccessDenied.
@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
                 try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
             else
                 try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
-            const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, false, allocator);
+            const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, parsed.resemble, false, allocator);
 
             // Parse selector string into QueryFilter
             const selector = parsed.query_selector orelse {
@@ -217,7 +217,10 @@ pub fn main(init: std.process.Init) !void {
                     try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
                 else
                     try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
-                var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, parsed.alternatives, allocator);
+                // --resemble implies collecting alternatives so resemblance
+                // candidates are surfaced through the alternatives path.
+                const collect_alternatives = parsed.alternatives or parsed.resemble;
+                var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, parsed.resemble, collect_alternatives, allocator);
 
                 // Apply node filter if specified
                 if (parsed.node_filter) |filter| {
@@ -240,7 +243,7 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                 } else {
-                    try json.serializeEventsWithAlternatives(structural_events, parsed.alternatives, stdout);
+                    try json.serializeEventsWithAlternatives(structural_events, collect_alternatives, stdout);
                 }
             } else {
                 // No grammar: raw token output
@@ -264,6 +267,7 @@ test {
     // Pull in tests from all modules.
     _ = cli;
     _ = tokenizer;
+    _ = resemblance;
 }
 
 test "readSourceFile returns file contents" {
@@ -2041,4 +2045,64 @@ test "integration: existing zig grammar output unchanged (no [tokens])" {
     }
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "add") != null);
+}
+
+// Feature: grammar-projected-resemblance, Integration
+// **Validates: Requirements 4.1, 5.1, 6.1**
+test "integration: --resemble surfaces number resemblance alternatives end-to-end" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/resemblance_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/resemblance.toml",
+        "--resemble",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), events_arr.len);
+
+    // Hex/bin literals → grammar `literal` primary with a `number` resemblance alternative.
+    for (events_arr[0..2]) |ev| {
+        try std.testing.expectEqualStrings("literal", ev.object.get("type").?.string);
+        const alts = ev.object.get("alternatives").?.array.items;
+        var saw_number = false;
+        for (alts) |alt| {
+            if (std.mem.eql(u8, alt.object.get("type").?.string, "number") and
+                std.mem.eql(u8, alt.object.get("source").?.string, "resemblance"))
+            {
+                saw_number = true;
+                try std.testing.expect(alt.object.get("membership").?.float < 1.0);
+            }
+        }
+        try std.testing.expect(saw_number);
+    }
+
+    // "42" → exact `num` primary.
+    const num_ev = events_arr[2].object;
+    try std.testing.expectEqualStrings("num", num_ev.get("type").?.string);
+}
+
+test "integration: parse without --resemble is unchanged for resemblance fixture" {
+    const allocator = std.testing.allocator;
+    const plain = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/resemblance_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/resemblance.toml",
+    });
+    defer {
+        allocator.free(plain.stdout);
+        allocator.free(plain.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, plain.term);
+    try std.testing.expect(std.mem.indexOf(u8, plain.stdout, "alternatives") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.stdout, "source") == null);
 }

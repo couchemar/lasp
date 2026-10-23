@@ -18,6 +18,7 @@ pub const ParsedArgs = struct {
     query_selector: ?[]const u8 = null,
     help_topic: ?Command = null,
     alternatives: bool = false,
+    resemble: bool = false,
 };
 
 pub const CliError = error{
@@ -29,6 +30,7 @@ pub const CliError = error{
     MissingFlagValue,
     MissingSelectorString,
     AlternativesOnQuery,
+    ResembleOnQuery,
 };
 
 pub const general_help_text =
@@ -41,18 +43,12 @@ pub const general_help_text =
     \\  lasp version
     \\  lasp help
     \\
-    \\Commands:
-    \\  parse       Parse a single file into structural or token events
-    \\  parse-dir   Parse all files in a directory
-    \\  query       Filter structural events with a CSS-like selector
-    \\  version     Print the version and exit
-    \\  help        Print this help and exit
-    \\
     \\Flags:
     \\  -g, --grammar <path>   Grammar TOML file (structural parsing)
     \\      --grammar-dir <d>  Grammar directory (parse-dir)
     \\  -n, --node <type>      Emit only events of this type (case-insensitive)
     \\      --names-only       Emit first capture value per event, one per line
+    \\      --resemble         Annotate alternatives with grammar-projected token resemblance
     \\  -V, --version          Print the version and exit
     \\  -h, --help             Print help and exit
     \\
@@ -75,7 +71,7 @@ pub const parse_help_text =
     \\Flags:
     \\  -g, --grammar <path>   Grammar TOML file; omit for raw token output
     \\  -n, --node <type>      Emit only events of this type (case-insensitive)
-    \\      --names-only       Emit first capture value per event, one per line
+    \\      --resemble         Annotate alternatives with grammar-projected token resemblance
     \\
 ;
 
@@ -130,6 +126,7 @@ pub fn formatCliError(err: CliError) []const u8 {
         error.MissingFlagValue => "error: flag requires a value",
         error.MissingSelectorString => "error: query command requires a selector string",
         error.AlternativesOnQuery => "error: --alternatives is supported on the parse command only",
+        error.ResembleOnQuery => "error: --resemble is supported on the parse command only",
     };
 }
 
@@ -185,6 +182,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     var node_filter: ?[]const u8 = null;
     var names_only: bool = false;
     var alternatives: bool = false;
+    var resemble: bool = false;
 
     var i: usize = 2;
     while (i < args.len) {
@@ -206,6 +204,8 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
             names_only = true;
         } else if (std.mem.eql(u8, arg, "--alternatives")) {
             alternatives = true;
+        } else if (std.mem.eql(u8, arg, "--resemble")) {
+            resemble = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
@@ -223,6 +223,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
         .node_filter = node_filter,
         .names_only = names_only,
         .alternatives = alternatives,
+        .resemble = resemble,
     };
 }
 
@@ -255,6 +256,8 @@ fn parseQueryArgs(args: []const []const u8) CliError!ParsedArgs {
             names_only = true;
         } else if (std.mem.eql(u8, arg, "--alternatives")) {
             return error.AlternativesOnQuery;
+        } else if (std.mem.eql(u8, arg, "--resemble")) {
+            return error.ResembleOnQuery;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
@@ -1126,4 +1129,34 @@ test "--alternatives composes with other flags" {
 
 test "formatCliError: AlternativesOnQuery message" {
     try testing.expectEqualStrings("error: --alternatives is supported on the parse command only", formatCliError(error.AlternativesOnQuery));
+}
+
+// Feature: grammar-projected-resemblance, Unit: flag parsing
+// **Validates: Requirement 5.2**
+test "--resemble sets flag on parse" {
+    const args = &[_][]const u8{ "parse", "file.zig", "--resemble" };
+    const result = try parseArgs(args);
+    try testing.expect(result.resemble);
+}
+
+test "--resemble on query is rejected" {
+    const args = &[_][]const u8{ "query", "function", "file.zig", "-g", "g.toml", "--resemble" };
+    try testing.expectError(error.ResembleOnQuery, parseArgs(args));
+}
+
+test "--resemble composes with -g and --node" {
+    const args = &[_][]const u8{ "parse", "file.zig", "-g", "g.toml", "--node", "function", "--resemble" };
+    const result = try parseArgs(args);
+    try testing.expect(result.resemble);
+    try testing.expectEqualStrings("function", result.node_filter.?);
+    try testing.expectEqualStrings("g.toml", result.grammar_path.?);
+}
+
+test "formatCliError: ResembleOnQuery message" {
+    try testing.expectEqualStrings("error: --resemble is supported on the parse command only", formatCliError(error.ResembleOnQuery));
+}
+
+test "help text mentions --resemble" {
+    try testing.expect(std.mem.indexOf(u8, general_help_text, "--resemble") != null);
+    try testing.expect(std.mem.indexOf(u8, parse_help_text, "--resemble") != null);
 }

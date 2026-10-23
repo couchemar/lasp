@@ -10,12 +10,17 @@ pub const CaptureEntry = struct {
     value: []const u8,
 };
 
+/// Origin of a candidate: `.grammar` (pattern match) or `.resemblance`
+/// (grammar-projected token resemblance, advisory).
+pub const CandidateSource = enum { grammar, resemblance };
+
 /// A non-winning candidate from the same Candidate_Set as a winning event.
-/// Carries only type, confidence, and captures — no position fields.
 pub const Alternative = struct {
     type_name: []const u8,
     confidence: f32,
     captures: []const CaptureEntry,
+    /// Candidate origin (see `CandidateSource`).
+    source: CandidateSource = .grammar,
 };
 
 pub const StructuralEvent = struct {

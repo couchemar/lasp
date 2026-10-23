@@ -79,7 +79,26 @@ Opt-in, parse-only boolean flag: every winning event gains an `alternatives` JSO
   "alternatives": [ { "type": "call", "confidence": 0.60, "callee": "foo" } ] }
 ```
 
-Use it to inspect the full distribution of interpretations for a region — the probabilistic front-end for an LLM disambiguator.
+
+
+### Resemblance output (`--resemble`)
+
+Opt-in, parse-only boolean flag: scores each token's partial membership against the grammar's own `char_class_run` kinds (relaxed recognition) and surfaces the best above-floor match as an advisory alternative on the affected event. A token that no kind fully recognizes (e.g. `0x01` under a `number` kind whose set is `0-9`) appears as a low-confidence `number` candidate — the grammar is the feature basis, the binary supplies only the scoring.
+
+`--resemble` implies `--alternatives` collection for the affected regions; resemblance candidates appear in the event's `alternatives` array with `"source": "resemblance"`, `"resembled_kind"` (the resembled kind name), and `"membership"` (the score, which equals the confidence). Grammar-matched candidates win their region unchanged; resemblance can never become the winner or create a primary event the grammar did not license. Rejected on `query`; ignored by `--names-only`; no char-class kinds ⇒ no resemblance.
+
+```bash
+.bin/lasp parse file.txt -g grammars/num.toml --resemble
+```
+
+```json
+{ "type": "literal", "start": 0, "end": 4, "confidence": 1.00,
+  "alternatives": [ { "type": "number", "confidence": 0.83,
+                      "source": "resemblance", "resembled_kind": "number",
+                      "membership": 0.83 } ] }
+```
+
+Without the flag, output is byte-for-byte identical and no `source`/`resemblance` keys appear. See `tests/fixtures/grammars/resemblance.toml` (and `examples/grammars/erlang_tokens.toml`/`forth_tokens.toml` for `[tokens]` grammars).
 
 Emit just the first capture value per event, one per line — plain text, no JSON:
 
