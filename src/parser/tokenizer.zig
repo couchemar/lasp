@@ -20,6 +20,78 @@ pub const Token = struct {
     end: usize,
     line: usize,
     col: usize,
+    /// Index into the grammar's KindVocabulary for content tokens; 0 for structural
+    /// tokens and for the default-profile path.
+    kind_id: usize = 0,
+};
+
+/// A 256-entry membership bitset compiled from a char-set spec.
+pub const CharClass = struct {
+    bits: [256]bool = [_]bool{false} ** 256,
+
+    pub fn set(self: *CharClass, c: u8) void {
+        self.bits[c] = true;
+    }
+
+    pub fn contains(self: CharClass, c: u8) bool {
+        return self.bits[c];
+    }
+};
+
+/// Serializes a CharClass back into a canonical char-set spec string
+/// (runs as `lo-hi`, singles literal, ambiguous bytes `\u`-escaped).
+pub fn writeCharSetSpec(cc: CharClass, w: anytype) !void {
+    var b: usize = 0;
+    while (b < 256) {
+        if (!cc.bits[b]) {
+            b += 1;
+            continue;
+        }
+        var run_end = b + 1;
+        while (run_end < 256 and cc.bits[run_end]) run_end += 1;
+        const len = run_end - b;
+        if (len == 1) {
+            try writeCharSpec(@intCast(b), w);
+        } else {
+            try writeCharSpec(@intCast(b), w);
+            try w.writeByte('-');
+            try writeCharSpec(@intCast(run_end - 1), w);
+        }
+        b = run_end;
+    }
+}
+
+pub fn writeCharSpec(c: u8, w: anytype) !void {
+    switch (c) {
+        '"', '\\', '-' => try w.print("\\u{X:0>4}", .{c}),
+        else => try w.writeByte(c),
+    }
+}
+
+pub const CharClassRun = struct {
+    start: CharClass,
+    cont: CharClass,
+};
+
+pub const DelimitedSpan = struct {
+    open: []const u8,
+    close: []const u8,
+    escape: ?u8,
+};
+
+pub const Recognizer = union(enum) {
+    char_class_run: CharClassRun,
+    delimited_span: DelimitedSpan,
+    literal_set: []const []const u8,
+};
+
+pub const KindDefinition = struct {
+    name: []const u8,
+    recognizer: Recognizer,
+};
+
+pub const KindVocabulary = struct {
+    kinds: []const KindDefinition,
 };
 
 /// Result of a comment match attempt
@@ -340,6 +412,164 @@ pub fn tokenize(
 
         // Unknown bytes — skip
         i += 1;
+    }
+
+    return tokens.toOwnedSlice(allocator);
+}
+
+// --- Vocabulary-driven scan ([tokens] grammars) ---
+
+fn tryRecognizer(rec: Recognizer, source: []const u8, at: usize) ?usize {
+    return switch (rec) {
+        .char_class_run => |r| {
+            if (at >= source.len or !r.start.contains(source[at])) return null;
+            var end = at + 1;
+            while (end < source.len and r.cont.contains(source[end])) : (end += 1) {}
+            return end;
+        },
+        .delimited_span => |d| {
+            if (!std.mem.startsWith(u8, source[at..], d.open)) return null;
+            var pos = at + d.open.len;
+            while (pos < source.len) {
+                if (d.escape) |esc| {
+                    if (source[pos] == esc) {
+                        pos += 2;
+                        continue;
+                    }
+                }
+                if (std.mem.startsWith(u8, source[pos..], d.close)) {
+                    return pos + d.close.len;
+                }
+                pos += 1;
+            }
+            return source.len; // unclosed span extends to EOF
+        },
+        .literal_set => |set| {
+            var best: usize = 0;
+            for (set) |lit| {
+                if (lit.len > best and std.mem.startsWith(u8, source[at..], lit)) {
+                    best = lit.len;
+                }
+            }
+            if (best > 0) return at + best;
+            return null;
+        },
+    };
+}
+
+fn kindTokenKind(name: []const u8, rec: Recognizer) TokenKind {
+    if (std.mem.eql(u8, name, "identifier")) return .identifier;
+    if (std.mem.eql(u8, name, "keyword")) return .keyword;
+    if (std.mem.eql(u8, name, "symbol")) return .symbol;
+    if (std.mem.eql(u8, name, "string")) return .string;
+    if (std.mem.eql(u8, name, "number")) return .number;
+    if (std.mem.eql(u8, name, "operator")) return .operator;
+    if (std.mem.eql(u8, name, "delimiter")) return .delimiter;
+    // Custom (non-built-in) kind names fall back to a content kind derived from
+    // their recognizer shape so default matching paths (e.g. .punctuation
+    // matchers against literal-set tokens) keep working.
+    return switch (rec) {
+        .char_class_run, .delimited_span => .identifier,
+        .literal_set => .symbol,
+    };
+}
+
+/// Tokenizes source using a grammar-declared KindVocabulary. Structural kinds
+/// (newline/indent/comment) and whitespace handling mirror the default path.
+pub fn tokenizeWithVocab(
+    source: []const u8,
+    vocab: KindVocabulary,
+    keyword_table: ?[]const []const u8,
+    comments: CommentConfig,
+    allocator: std.mem.Allocator,
+) ![]Token {
+    if (source.len == 0) return &[_]Token{};
+
+    var tokens: std.ArrayList(Token) = .empty;
+    var i: usize = 0;
+    var at_line_start = true;
+    var current_line: usize = 1;
+    var line_start: usize = 0;
+
+    while (i < source.len) {
+        const c = source[i];
+
+        if (c == '\n') {
+            try tokens.append(allocator, .{ .kind = .newline, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
+            i += 1;
+            at_line_start = true;
+            current_line += 1;
+            line_start = i;
+            const indent_start = i;
+            while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
+            if (i > indent_start) {
+                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
+            }
+            continue;
+        }
+
+        if (isWhitespace(c)) {
+            if (at_line_start) {
+                const indent_start = i;
+                while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
+                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
+                at_line_start = false;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        at_line_start = false;
+
+        if (tryMatchComment(source, i, comments)) |match| {
+            const start = i;
+            i = match.end;
+            const token_line_start = line_start;
+            const token_line = current_line;
+            if (match.is_block) {
+                current_line += match.newline_count;
+                var scan_pos = i;
+                line_start = i;
+                while (scan_pos > 0) {
+                    scan_pos -= 1;
+                    if (source[scan_pos] == '\n') {
+                        line_start = scan_pos + 1;
+                        break;
+                    }
+                }
+            }
+            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = token_line, .col = start - token_line_start });
+            continue;
+        }
+
+        var matched = false;
+        for (vocab.kinds, 0..) |def, id| {
+            if (tryRecognizer(def.recognizer, source, i)) |end| {
+                var kind = kindTokenKind(def.name, def.recognizer);
+                // [keywords] overlay: identifier runs whose text is in the keyword
+                // table emit as keyword-kind tokens.
+                if (kind == .identifier) {
+                    if (keyword_table) |kt| {
+                        if (isKeyword(source[i..end], kt)) kind = .keyword;
+                    }
+                }
+                try tokens.append(allocator, .{
+                    .kind = kind,
+                    .start = i,
+                    .end = end,
+                    .line = current_line,
+                    .col = i - line_start,
+                    .kind_id = id,
+                });
+                i = end;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        i += 1; // unknown byte advances by one
     }
 
     return tokens.toOwnedSlice(allocator);
@@ -1322,6 +1552,362 @@ test "property: comment does not swallow subsequent code" {
             try testing.expectEqualStrings("=", input[tokens[3].start..tokens[3].end]);
             try testing.expectEqual(TokenKind.number, tokens[4].kind);
             try testing.expectEqualStrings("1", input[tokens[4].start..tokens[4].end]);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+
+// --- Grammar vocabulary scan tests (configurable-token-kinds) ---
+
+fn ccAlpha() CharClass {
+    var cc = CharClass{};
+    cc.set('a');
+    cc.set('b');
+    cc.set('c');
+    cc.set('d');
+    cc.set('e');
+    cc.set('f');
+    cc.set('g');
+    cc.set('h');
+    cc.set('i');
+    cc.set('j');
+    cc.set('k');
+    cc.set('l');
+    cc.set('m');
+    cc.set('n');
+    cc.set('o');
+    cc.set('p');
+    cc.set('q');
+    cc.set('r');
+    cc.set('s');
+    cc.set('t');
+    cc.set('u');
+    cc.set('v');
+    cc.set('w');
+    cc.set('x');
+    cc.set('y');
+    cc.set('z');
+    cc.set('A');
+    cc.set('B');
+    cc.set('C');
+    cc.set('D');
+    cc.set('E');
+    cc.set('F');
+    cc.set('G');
+    cc.set('H');
+    cc.set('I');
+    cc.set('J');
+    cc.set('K');
+    cc.set('L');
+    cc.set('M');
+    cc.set('N');
+    cc.set('O');
+    cc.set('P');
+    cc.set('Q');
+    cc.set('R');
+    cc.set('S');
+    cc.set('T');
+    cc.set('U');
+    cc.set('V');
+    cc.set('W');
+    cc.set('X');
+    cc.set('Y');
+    cc.set('Z');
+    cc.set('_');
+    return cc;
+}
+
+fn ccAlphaNum() CharClass {
+    var cc = ccAlpha();
+    var d: u8 = '0';
+    while (d <= '9') : (d += 1) cc.set(d);
+    return cc;
+}
+
+fn ccDigits() CharClass {
+    var cc = CharClass{};
+    var d: u8 = '0';
+    while (d <= '9') : (d += 1) cc.set(d);
+    return cc;
+}
+
+test "tokenizeWithVocab: char_class_run greedy + start/continue split" {
+    const ident = KindDefinition{
+        .name = "identifier",
+        .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+    };
+    const num = KindDefinition{
+        .name = "number",
+        .recognizer = .{ .char_class_run = .{ .start = ccDigits(), .cont = ccDigits() } },
+    };
+    const vocab = KindVocabulary{ .kinds = &.{ ident, num } };
+
+    const tokens = try tokenizeWithVocab("foo123 abc 42", vocab, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+
+    try testing.expectEqual(@as(usize, 3), tokens.len);
+    try testing.expectEqual(TokenKind.identifier, tokens[0].kind);
+    try testing.expectEqual(@as(usize, 0), tokens[0].kind_id);
+    try testing.expectEqualStrings("foo123", "foo123 abc 42"[tokens[0].start..tokens[0].end]);
+    try testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+    try testing.expectEqualStrings("abc", "foo123 abc 42"[tokens[1].start..tokens[1].end]);
+    try testing.expectEqual(TokenKind.number, tokens[2].kind);
+    try testing.expectEqual(@as(usize, 1), tokens[2].kind_id);
+    try testing.expectEqualStrings("42", "foo123 abc 42"[tokens[2].start..tokens[2].end]);
+}
+
+test "tokenizeWithVocab: first-declared kind wins on ambiguity" {
+    // Both kinds match at the same position; priority order decides.
+    const letters = KindDefinition{
+        .name = "letters",
+        .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlpha() } },
+    };
+    const alnum = KindDefinition{
+        .name = "alnum",
+        .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+    };
+    const vocab = KindVocabulary{ .kinds = &.{ letters, alnum } };
+
+    const tokens = try tokenizeWithVocab("a1", vocab, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+
+    try testing.expectEqual(@as(usize, 1), tokens.len);
+    try testing.expectEqual(@as(usize, 0), tokens[0].kind_id);
+    try testing.expectEqualStrings("a", "a1"[tokens[0].start..tokens[0].end]);
+    try testing.expectEqual(@as(usize, 1), tokens[0].end);
+}
+
+test "tokenizeWithVocab: delimited_span with escape and EOF fallback" {
+    const str = KindDefinition{
+        .name = "string",
+        .recognizer = .{ .delimited_span = .{ .open = "\"", .close = "\"", .escape = '\\' } },
+    };
+    const vocab = KindVocabulary{ .kinds = &.{str} };
+
+    // Escaped quote does not close; token spans to the closing quote.
+    const src1 = "\"a\\\"b\"";
+    const t1 = try tokenizeWithVocab(src1, vocab, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(t1);
+    try testing.expectEqual(@as(usize, 1), t1.len);
+    try testing.expectEqual(@as(usize, 0), t1[0].start);
+    try testing.expectEqual(src1.len, t1[0].end);
+
+    // Unclosed span extends to EOF.
+    const src2 = "\"abc";
+    const t2 = try tokenizeWithVocab(src2, vocab, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(t2);
+    try testing.expectEqual(@as(usize, 1), t2.len);
+    try testing.expectEqual(src2.len, t2[0].end);
+}
+
+test "tokenizeWithVocab: literal_set longest match wins" {
+    const arrow = KindDefinition{
+        .name = "arrow",
+        .recognizer = .{ .literal_set = &.{ "->", "-" } },
+    };
+    const vocab = KindVocabulary{ .kinds = &.{arrow} };
+
+    const tokens = try tokenizeWithVocab("-> -", vocab, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    try testing.expectEqualStrings("->", "-> -"[tokens[0].start..tokens[0].end]);
+    try testing.expectEqualStrings("-", "-> -"[tokens[1].start..tokens[1].end]);
+}
+
+test "tokenizeWithVocab: structural kinds still emitted" {
+    const ident = KindDefinition{
+        .name = "identifier",
+        .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+    };
+    const vocab = KindVocabulary{ .kinds = &.{ident} };
+
+    const tokens = try tokenizeWithVocab("a\n  b", vocab, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 4), tokens.len);
+    try testing.expectEqual(TokenKind.identifier, tokens[0].kind);
+    try testing.expectEqual(TokenKind.newline, tokens[1].kind);
+    try testing.expectEqual(TokenKind.indent, tokens[2].kind);
+    try testing.expectEqualStrings("  ", "a\n  b"[tokens[2].start..tokens[2].end]);
+    try testing.expectEqual(TokenKind.identifier, tokens[3].kind);
+}
+
+test "tokenizeWithVocab: comments via Config and unknown byte advance" {
+    const ident = KindDefinition{
+        .name = "identifier",
+        .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+    };
+    const vocab = KindVocabulary{ .kinds = &.{ident} };
+    const cfg = CommentConfig{ .line_prefixes = &.{"%"} };
+
+    const tokens = try tokenizeWithVocab("% hi\nx@y", vocab, null, cfg, testing.allocator);
+    defer testing.allocator.free(tokens);
+    // comment, newline, identifier("x"), identifier("y") — '@' skipped.
+    try testing.expectEqual(@as(usize, 4), tokens.len);
+    try testing.expectEqual(TokenKind.comment, tokens[0].kind);
+    try testing.expectEqual(TokenKind.newline, tokens[1].kind);
+    try testing.expectEqual(TokenKind.identifier, tokens[2].kind);
+    try testing.expectEqualStrings("x", "% hi\nx@y"[tokens[2].start..tokens[2].end]);
+    try testing.expectEqual(TokenKind.identifier, tokens[3].kind);
+    try testing.expectEqualStrings("y", "% hi\nx@y"[tokens[3].start..tokens[3].end]);
+}
+
+test "tokenizeWithVocab: keyword overlay promotes identifier-run kind" {
+    const ident = KindDefinition{
+        .name = "identifier",
+        .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+    };
+    const vocab = KindVocabulary{ .kinds = &.{ident} };
+    const keywords = [_][]const u8{"fn"};
+
+    const tokens = try tokenizeWithVocab("fn foo", vocab, &keywords, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    try testing.expectEqual(TokenKind.keyword, tokens[0].kind);
+    try testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+}
+
+test "tokenizeWithVocab: empty source yields no tokens" {
+    const vocab = KindVocabulary{ .kinds = &.{} };
+    const tokens = try tokenizeWithVocab("", vocab, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 0), tokens.len);
+}
+
+// Feature: configurable-token-kinds, Property 2: Char-class-run greedy maximal match
+test "property: char_class_run greedy maximal match" {
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 32, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            const ident = KindDefinition{
+                .name = "identifier",
+                .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+            };
+            const vocab = KindVocabulary{ .kinds = &.{ident} };
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "x{s}", .{word}) catch return;
+            const tokens = try tokenizeWithVocab(input, vocab, null, CommentConfig.default, testing.allocator);
+            defer testing.allocator.free(tokens);
+            try testing.expectEqual(@as(usize, 1), tokens.len);
+            try testing.expectEqual(input.len, tokens[0].end);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-token-kinds, Property 3: Recognizer priority determinism
+test "property: recognizer priority determinism" {
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 24, .charset = .alphanumeric });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            const letters = KindDefinition{
+                .name = "letters",
+                .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlpha() } },
+            };
+            const alnum = KindDefinition{
+                .name = "alnum",
+                .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+            };
+            const vocab = KindVocabulary{ .kinds = &.{ letters, alnum } };
+            var buf: [256]u8 = undefined;
+            const input = std.fmt.bufPrint(&buf, "a{s}", .{word}) catch return;
+            const t1 = try tokenizeWithVocab(input, vocab, null, CommentConfig.default, testing.allocator);
+            defer testing.allocator.free(t1);
+            const t2 = try tokenizeWithVocab(input, vocab, null, CommentConfig.default, testing.allocator);
+            defer testing.allocator.free(t2);
+            try testing.expectEqual(t1.len, t2.len);
+            for (t1, t2) |a, b| {
+                try testing.expectEqual(a.kind_id, b.kind_id);
+                try testing.expectEqual(a.start, b.start);
+                try testing.expectEqual(a.end, b.end);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-token-kinds, Property 4: Delimited-span boundaries and escapes
+test "property: delimited_span boundaries and escapes" {
+    const body_gen = gen.string(.{ .min_len = 0, .max_len = 32, .charset = .custom, .custom_chars = "abc XYZ123 " });
+
+    try minish.check(testing.allocator, body_gen, struct {
+        fn prop(body: []const u8) !void {
+            const str = KindDefinition{
+                .name = "string",
+                .recognizer = .{ .delimited_span = .{ .open = "\"", .close = "\"", .escape = '\\' } },
+            };
+            const ident = KindDefinition{
+                .name = "identifier",
+                .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+            };
+            const vocab = KindVocabulary{ .kinds = &.{ str, ident } };
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            const w = &aw.writer;
+            try w.writeByte('"');
+            try w.writeAll(body);
+            try w.writeByte('"');
+            try w.writeByte('x');
+            const input = aw.written();
+
+            const tokens = try tokenizeWithVocab(input, vocab, null, CommentConfig.default, testing.allocator);
+            defer testing.allocator.free(tokens);
+            try testing.expectEqual(@as(usize, 2), tokens.len);
+            // First token spans open quote through close quote.
+            try testing.expectEqual(@as(usize, 0), tokens[0].start);
+            try testing.expectEqual(input.len - 1, tokens[0].end);
+            try testing.expectEqual(TokenKind.identifier, tokens[1].kind);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-token-kinds, Property 5: Literal-set exact membership
+test "property: literal_set exact membership" {
+    const idx_gen = gen.intRange(u8, 0, 2);
+
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idx: u8) !void {
+            const op = KindDefinition{
+                .name = "op",
+                .recognizer = .{ .literal_set = &.{ "->", "=>", "::" } },
+            };
+            const vocab = KindVocabulary{ .kinds = &.{op} };
+            const lits = [_][]const u8{ "->", "=>", "::" };
+            const input = lits[idx];
+            const tokens = try tokenizeWithVocab(input, vocab, null, CommentConfig.default, testing.allocator);
+            defer testing.allocator.free(tokens);
+            try testing.expectEqual(@as(usize, 1), tokens.len);
+            try testing.expectEqualStrings(input, input[tokens[0].start..tokens[0].end]);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-token-kinds, Property 8: Single-pass linearity (coverage + no overlap)
+test "property: vocab scan is single-pass and total" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 128, .charset = .custom, .custom_chars = "abc123 \n\t" });
+
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(source: []const u8) !void {
+            const ident = KindDefinition{
+                .name = "identifier",
+                .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlphaNum() } },
+            };
+            const num = KindDefinition{
+                .name = "number",
+                .recognizer = .{ .char_class_run = .{ .start = ccDigits(), .cont = ccDigits() } },
+            };
+            const vocab = KindVocabulary{ .kinds = &.{ ident, num } };
+            const tokens = try tokenizeWithVocab(source, vocab, null, CommentConfig.default, testing.allocator);
+            defer testing.allocator.free(tokens);
+
+            // Tokens are ordered and non-overlapping.
+            var prev_end: usize = 0;
+            for (tokens) |tok| {
+                try testing.expect(tok.start >= prev_end);
+                try testing.expect(tok.end > tok.start);
+                prev_end = tok.end;
+            }
+            // Unknown bytes are skipped, so coverage may be partial — but never beyond source.
+            try testing.expect(tokens.len == 0 or tokens[tokens.len - 1].end <= source.len);
         }
     }.prop, .{ .num_runs = 100 });
 }

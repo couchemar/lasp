@@ -21,6 +21,7 @@ pub const Grammar = struct {
     blocks: BlockConfig,
     weights: EvidenceWeights = .{},
     comments: CommentConfig = .{},
+    tokens: ?tokenizer.KindVocabulary = null,
 };
 
 pub const KeywordCategory = struct {
@@ -63,6 +64,7 @@ pub const KindRef = union(enum) {
     any,
     one: TokenKind,
     punctuation,
+    id: usize,
 };
 
 pub const TextConstraint = union(enum) {
@@ -127,6 +129,12 @@ pub const GrammarError = error{
     TooManyLinePrefixes,
     BlockDelimiterTooLong,
     OutOfMemory,
+    InvalidTokenSection,
+    DuplicateKindName,
+    EmptyKindName,
+    InvalidRecognizer,
+    InvalidCharSet,
+    EmptyLiteralSet,
 };
 
 const delimiter_chars = "(){}[]";
@@ -164,6 +172,26 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
         }
     }
 }
+
+/// Compiles a char-set spec ("a-zA-Z0-9_") into a CharClass bitset.
+fn compileCharSet(spec: []const u8) GrammarError!tokenizer.CharClass {
+    var cc = tokenizer.CharClass{};
+    var i: usize = 0;
+    while (i < spec.len) {
+        const lo = spec[i];
+        if (i + 2 < spec.len and spec[i + 1] == '-' and spec[i + 2] != '?') {
+            const hi = spec[i + 2];
+            if (lo > hi) return error.InvalidCharSet;
+            var ch = lo;
+            while (ch <= hi) : (ch += 1) cc.set(ch);
+            i += 3;
+        } else {
+            cc.set(lo);
+            i += 1;
+        }
+    }
+    return cc;
+}
 const CaptureParams = struct {
     separator: ?[]const u8,
     suffix_set: ?[]const u8,
@@ -178,12 +206,32 @@ fn resolveKind(name: []const u8) ?KindRef {
     return null;
 }
 
+/// Resolves a kind name against the default table first, then the grammar's
+/// declared [tokens] vocabulary. Unknown name → null.
+fn vocabKindRef(name: []const u8, vocab: ?tokenizer.KindVocabulary) ?KindRef {
+    if (resolveKind(name)) |r| return r;
+    if (vocab) |v| {
+        for (v.kinds, 0..) |def, id| {
+            if (std.mem.eql(u8, def.name, name)) return .{ .id = id };
+        }
+    }
+    return null;
+}
+
+/// Maps a vocabulary kind index back to its declared name for serialization.
+fn vocabKindName(grammar: Grammar, id: usize) []const u8 {
+    if (grammar.tokens) |v| {
+        if (id < v.kinds.len) return v.kinds[id].name;
+    }
+    return "identifier";
+}
+
 /// Parses the tail of a $field:KIND... sequence element: either bare "KIND"
 /// (single-token capture) or "KIND(sep="...", suffix="...")".
-fn parseCaptureTail(tail: []const u8, allocator: std.mem.Allocator) GrammarError!struct { kind: KindRef, span: CaptureParams } {
+fn parseCaptureTail(tail: []const u8, allocator: std.mem.Allocator, vocab: ?tokenizer.KindVocabulary) GrammarError!struct { kind: KindRef, span: CaptureParams } {
     const colon = std.mem.indexOfScalar(u8, tail, '(') orelse tail.len;
     const kind_name = tail[0..colon];
-    const kind = resolveKind(kind_name) orelse return error.InvalidKindName;
+    const kind = vocabKindRef(kind_name, vocab) orelse return error.InvalidKindName;
     const rest = tail[colon..];
     if (rest.len == 0) {
         return .{ .kind = kind, .span = .{ .separator = null, .suffix_set = null } };
@@ -225,10 +273,18 @@ fn parseParamList(params: []const u8, allocator: std.mem.Allocator) GrammarError
     return .{ .separator = separator, .suffix_set = suffix_set };
 }
 
+const SequenceElementResult = struct {
+    element: SequenceElement,
+    capture: ?Capture,
+};
+
+fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.Allocator) GrammarError!SequenceElementResult {
+    return parseSequenceElementV(raw, position, allocator, null);
+}
 
 /// Parses a single pattern sequence string into a SequenceElement.
 /// Handles trailing `?` suffix for optional elements.
-fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.Allocator) GrammarError!struct { element: SequenceElement, capture: ?Capture } {
+fn parseSequenceElementV(raw: []const u8, position: usize, allocator: std.mem.Allocator, vocab: ?tokenizer.KindVocabulary) GrammarError!SequenceElementResult {
     // Check for trailing `?` suffix (optional element)
     var s = raw;
     var optional = false;
@@ -243,7 +299,7 @@ fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.All
         if (colon_idx < 2) return error.InvalidCaptureFormat; // need at least $x
         const field_name = try allocator.dupe(u8, s[1..colon_idx]);
         const tail = s[colon_idx + 1 ..];
-        const parsed = try parseCaptureTail(tail, allocator);
+        const parsed = try parseCaptureTail(tail, allocator, vocab);
         const cap = Capture{
             .field_name = field_name,
             .position = position,
@@ -263,13 +319,21 @@ fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.All
     if (std.mem.eql(u8, s, "string")) {
         return .{ .element = .{ .matcher = .{ .kind = .{ .one = .string } }, .is_optional = optional }, .capture = null };
     }
+    // Grammar vocabulary kind wildcards: bare kind name matches any token of that kind.
+    if (vocab) |v| {
+        for (v.kinds, 0..) |def, id| {
+            if (std.mem.eql(u8, s, def.name)) {
+                return .{ .element = .{ .matcher = .{ .kind = .{ .id = id } }, .is_optional = optional }, .capture = null };
+            }
+        }
+    }
     // EXACT KIND matching (Name:KIND) — not starting with '$'
     if (s[0] != '$') {
         if (std.mem.indexOfScalar(u8, s, ':')) |colon_idx| {
             if (colon_idx > 0) {
                 const kind_name = s[colon_idx + 1 ..];
                 if (kind_name.len == 0) return error.InvalidKindName;
-                const kind = resolveKind(kind_name) orelse return error.InvalidKindName;
+                const kind = vocabKindRef(kind_name, vocab) orelse return error.InvalidKindName;
                 const exact_text = try allocator.dupe(u8, s[0..colon_idx]);
                 return .{ .element = .{ .matcher = .{ .kind = kind, .text = .{ .exact = exact_text } }, .is_optional = optional }, .capture = null };
             }
@@ -281,6 +345,84 @@ fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.All
     }
     // Keyword literal
     return .{ .element = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = try allocator.dupe(u8, s) } }, .is_optional = optional }, .capture = null };
+}
+
+
+/// Parses the optional [tokens] section into a KindVocabulary. Returns null when
+/// the section is absent. Each kind declaration must contain exactly one of
+/// char_class_run, delimited_span, or literal_set.
+fn parseTokensSection(root: anytype, allocator: std.mem.Allocator) GrammarError!?tokenizer.KindVocabulary {
+    const tokens_table = root.get("tokens") orelse return null;
+    var defs: std.ArrayList(tokenizer.KindDefinition) = .empty;
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = tokens_table.table.map.iterator();
+    while (it.next()) |entry| {
+        const name = try allocator.dupe(u8, entry.key_ptr.*);
+        if (name.len == 0) return error.EmptyKindName;
+        for (names.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return error.DuplicateKindName;
+        }
+        try names.append(allocator, name);
+
+        const val = entry.value_ptr.*;
+        if (val.* != .table) return error.InvalidTokenSection;
+        const t = val.table;
+        var rec_count: usize = 0;
+        if (t.map.get("char_class_run")) |ccr| {
+            if (ccr.* != .table) return error.InvalidRecognizer;
+            const start_spec = ccr.table.map.get("start") orelse return error.InvalidRecognizer;
+            if (start_spec.* != .string) return error.InvalidRecognizer;
+            if (start_spec.string.len == 0) return error.InvalidCharSet;
+            const start = try compileCharSet(start_spec.string);
+            const cont = if (ccr.table.map.get("continue")) |csp| blk: {
+                if (csp.* != .string) return error.InvalidRecognizer;
+                break :blk try compileCharSet(csp.string);
+            } else start;
+            try defs.append(allocator, .{
+                .name = name,
+                .recognizer = .{ .char_class_run = .{ .start = start, .cont = cont } },
+            });
+            rec_count += 1;
+        }
+        if (t.map.get("delimited_span")) |ds| {
+            if (ds.* != .table) return error.InvalidRecognizer;
+            const open = ds.table.map.get("open") orelse return error.InvalidRecognizer;
+            const close = ds.table.map.get("close") orelse return error.InvalidRecognizer;
+            if (open.* != .string or close.* != .string) return error.InvalidRecognizer;
+            if (open.string.len == 0 or close.string.len == 0) return error.InvalidRecognizer;
+            var escape: ?u8 = null;
+            if (ds.table.map.get("escape")) |esc| {
+                if (esc.* != .string or esc.string.len != 1) return error.InvalidRecognizer;
+                escape = esc.string[0];
+            }
+            try defs.append(allocator, .{
+                .name = name,
+                .recognizer = .{ .delimited_span = .{
+                    .open = try allocator.dupe(u8, open.string),
+                    .close = try allocator.dupe(u8, close.string),
+                    .escape = escape,
+                } },
+            });
+            rec_count += 1;
+        }
+        if (t.map.get("literal_set")) |ls| {
+            if (ls.* != .array) return error.InvalidRecognizer;
+            if (ls.array.items.items.len == 0) return error.EmptyLiteralSet;
+            var lits: std.ArrayList([]const u8) = .empty;
+            for (ls.array.items.items) |item| {
+                if (item != .string) return error.InvalidRecognizer;
+                if (item.string.len == 0) return error.EmptyLiteralSet;
+                try lits.append(allocator, try allocator.dupe(u8, item.string));
+            }
+            try defs.append(allocator, .{
+                .name = name,
+                .recognizer = .{ .literal_set = try lits.toOwnedSlice(allocator) },
+            });
+            rec_count += 1;
+        }
+        if (rec_count != 1) return error.InvalidRecognizer;
+    }
+    return .{ .kinds = try defs.toOwnedSlice(allocator) };
 }
 
 /// Parses a TOML grammar file from bytes into a Grammar struct.
@@ -321,6 +463,8 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         }
     }
 
+    const tokens_vocab = try parseTokensSection(root, allocator);
+
     // --- [[patterns]] (required) ---
     const patterns_val = root.get("patterns") orelse return error.MissingPatterns;
     var patterns: std.ArrayList(Pattern) = .empty;
@@ -338,7 +482,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         var captures: std.ArrayList(Capture) = .empty;
 
         for (seq_val.array.items.items, 0..) |item, idx| {
-            const result = try parseSequenceElement(item.string, idx, allocator);
+            const result = try parseSequenceElementV(item.string, idx, allocator, tokens_vocab);
             try matchers.append(allocator, result.element);
             if (result.capture) |cap| {
                 try captures.append(allocator, cap);
@@ -493,6 +637,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
     }
     // else: no [comments] section -> use default CommentConfig{}
 
+
     return Grammar{
         .language_name = language_name,
         .keyword_categories = try categories.toOwnedSlice(allocator),
@@ -531,6 +676,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
             break :blk w;
         },
         .comments = comments,
+        .tokens = tokens_vocab,
     };
 }
 
@@ -585,6 +731,8 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                         .string => try w.writeAll("STRING"),
                         else => {},
                     }
+                } else if (m.kind == .id) {
+                    try w.writeAll(vocabKindName(grammar, m.kind.id));
                 }
                 if (cap.separator != null or cap.suffix_set != null) {
                     try w.writeAll("(");
@@ -635,6 +783,9 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
                 },
                 .punctuation => {
                     if (m.text == .exact) try w.writeAll(m.text.exact);
+                },
+                .id => |id| {
+                    try w.writeAll(vocabKindName(grammar, id));
                 },
             }
             if (elem.is_optional) try w.writeAll("?");
@@ -772,6 +923,54 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
             }
             if (wts.relaxed_keyword != defaults.relaxed_keyword) {
                 try w.print("relaxed_keyword = {d}\n", .{wts.relaxed_keyword});
+            }
+        }
+    }
+
+    // [tokens] — serialize the grammar-declared vocabulary when present
+    if (grammar.tokens) |vocab| {
+        try w.writeAll("\n[tokens]\n");
+        for (vocab.kinds) |def| {
+            try w.writeAll("[tokens.");
+            try w.writeAll(def.name);
+            try w.writeAll("]\n");
+            switch (def.recognizer) {
+                .char_class_run => |r| {
+                    try w.writeAll("char_class_run = { start = \"");
+                    try tokenizer.writeCharSetSpec(r.start, w);
+                    try w.writeAll("\", \"continue\" = \"");
+                    try tokenizer.writeCharSetSpec(r.cont, w);
+                    try w.writeAll("\" }\n");
+                },
+                .delimited_span => |d| {
+                    try w.writeAll("delimited_span = { open = \"");
+                    try w.writeAll(d.open);
+                    try w.writeAll("\", close = \"");
+                    try w.writeAll(d.close);
+                    try w.writeAll("\"");
+                    if (d.escape) |esc| {
+                        try w.writeAll(", escape = \"");
+                        try tokenizer.writeCharSpec(esc, w);
+                        try w.writeAll("\"");
+                    }
+                    try w.writeAll(" }\n");
+                },
+                .literal_set => |lits| {
+                    try w.writeAll("literal_set = [");
+                    for (lits, 0..) |lit, j| {
+                        if (j > 0) try w.writeAll(", ");
+                        try w.writeAll("\"");
+                        for (lit) |ch| {
+                            switch (ch) {
+                                '\\' => try w.writeAll("\\\\"),
+                                '"' => try w.writeAll("\\\""),
+                                else => try w.writeByte(ch),
+                            }
+                        }
+                        try w.writeAll("\"");
+                    }
+                    try w.writeAll("]\n");
+                },
             }
         }
     }
@@ -3333,6 +3532,7 @@ fn matcherTag(m: ComposableMatcher) u8 {
             else => 6,
         },
         .punctuation => 2,
+        .id => 7,
     };
     const text_tag: u8 = switch (m.text) {
         .any => 0,
@@ -3789,6 +3989,370 @@ test "property: new surface forms round-trip" {
             try testing.expectEqual(grammar.patterns[0].sequence.len, re.patterns[0].sequence.len);
             for (grammar.patterns[0].sequence, re.patterns[0].sequence) |a, b| {
                 try testing.expectEqual(matcherTag(a.matcher), matcherTag(b.matcher));
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+
+// --- configurable-token-kinds loader tests ---
+
+test "char-set compiler: literals, ranges, mixed" {
+    {
+        const cc = try compileCharSet("abc");
+        try testing.expect(cc.contains('a'));
+        try testing.expect(cc.contains('b'));
+        try testing.expect(cc.contains('c'));
+        try testing.expect(!cc.contains('d'));
+    }
+    {
+        const cc = try compileCharSet("a-z");
+        try testing.expect(cc.contains('a'));
+        try testing.expect(cc.contains('m'));
+        try testing.expect(cc.contains('z'));
+        try testing.expect(!cc.contains('A'));
+        try testing.expect(!cc.contains('{'));
+    }
+    {
+        const cc = try compileCharSet("a-zA-Z0-9_");
+        try testing.expect(cc.contains('q'));
+        try testing.expect(cc.contains('Q'));
+        try testing.expect(cc.contains('7'));
+        try testing.expect(cc.contains('_'));
+        try testing.expect(!cc.contains('-'));
+        try testing.expect(!cc.contains(' '));
+    }
+    {
+        const cc = try compileCharSet("-a");
+        try testing.expect(cc.contains('-'));
+        try testing.expect(cc.contains('a'));
+    }
+}
+
+test "char-set compiler: inverted range rejected" {
+    try testing.expectError(error.InvalidCharSet, compileCharSet("z-a"));
+    try testing.expectError(error.InvalidCharSet, compileCharSet("9-0"));
+}
+
+fn expectGrammarError(source: []const u8, expected: anyerror) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(expected, parseGrammar(source, arena.allocator()));
+}
+
+test "parseGrammar: [tokens] custom kinds parse into vocabulary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["ident", "$v:ident", "->", "quoted"]
+        \\
+        \\[tokens]
+        \\ident = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_" } }
+        \\number = { char_class_run = { start = "0-9" } }
+        \\quoted = { delimited_span = { open = "'", close = "'" } }
+        \\arrow = { literal_set = ["->", "=>"] }
+    ;
+    const grammar = try parseGrammar(source, alloc);
+    const vocab = grammar.tokens.?;
+    try testing.expectEqual(@as(usize, 4), vocab.kinds.len);
+
+    // Declaration order preserved as priority.
+    try testing.expectEqualStrings("ident", vocab.kinds[0].name);
+    try testing.expectEqualStrings("number", vocab.kinds[1].name);
+    try testing.expectEqualStrings("quoted", vocab.kinds[2].name);
+    try testing.expectEqualStrings("arrow", vocab.kinds[3].name);
+
+    try testing.expect(vocab.kinds[0].recognizer == .char_class_run);
+    try testing.expect(vocab.kinds[0].recognizer.char_class_run.start.contains('A'));
+    try testing.expect(vocab.kinds[0].recognizer.char_class_run.start.contains('_'));
+    try testing.expect(vocab.kinds[0].recognizer.char_class_run.cont.contains('9'));
+    try testing.expect(vocab.kinds[1].recognizer == .char_class_run);
+    try testing.expect(vocab.kinds[1].recognizer.char_class_run.start.contains('5'));
+    try testing.expect(!vocab.kinds[1].recognizer.char_class_run.cont.contains('.'));
+    try testing.expect(vocab.kinds[2].recognizer == .delimited_span);
+    try testing.expectEqualStrings("'", vocab.kinds[2].recognizer.delimited_span.open);
+    try testing.expect(vocab.kinds[3].recognizer == .literal_set);
+    try testing.expectEqual(@as(usize, 2), vocab.kinds[3].recognizer.literal_set.len);
+
+    // Sequence matchers: bare custom kind references resolve to .id.
+    const seq = grammar.patterns[0].sequence;
+    try testing.expectEqual(@as(usize, 4), seq.len);
+    try testing.expect(seq[0].matcher.kind == .id and seq[0].matcher.kind.id == 0);
+    try testing.expect(seq[1].matcher.kind == .id and seq[1].matcher.kind.id == 0);
+    try testing.expect(seq[1].matcher.capture != null);
+    try testing.expect(seq[3].matcher.kind == .id and seq[3].matcher.kind.id == 2);
+}
+
+test "parseGrammar: [tokens] validation errors" {
+    // Duplicate kind names cannot be expressed in TOML (the parser rejects duplicate
+    // keys as InvalidToml before the loader sees them); the DuplicateKindName guard
+    // remains as defense-in-depth for non-TOML frontends.
+
+    // Empty kind name.
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\"" = { char_class_run = { start = "a-z" } }
+    , error.EmptyKindName);
+
+    // Zero recognizers on a kind.
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\a = { }
+    , error.InvalidRecognizer);
+
+    // Multiple recognizers on a kind.
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\a = { char_class_run = { start = "a-z" }, literal_set = ["x"] }
+    , error.InvalidRecognizer);
+
+    // Empty char-class start set.
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\a = { char_class_run = { start = "" } }
+    , error.InvalidCharSet);
+
+    // Inverted char-class range.
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\a = { char_class_run = { start = "z-a" } }
+    , error.InvalidCharSet);
+
+    // Empty span open/close.
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\a = { delimited_span = { open = "", close = "'" } }
+    , error.InvalidRecognizer);
+
+    // Empty literal set / member.
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\a = { literal_set = [] }
+    , error.EmptyLiteralSet);
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[tokens]
+        \\a = { literal_set = [""] }
+    , error.EmptyLiteralSet);
+}
+
+test "parseGrammar: [tokens] absent yields no vocabulary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar("[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n", arena.allocator());
+    try testing.expect(grammar.tokens == null);
+}
+
+test "formatGrammar: [tokens] round-trips to an equivalent vocabulary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["ident", "number", "$s:quoted", "arrow"]
+        \\
+        \\[tokens]
+        \\ident = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_" } }
+        \\number = { char_class_run = { start = "0-9", continue = "0-9." } }
+        \\quoted = { delimited_span = { open = "'", close = "'", escape = "\\" } }
+        \\arrow = { literal_set = ["->", "=>"] }
+    ;
+    const grammar = try parseGrammar(source, alloc);
+    const formatted = try formatGrammar(grammar, alloc);
+    const re = try parseGrammar(formatted, alloc);
+
+    const v1 = grammar.tokens.?;
+    const v2 = re.tokens.?;
+    try testing.expectEqual(v1.kinds.len, v2.kinds.len);
+    for (v1.kinds, v2.kinds) |a, b| {
+        try testing.expectEqualStrings(a.name, b.name);
+        try testing.expect(std.meta.activeTag(a.recognizer) == std.meta.activeTag(b.recognizer));
+        switch (a.recognizer) {
+            .char_class_run => |ra| {
+                const rb = b.recognizer.char_class_run;
+                var ch: usize = 0;
+                while (ch < 256) : (ch += 1) {
+                    try testing.expectEqual(ra.start.bits[ch], rb.start.bits[ch]);
+                    try testing.expectEqual(ra.cont.bits[ch], rb.cont.bits[ch]);
+                }
+            },
+            .delimited_span => |da| {
+                const db = b.recognizer.delimited_span;
+                try testing.expectEqualStrings(da.open, db.open);
+                try testing.expectEqualStrings(da.close, db.close);
+                try testing.expectEqual(da.escape, db.escape);
+            },
+            .literal_set => |la| {
+                const lb = b.recognizer.literal_set;
+                try testing.expectEqual(la.len, lb.len);
+                for (la, lb) |x, y| try testing.expectEqualStrings(x, y);
+            },
+        }
+    }
+
+    // Matchers survive with identical kind ids.
+    try testing.expectEqual(grammar.patterns[0].sequence.len, re.patterns[0].sequence.len);
+    for (grammar.patterns[0].sequence, re.patterns[0].sequence) |a, b| {
+        try testing.expectEqual(@as(u8, matcherTag(a.matcher)), @as(u8, matcherTag(b.matcher)));
+        if (a.matcher.kind == .id) {
+            try testing.expect(b.matcher.kind == .id and b.matcher.kind.id == a.matcher.kind.id);
+        }
+    }
+}
+
+test "formatGrammar: default-profile grammar emits no [tokens]" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const grammar = try parseGrammar("[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n", alloc);
+    const formatted = try formatGrammar(grammar, alloc);
+    try testing.expect(std.mem.indexOf(u8, formatted, "[tokens]") == null);
+}
+
+// Feature: configurable-token-kinds, Property 6: Custom-kind matching and capture
+test "property: custom kind bare reference resolves to kind id" {
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            if (std.mem.eql(u8, word, "identifier") or std.mem.eql(u8, word, "number") or std.mem.eql(u8, word, "string")) return;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"{s}\"]\n\n[tokens]\n{s} = {{ char_class_run = {{ start = \"a-z\" }} }}\n",
+                .{ word, word });
+            const grammar = try parseGrammar(source, alloc);
+            const elem = grammar.patterns[0].sequence[0];
+            try testing.expect(elem.matcher.kind == .id);
+            try testing.expectEqual(@as(usize, 0), elem.matcher.kind.id);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-token-kinds, Property 7: Unknown-kind reference rejected
+test "property: unknown custom kind reference rejected" {
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            if (std.mem.eql(u8, word, "IDENTIFIER") or std.mem.eql(u8, word, "NUMBER") or std.mem.eql(u8, word, "STRING")) return;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"$f:{s}\"]\n\n[tokens]\nother = {{ char_class_run = {{ start = \"a-z\" }} }}\n",
+                .{word});
+            const result = parseGrammar(source, alloc);
+            if (!std.mem.eql(u8, word, "other")) {
+                try testing.expectError(error.InvalidKindName, result);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-token-kinds, Property 9: [tokens] validation rejects malformed declarations
+test "property: [tokens] validation rejects malformed declarations" {
+    const bad_sources = [_][]const u8{
+        "[tokens]\na = { char_class_run = { start = \"\" } }\n",
+        "[tokens]\na = { char_class_run = { start = \"z-a\" } }\n",
+        "[tokens]\na = { char_class_run = { start = \"a-z\" }, literal_set = [\"x\"] }\n",
+        "[tokens]\na = { delimited_span = { open = \"\", close = \"'\" } }\n",
+        "[tokens]\na = { literal_set = [] }\n",
+        "[tokens]\na = { literal_set = [\"\"] }\n",
+        "[tokens]\n\"\" = { char_class_run = { start = \"a-z\" } }\n",
+    };
+    const idx_gen = gen.intRange(u8, 0, bad_sources.len - 1);
+
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idx: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n{s}",
+                .{bad_sources[idx]});
+            const result = parseGrammar(source, alloc);
+            if (result) |_| {
+                try testing.expect(false); // malformed declaration must fail
+            } else |e| {
+                switch (e) {
+                    error.InvalidCharSet, error.InvalidRecognizer, error.EmptyLiteralSet, error.EmptyKindName => {},
+                    else => return e,
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: configurable-token-kinds, Property 10: [tokens] round-trip
+test "property: [tokens] round-trip preserves vocabulary" {
+    const tuple_gen = comptime gen.tuple2(
+        []const u8,
+        []const u8,
+        gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
+        gen.string(.{ .min_len = 1, .max_len = 4, .charset = .alpha }),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8 }) !void {
+            const name = vals[0];
+            const lit = vals[1];
+            if (std.mem.eql(u8, name, "identifier")) return;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"{s}\", \"$f:{s}\"]\n\n[tokens]\n{s} = {{ literal_set = [\"{s}\"] }}\n",
+                .{ name, name, name, lit });
+            const grammar = try parseGrammar(source, alloc);
+            const formatted = try formatGrammar(grammar, alloc);
+            const re = try parseGrammar(formatted, alloc);
+
+            try testing.expectEqual(grammar.tokens.?.kinds.len, re.tokens.?.kinds.len);
+            try testing.expectEqualStrings(grammar.tokens.?.kinds[0].name, re.tokens.?.kinds[0].name);
+            try testing.expectEqualStrings(lit, re.tokens.?.kinds[0].recognizer.literal_set[0]);
+            try testing.expectEqual(grammar.patterns[0].sequence.len, re.patterns[0].sequence.len);
+            for (grammar.patterns[0].sequence, re.patterns[0].sequence) |a, b| {
+                try testing.expectEqual(@as(u8, matcherTag(a.matcher)), @as(u8, matcherTag(b.matcher)));
             }
         }
     }.prop, .{ .num_runs = 100 });

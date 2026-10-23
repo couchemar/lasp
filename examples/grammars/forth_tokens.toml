@@ -1,0 +1,17 @@
+[language]
+name = "Forth (configurable tokens)"
+
+[tokens]
+# Literal-set kinds are declared BEFORE the word run so `:` and `;` win the
+# priority race over the catch-all word recognizer.
+defn_start = { literal_set = [":"] }
+defn_end = { literal_set = [";"] }
+word = { char_class_run = { start = "!-~", continue = "!-~" } }
+
+# A definition is anchored on its colon + name (`: square ...`); the body and
+# the closing `;` are not part of the pattern, so definitions of any length are
+# detected and the name is captured. `defn_end` is still a recognized kind so a
+# grammar can also match `;` on its own if desired.
+[[patterns]]
+type = "definition"
+sequence = ["defn_start", "$name:word"]

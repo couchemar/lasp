@@ -291,6 +291,26 @@ nodes:
       body: block
 ```
 
+### Grammar-Defined Token Kinds (`[tokens]`)
+Without `[tokens]`, LASP tokenizes with a built-in C-family profile (identifiers, numbers, strings, single-character operators/symbols/delimiters). A grammar may replace that vocabulary with its own ordered kinds — each key declares exactly one recognizer:
+
+```toml
+[tokens]
+ident = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_" } }
+number = { char_class_run = { start = "0-9", continue = "0-9." } }
+quoted_atom = { delimited_span = { open = "'", close = "'" } }
+arrow = { literal_set = ["->", "=>"] }
+```
+
+- `char_class_run` — greedy run of one `start` char then `continue` chars (defaults to `start`); char-set specs support literals and inclusive ranges (`a-zA-Z0-9_`).
+- `delimited_span` — `open`…`close` with optional single-char `escape`; unclosed spans extend to EOF.
+- `literal_set` — longest matching literal (non-empty members).
+- Declaration order is matching priority; the first recognizer that matches at a position wins. Custom kind names are allowed; patterns reference kinds by name (`ident`, `foo:ident`, `$field:ident`).
+- A grammar without `[tokens]` is byte-for-byte identical to pre-feature output; the engine hardcodes a default profile, not a law.
+- Invalid declarations (empty/inverted char sets, empty spans/literal sets, zero or multiple recognizers, empty names) are grammar errors.
+
+See `examples/grammars/erlang_tokens.toml` and `examples/grammars/forth_tokens.toml`.
+
 ### Available Token Primitives
 - **Keywords**: `"fn"`, `"class"`, `"import"`.
 - **Identifiers**: `IDENTIFIER`.

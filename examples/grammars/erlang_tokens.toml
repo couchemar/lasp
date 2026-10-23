@@ -1,0 +1,25 @@
+[language]
+name = "Erlang (configurable tokens)"
+
+# Grammar-declared token vocabulary: each kind maps to exactly one recognizer.
+# Declaration order is matching priority. Custom kinds (variable, atom,
+# quoted_atom) are referenced by name in patterns below.
+[tokens]
+variable = { char_class_run = { start = "A-Z_", continue = "A-Za-z0-9_" } }
+atom = { char_class_run = { start = "a-z", continue = "a-z0-9_" } }
+quoted_atom = { delimited_span = { open = "'", close = "'" } }
+integer = { char_class_run = { start = "0-9", continue = "0-9" } }
+symbol = { literal_set = ["(", ")", ",", ".", ";", "|", "[", "]"] }
+op = { literal_set = ["+", "-", "*", "/", "=", "<", ">"] }
+
+[[patterns]]
+type = "call"
+sequence = ["atom", "(", "atom", ")"]
+
+[[patterns]]
+type = "quoted"
+sequence = ["quoted_atom"]
+
+[[patterns]]
+type = "assignment"
+sequence = ["variable", "=", "atom"]

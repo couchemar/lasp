@@ -54,7 +54,7 @@ pub const Automaton = struct {
         const text = source[token.start..token.end];
 
         for (state.transitions) |tr| {
-            const quality = matchesTransition(tr.matcher, token.kind, text);
+            const quality = matchesTransition(tr.matcher, token.kind, text, token.kind_id);
             if (quality != .no_match) {
                 const cap: ?CaptureValue = if (tr.capture) |c|
                     .{
@@ -72,11 +72,12 @@ pub const Automaton = struct {
     }
 };
 
-fn matchesTransition(matcher: ComposableMatcher, kind: TokenKind, text: []const u8) MatchResult {
+fn matchesTransition(matcher: ComposableMatcher, kind: TokenKind, text: []const u8, kind_id: usize) MatchResult {
     const kind_ok = switch (matcher.kind) {
         .any => true,
         .one => |k| kind == k,
         .punctuation => kind == .operator or kind == .symbol or kind == .delimiter,
+        .id => |id| kind_id == id,
     };
     const text_ok = switch (matcher.text) {
         .any => true,
@@ -182,6 +183,7 @@ fn matchersEqual(a: ComposableMatcher, b: ComposableMatcher) bool {
         .any => true,
         .one => |ka| ka == b.kind.one,
         .punctuation => true,
+        .id => |id| id == b.kind.id,
     } and switch (a.text) {
         .any => b.text == .any,
         .exact => |ta| b.text == .exact and std.mem.eql(u8, ta, b.text.exact),
@@ -630,20 +632,20 @@ test "property: matchesTransition correctness for keyword_literal" {
             const matcher: ComposableMatcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = keyword_text } };
 
             // Case 1: kind=.keyword, text matches → full_match
-            try testing.expectEqual(MatchResult.full_match, matchesTransition(matcher, .keyword, keyword_text));
+            try testing.expectEqual(MatchResult.full_match, matchesTransition(matcher, .keyword, keyword_text, 0));
 
             // Case 2: kind=.identifier, text matches → relaxed_match
-            try testing.expectEqual(MatchResult.relaxed_match, matchesTransition(matcher, .identifier, keyword_text));
+            try testing.expectEqual(MatchResult.relaxed_match, matchesTransition(matcher, .identifier, keyword_text, 0));
 
             // Case 3: kind=.identifier, text does NOT match → no_match
-            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .identifier, "ZZZZZ_NOMATCH"));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .identifier, "ZZZZZ_NOMATCH", 0));
 
             // Case 4: other kinds → no_match
-            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .delimiter, keyword_text));
-            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .symbol, keyword_text));
-            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .string, keyword_text));
-            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .number, keyword_text));
-            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .operator, keyword_text));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .delimiter, keyword_text, 0));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .symbol, keyword_text, 0));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .string, keyword_text, 0));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .number, keyword_text, 0));
+            try testing.expectEqual(MatchResult.no_match, matchesTransition(matcher, .operator, keyword_text, 0));
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -857,27 +859,27 @@ test "compile: identical-sequence same-type alternatives land on one terminal in
 // Feature: operator-token-matching, Unit: matchesTransition punctuation matching
 // **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 7.2, 8.1, 8.2, 8.3**
 test "matchesTransition: operator tokens full-match equal-text punctuation literal" {
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .operator, "-") == .full_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .operator, "+") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "&" } }, .operator, "&") == .full_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "?" } }, .operator, "?") == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .operator, "-", 0) == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .operator, "+", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "&" } }, .operator, "&", 0) == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "?" } }, .operator, "?", 0) == .full_match);
 }
 
 test "matchesTransition: punctuation literals reject non-punctuation tokens" {
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .identifier, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .keyword, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .string, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .number, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .newline, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .indent, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .comment, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .identifier, "-", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .keyword, "-", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .string, "-", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .number, "-", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .newline, "-", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .indent, "-", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .comment, "-", 0) == .no_match);
 }
 
 test "matchesTransition: symbol and delimiter matching preserved" {
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "(" } }, .delimiter, "(") == .full_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = ":" } }, .symbol, ":") == .full_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "(" } }, .delimiter, ")") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = ":" } }, .symbol, ";") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "(" } }, .delimiter, "(", 0) == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = ":" } }, .symbol, ":", 0) == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "(" } }, .delimiter, ")", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = ":" } }, .symbol, ";", 0) == .no_match);
 }
 
 // Feature: operator-token-matching, Property 1: Operator tokens full-match an equal-text
@@ -891,10 +893,10 @@ test "property: operator tokens full-match an equal-text punctuation literal" {
         fn prop(idx: u8) !void {
             const c = ops[idx];
             const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
-            try testing.expect(matchesTransition(m, .operator, &[1]u8{c}) == .full_match);
+            try testing.expect(matchesTransition(m, .operator, &[1]u8{c}, 0) == .full_match);
             // Different operator text → no match, never relaxed.
             const other = ops[(idx + 1) % ops.len];
-            try testing.expect(matchesTransition(m, .operator, &[1]u8{other}) == .no_match);
+            try testing.expect(matchesTransition(m, .operator, &[1]u8{other}, 0) == .no_match);
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -911,7 +913,7 @@ test "property: symbol and delimiter matching is preserved" {
             const c = if (idx < syms.len) syms[idx] else delims[idx - syms.len];
             const kind: TokenKind = if (idx < syms.len) .symbol else .delimiter;
             const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
-            try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == .full_match);
+            try testing.expect(matchesTransition(m, kind, &[1]u8{c}, 0) == .full_match);
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -934,7 +936,7 @@ test "property: punctuation literals reject non-punctuation tokens" {
             const kind = kinds[vals[1]];
             const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
             // Even when the token text equals the literal, non-punctuation kinds reject.
-            try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == .no_match);
+            try testing.expect(matchesTransition(m, kind, &[1]u8{c}, 0) == .no_match);
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -958,8 +960,8 @@ test "property: punctuation matching is single-token and exact" {
             const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
             const is_punct_kind = kind == .operator or kind == .symbol or kind == .delimiter;
             const expected: MatchResult = if (is_punct_kind) .full_match else .no_match;
-            try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == expected);
-            try testing.expect(matchesTransition(m, kind, "x") == .no_match);
+            try testing.expect(matchesTransition(m, kind, &[1]u8{c}, 0) == expected);
+            try testing.expect(matchesTransition(m, kind, "x", 0) == .no_match);
         }
     }.prop, .{ .num_runs = 100 });
 }
@@ -967,14 +969,14 @@ test "property: punctuation matching is single-token and exact" {
 // Feature: number-token-primitive, Unit: compiler match and equality
 // **Validates: Requirements 4.1, 4.2, 5.1, 5.2**
 test "matchesTransition: number matcher matches numeric tokens only" {
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .number, "42") == .full_match);
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .number, "x") == .full_match); // kind wildcard, text ignored
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .identifier, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .keyword, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .symbol, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .delimiter, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .operator, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .string, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .number, "42", 0) == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .number, "x", 0) == .full_match); // kind wildcard, text ignored
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .identifier, "42", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .keyword, "42", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .symbol, "42", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .delimiter, "42", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .operator, "42", 0) == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .string, "42", 0) == .no_match);
 }
 
 test "matchersEqual: number matchers equal each other, never other variants" {
@@ -1025,7 +1027,7 @@ test "property: number matcher matches numeric tokens only, by kind, without cap
             const kind = kinds[vals[0]];
             const m: ComposableMatcher = .{ .kind = .{ .one = .number } };
             const expected: MatchResult = if (kind == .number) .full_match else .no_match;
-            try testing.expect(matchesTransition(m, kind, vals[1]) == expected);
+            try testing.expect(matchesTransition(m, kind, vals[1], 0) == expected);
         }
     }.prop, .{ .num_runs = 100 });
 }

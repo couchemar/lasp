@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Composable matcher model: the six matcher variants collapse into one `{kind, text, capture}` struct with a resolved kind reference (the seam for future grammar-defined token kinds). New surface forms: typed captures `$field:NUMBER` / `$field:STRING`, the `string` kind wildcard, and exact-text over any kind (`Name:KIND`); unknown kind names are rejected at load time with a descriptive CLI error. Byte-for-byte identical output for all pre-feature grammars (string tokens join matching only when a grammar references the string kind).
 
+
+- Configurable token kinds (`[tokens]`): a grammar can now define its own ordered token vocabulary with three recognizers — `char_class_run` (greedy char-class run, literals + ranges), `delimited_span` (open/close with optional escape, EOF fallback), and `literal_set` (longest-match literals). Declaration order is matching priority; custom kind names are allowed and patterns reference them by name (bare, `Name:KIND`, `$field:KIND`). Matching compares the token's vocabulary id so custom kinds are distinct from built-ins. A grammar without `[tokens]` is byte-for-byte identical to pre-feature output. `[keywords]` remains a keyword overlay over identifier-run kinds. New validation errors: `InvalidTokenSection`, `DuplicateKindName`, `EmptyKindName`, `InvalidRecognizer`, `InvalidCharSet`, `EmptyLiteralSet`. Example grammars: `examples/grammars/erlang_tokens.toml`, `examples/grammars/forth_tokens.toml`. (Spec: configurable-token-kinds)
+
 ## [0.3.0] - 2026-10-23
 
 ### Added

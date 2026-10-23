@@ -192,6 +192,20 @@ close = "}"
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
 | `"fn?"` / `"(?"` | Optional element — boosts confidence when present, doesn't block when absent |
 
+
+### Grammar-defined token kinds (`[tokens]`)
+Without `[tokens]`, LASP uses a built-in C-family token profile. A grammar may declare its own ordered vocabulary — each kind is exactly one recognizer, and declaration order is matching priority:
+```toml
+[tokens]
+ident = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_" } }
+quoted_atom = { delimited_span = { open = "'", close = "'" } }
+arrow = { literal_set = ["->", "=>"] }
+```
+- `char_class_run`: greedy run of one `start` char then `continue` chars (defaults to `start`); char-set specs support literals and ranges (`a-zA-Z0-9_`).
+- `delimited_span`: `open`…`close` with optional single-char `escape`; unclosed spans extend to EOF.
+- `literal_set`: longest matching literal (non-empty members).
+- Patterns reference kinds by name: bare `ident`, exact-text `foo:ident`, or typed capture `$field:ident`. Built-in names keep their default semantics; unknown custom names with class/span recognizers behave like identifiers, literal-set kinds like symbols.
+- A grammar without `[tokens]` is byte-for-byte identical to pre-feature output. Invalid declarations (empty/inverted char sets, empty spans/literal sets, zero or multiple recognizers, empty names) are grammar errors.
 ### Position constraint
 Restrict a pattern to column 0 (line start):
 ```toml

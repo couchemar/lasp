@@ -121,6 +121,7 @@ fn patternMaxScore(sequence: []const loader.SequenceElement, weights: loader.Evi
                 else => 0.0,
             },
             .punctuation => weights.symbol,
+            .id => weights.symbol,
         };
     }
     return total;
@@ -1016,6 +1017,122 @@ test "parse: confidence computation for known tokens" {
     try testing.expectEqual(@as(usize, 1), result.len);
     // All tokens matched their expected kinds, so confidence = 1.0
     try testing.expectApproxEqRel(@as(f32, 1.0), result[0].confidence, 0.01);
+}
+
+// --- configurable-token-kinds engine tests ---
+
+test "parse: custom-kind matcher matches by kind id and captures text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "call",
+        .sequence = &.{
+            .{ .matcher = .{ .kind = .{ .id = 0 }, .capture = .{ .field_name = "callee", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
+            .{ .matcher = .{ .kind = .{ .id = 0 }, .capture = .{ .field_name = "arg", .position = 2 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = ")" } } },
+        },
+        .captures = &.{
+            .{ .field_name = "callee", .position = 0 },
+            .{ .field_name = "arg", .position = 2 },
+        },
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "foo(bar)";
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0, .kind_id = 0 },
+        .{ .kind = .symbol, .start = 3, .end = 4, .line = 1, .col = 3, .kind_id = 1 },
+        .{ .kind = .identifier, .start = 4, .end = 7, .line = 1, .col = 4, .kind_id = 0 },
+        .{ .kind = .symbol, .start = 7, .end = 8, .line = 1, .col = 7, .kind_id = 1 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("call", result[0].type_name);
+    try testing.expectEqual(@as(usize, 0), result[0].start);
+    try testing.expectEqual(@as(usize, 8), result[0].end);
+    try testing.expectEqual(@as(usize, 2), result[0].captures.len);
+    try testing.expectEqualStrings("callee", result[0].captures[0].field_name);
+    try testing.expectEqualStrings("foo", result[0].captures[0].value);
+    try testing.expectEqualStrings("arg", result[0].captures[1].field_name);
+    try testing.expectEqualStrings("bar", result[0].captures[1].value);
+}
+
+test "parse: end-to-end [tokens] grammar" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar_source =
+        \\[[patterns]]
+        \\type = "call"
+        \\sequence = ["ident", "(", "$a:ident", ")"]
+        \\
+        \\[tokens]
+        \\ident = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_" } }
+        \\punct = { literal_set = ["(", ")"] }
+    ;
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+    const tokens = try tokenizer.tokenizeWithVocab("foo(bar)", grammar.tokens.?, grammar.keyword_table, grammar.comments, alloc);
+
+    const result = try parse(automaton, tokens, "foo(bar)", grammar.patterns, grammar.blocks, grammar.weights, false, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("call", result[0].type_name);
+    try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+    try testing.expectEqualStrings("bar", result[0].captures[0].value);
+}
+
+test "parse: custom-kind matcher rejects other vocabulary kinds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "word",
+        .sequence = &.{
+            .{ .matcher = .{ .kind = .{ .id = 0 } } },
+            .{ .matcher = .{ .kind = .{ .id = 1 } } },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "ab12";
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 2, .line = 1, .col = 0, .kind_id = 0 },
+        .{ .kind = .number, .start = 2, .end = 4, .line = 1, .col = 2, .kind_id = 1 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("word", result[0].type_name);
+}
+
+test "parse: custom-kind matcher rejects same-kind-but-wrong-id" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const patterns = &[_]loader.Pattern{.{
+        .type_name = "only_first",
+        .sequence = &.{
+            .{ .matcher = .{ .kind = .{ .id = 0 } } },
+        },
+        .captures = &.{},
+    }};
+
+    const automaton = try compiler.compile(patterns, alloc);
+    const source = "x";
+    const tokens = &[_]Token{
+        .{ .kind = .identifier, .start = 0, .end = 1, .line = 1, .col = 0, .kind_id = 1 },
+    };
+
+    const result = try parse(automaton, tokens, source, patterns, .{}, .{}, false, alloc);
+    try testing.expectEqual(@as(usize, 0), result.len);
 }
 
 test "parse: multiple pattern matches" {

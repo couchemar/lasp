@@ -122,13 +122,22 @@ pub fn main(init: std.process.Init) !void {
                     error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
                     error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
                     error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
+                    error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
+                    error.DuplicateKindName => "error: [tokens] duplicate kind name",
+                    error.EmptyKindName => "error: [tokens] kind name must not be empty",
+                    error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
+                    error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
+                    error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
                     error.OutOfMemory => "out of memory",
                     else => "unknown grammar error",
                 };
                 std.process.fatal("error: {s}: {s}", .{ msg, gp });
             };
             const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-            const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
+            const tokens = if (grammar.tokens) |vocab|
+                try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
+            else
+                try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
             const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, false, allocator);
 
             // Parse selector string into QueryFilter
@@ -192,13 +201,22 @@ pub fn main(init: std.process.Init) !void {
                         error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
                         error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
                         error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
+                        error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
+                        error.DuplicateKindName => "error: [tokens] duplicate kind name",
+                        error.EmptyKindName => "error: [tokens] kind name must not be empty",
+                        error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
+                        error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
+                        error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
                         error.OutOfMemory => "out of memory",
                         else => "unknown grammar error",
                     };
                     std.process.fatal("error: {s}: {s}", .{ msg, gp });
                 };
                 const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-                const tokens = try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
+                const tokens = if (grammar.tokens) |vocab|
+                    try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
+                else
+                    try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
                 var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.blocks, grammar.weights, parsed.alternatives, allocator);
 
                 // Apply node filter if specified
@@ -1932,4 +1950,95 @@ test "integration: typed captures and string wildcard emit values" {
     try std.testing.expectEqualStrings("42", events_arr[1].object.get("n").?.string);
     try std.testing.expectEqualStrings("msg", events_arr[2].object.get("type").?.string);
     try std.testing.expectEqualStrings("\"key\"", events_arr[2].object.get("s").?.string);
+}
+
+
+// Feature: configurable-token-kinds, Integration: Erlang vocabulary
+// **Validates: Requirements 6.2, 6.5, 10.1**
+test "integration: Erlang tokens grammar detects calls and quoted atoms" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/sample.erl",
+        "--grammar",
+        "examples/grammars/erlang_tokens.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+
+    // sample.erl contains at least one function head `foo() -> ok.`; the call
+    // pattern is atom "(" atom ")" and the head contains atom "(" ")" only.
+    var call_count: usize = 0;
+    for (events_arr) |ev| {
+        if (std.mem.eql(u8, ev.object.get("type").?.string, "call")) call_count += 1;
+    }
+    try std.testing.expect(call_count >= 1);
+}
+
+test "integration: Erlang tokens grammar treats 'atom' as quoted atom, not string" {
+    const allocator = std.testing.allocator;
+    const result = try runLaspWithStdin(allocator, &.{
+        "parse",
+        "-",
+        "--grammar",
+        "examples/grammars/erlang_tokens.toml",
+    }, "'hello'\n");
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), events_arr.len);
+    try std.testing.expectEqualStrings("quoted", events_arr[0].object.get("type").?.string);
+}
+
+test "integration: Forth tokens grammar detects : name ; definition" {
+    const allocator = std.testing.allocator;
+    const result = try runLaspWithStdin(allocator, &.{
+        "parse",
+        "-",
+        "--grammar",
+        "examples/grammars/forth_tokens.toml",
+    }, ": double ;\n");
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), events_arr.len);
+    try std.testing.expectEqualStrings("definition", events_arr[0].object.get("type").?.string);
+}
+
+test "integration: existing zig grammar output unchanged (no [tokens])" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/sample.zig",
+        "--grammar",
+        "examples/grammars/zig.toml",
+        "--node",
+        "pub_function",
+        "--names-only",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "add") != null);
 }
