@@ -389,9 +389,24 @@ test "integration: --version prints version and exits zero" {
 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expect(std.mem.startsWith(u8, result.stdout, "lasp "));
+    // Exactly one line: `lasp <version>\n`, where the version is the plain semver
+    // or a dev build `X.Y.Z-dev+<short-commit>`.
+    try std.testing.expect(std.mem.endsWith(u8, result.stdout, "\n"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, result.stdout, '\n') == result.stdout.len - 1);
+    var it = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    try std.testing.expect(it.next() != null);
+    try std.testing.expect(it.next() == null);
+    const version_str = std.mem.trim(u8, result.stdout["lasp ".len..], " \n");
+    try std.testing.expect(version_str.len > 0);
+    const dev_marker = std.mem.indexOf(u8, version_str, "-dev+");
+    if (dev_marker) |idx| {
+        // `-dev+` must be followed by a non-empty hex-ish short commit.
+        try std.testing.expect(version_str.len > idx + 5);
+    }
 }
 
 // --- Integration Tests for CLI Help Text Feature ---
+
 
 test "integration: help command prints usage and exits zero" {
     const allocator = std.testing.allocator;

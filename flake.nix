@@ -35,6 +35,18 @@
               );
             in
             builtins.head (builtins.head versionMatches);
+          # Hermetic version facts from the flake revision (no git in the
+          # sandbox). `dirtyRev` is present for a dirty git source; `rev` for a
+          # clean one; both absent for tarball-like sources.
+          versionCommit =
+            if self ? dirtyRev then builtins.substring 0 7 self.dirtyRev
+            else if self ? rev then builtins.substring 0 7 self.rev
+            else null;
+          versionDirty =
+            if self ? dirtyRev then true else false;
+          gitArgs =
+            if versionCommit == null then ""
+            else "-Dgit_commit=${versionCommit} -Dgit_dirty=${if versionDirty then "true" else "false"}";
         in
         {
           packages = {
@@ -49,7 +61,7 @@
 
               buildPhase = ''
                 runHook preBuild
-                zig build -Doptimize=ReleaseSafe \
+                zig build -Doptimize=ReleaseSafe ${gitArgs} \
                   --cache-dir $(pwd)/.zig-cache \
                   --global-cache-dir $(pwd)/.zig-global-cache \
                   --prefix $out

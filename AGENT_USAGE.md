@@ -145,13 +145,19 @@ diff <(.bin/lasp parse a.zig -g examples/grammars/zig.toml --node function --nam
 .bin/lasp --version   # same as: .bin/lasp -V  or: .bin/lasp version
 ```
 
-Output:
+Output for a released build:
 
 ```
 lasp 0.3.0
 ```
 
-The version is embedded at build time from `build.zig.zon` (semver). To release a new version: bump `version` in `build.zig.zon` and add a `CHANGELOG.md` entry (Keep a Changelog format). `--version`/`-V` is also accepted among other flags and exits before reading any file.
+Output for a development build (the working tree, or any build whose version or tree does not match the latest release):
+
+```
+lasp 0.3.0-dev+a2ff0ae
+```
+
+The version is embedded at build time. A build is **released** (plain `X.Y.Z`) only when `build.zig.zon`'s version equals the latest dated `CHANGELOG.md` release AND the source tree is clean (git). Any other build reports `X.Y.Z-dev+<short-commit>`; when no git facts are available (no `.git`, no flake revision — e.g. a tarball build) it falls back to the plain version. The rule lives in `build.zig`; the Nix flake supplies commit/dirty hermetically from the flake revision (no `git` in the sandbox). To release a new version: bump `version` in `build.zig.zon` and add a `CHANGELOG.md` entry (Keep a Changelog format). `--version`/`-V` is also accepted among other flags and exits before reading any file.
 
 ### Help
 
