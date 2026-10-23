@@ -2,7 +2,7 @@ const std = @import("std");
 const loader = @import("loader.zig");
 const tokenizer = @import("../parser/tokenizer.zig");
 
-const TokenMatcher = loader.TokenMatcher;
+const ComposableMatcher = loader.ComposableMatcher;
 const Capture = loader.Capture;
 const Pattern = loader.Pattern;
 const Token = tokenizer.Token;
@@ -11,7 +11,7 @@ const TokenKind = tokenizer.TokenKind;
 // --- Data Types ---
 
 pub const Transition = struct {
-    matcher: TokenMatcher,
+    matcher: ComposableMatcher,
     next_state: usize,
     capture: ?Capture = null,
     is_optional: bool = false,
@@ -72,25 +72,28 @@ pub const Automaton = struct {
     }
 };
 
-fn matchesTransition(matcher: TokenMatcher, kind: TokenKind, text: []const u8) MatchResult {
-    return switch (matcher) {
-        .keyword_literal => |kw| {
-            if (kind == .keyword and std.mem.eql(u8, text, kw)) return .full_match;
-            if (kind == .identifier and std.mem.eql(u8, text, kw)) return .relaxed_match;
-            return .no_match;
-        },
-        .symbol_literal => |sym| if ((kind == .delimiter or kind == .symbol or kind == .operator) and std.mem.eql(u8, text, sym)) .full_match else .no_match,
-        .identifier => if (kind == .identifier) .full_match else .no_match,
-        .capture => if (kind == .identifier) .full_match else .no_match,
-        .identifier_literal => |id| if (kind == .identifier and std.mem.eql(u8, text, id)) .full_match else .no_match,
-        .number => if (kind == .number) .full_match else .no_match,
+fn matchesTransition(matcher: ComposableMatcher, kind: TokenKind, text: []const u8) MatchResult {
+    const kind_ok = switch (matcher.kind) {
+        .any => true,
+        .one => |k| kind == k,
+        .punctuation => kind == .operator or kind == .symbol or kind == .delimiter,
     };
+    const text_ok = switch (matcher.text) {
+        .any => true,
+        .exact => |t| std.mem.eql(u8, text, t),
+    };
+    if (kind_ok and text_ok) return .full_match;
+    // Relaxed keyword fallback: a keyword-kind exact-text matcher also matches an
+    // identifier token of equal text, at reduced confidence (preserved behavior).
+    if (matcher.kind == .one and matcher.kind.one == .keyword and matcher.text == .exact and
+        kind == .identifier and std.mem.eql(u8, text, matcher.text.exact)) return .relaxed_match;
+    return .no_match;
 }
 
 // --- Mutable builder types used during compilation ---
 
 const MutableTransition = struct {
-    matcher: TokenMatcher,
+    matcher: ComposableMatcher,
     next_state: usize,
     capture: ?Capture,
     is_optional: bool,
@@ -164,40 +167,25 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
     return .{ .states = try states.toOwnedSlice(allocator) };
 }
 
-fn findTransition(transitions: []const MutableTransition, matcher: TokenMatcher) ?usize {
+fn findTransition(transitions: []const MutableTransition, matcher: ComposableMatcher) ?usize {
     for (transitions) |tr| {
         if (matchersEqual(tr.matcher, matcher)) return tr.next_state;
     }
     return null;
 }
 
-fn matchersEqual(a: TokenMatcher, b: TokenMatcher) bool {
-    const tag_a: u3 = switch (a) {
-        .keyword_literal => 0,
-        .symbol_literal => 1,
-        .identifier => 2,
-        .capture => 3,
-        .identifier_literal => 4,
-        .number => 5,
-    };
-    const tag_b: u3 = switch (b) {
-        .keyword_literal => 0,
-        .symbol_literal => 1,
-        .identifier => 2,
-        .capture => 3,
-        .identifier_literal => 4,
-        .number => 5,
-    };
-    if (tag_a != tag_b) return false;
-
-    return switch (a) {
-        .keyword_literal => |ka| std.mem.eql(u8, ka, b.keyword_literal),
-        .symbol_literal => |sa| std.mem.eql(u8, sa, b.symbol_literal),
-        .identifier => true,
-        .capture => true, // captures match any identifier, same as identifier
-        .identifier_literal => |ia| std.mem.eql(u8, ia, b.identifier_literal),
-        .number => true,
-    };
+fn matchersEqual(a: ComposableMatcher, b: ComposableMatcher) bool {
+    // Compare kind (tag + payload), text (tag + bytes), and capture-presence only —
+    // not capture field names, preserving pre-feature trie-sharing.
+    if (std.meta.activeTag(a.kind) != std.meta.activeTag(b.kind)) return false;
+    return switch (a.kind) {
+        .any => true,
+        .one => |ka| ka == b.kind.one,
+        .punctuation => true,
+    } and switch (a.text) {
+        .any => b.text == .any,
+        .exact => |ta| b.text == .exact and std.mem.eql(u8, ta, b.text.exact),
+    } and (a.capture != null) == (b.capture != null);
 }
 
 fn findCaptureAtPosition(captures: []const Capture, position: usize) ?Capture {
@@ -233,9 +221,9 @@ test "compile: single pattern produces correct state count" {
     const patterns = &[_]Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .identifier = {} } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{},
     }};
@@ -261,18 +249,18 @@ test "compile: shared prefix" {
         .{
             .type_name = "function",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{},
         },
         .{
             .type_name = "fn_block",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
-                .{ .matcher = .{ .symbol_literal = "{" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } } },
             },
             .captures = &.{},
         },
@@ -304,7 +292,7 @@ test "step: matching token returns next state" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
+        .sequence = &.{.{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }},
         .captures = &.{},
     }};
 
@@ -323,7 +311,7 @@ test "step: matching identifier_literal returns next state" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "test",
-        .sequence = &.{.{ .matcher = .{ .identifier_literal = "Config" } }},
+        .sequence = &.{.{ .matcher = .{ .kind = .{ .one = .identifier }, .text = .{ .exact = "Config" } } }},
         .captures = &.{},
     }};
 
@@ -347,7 +335,7 @@ test "step: non-matching token returns null" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
+        .sequence = &.{.{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }},
         .captures = &.{},
     }};
 
@@ -366,8 +354,8 @@ test "step: capture returns value" {
     const patterns = &[_]Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -408,9 +396,9 @@ test "property: automaton structural invariants" {
             var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..pattern_len) |i| {
                 if (i % 2 == 0) {
-                    try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
+                    try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "kw" } } });
                 } else {
-                    try seq.append(alloc, .{ .matcher = .{ .identifier = {} } });
+                    try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .identifier } } });
                 }
             }
 
@@ -449,7 +437,7 @@ test "property: pattern path correctness" {
 
             var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..pattern_len) |_| {
-                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "x" } });
+                try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "x" } } });
             }
 
             const patterns = &[_]Pattern{.{
@@ -487,11 +475,11 @@ test "property: prefix sharing" {
             var seq1: std.ArrayList(loader.SequenceElement) = .empty;
             var seq2: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..prefix_len) |_| {
-                try seq1.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
-                try seq2.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
+                try seq1.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "shared" } } });
+                try seq2.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "shared" } } });
             }
-            try seq1.append(alloc, .{ .matcher = .{ .symbol_literal = "(" } });
-            try seq2.append(alloc, .{ .matcher = .{ .symbol_literal = "{" } });
+            try seq1.append(alloc, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } });
+            try seq2.append(alloc, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } } });
 
             const patterns = &[_]Pattern{
                 .{ .type_name = "a", .sequence = seq1.items, .captures = &.{} },
@@ -527,11 +515,11 @@ test "preservation: non-colliding grammars terminal state carries one event and 
             var seq1: std.ArrayList(loader.SequenceElement) = .empty;
             var seq2: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..prefix_len) |_| {
-                try seq1.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
-                try seq2.append(alloc, .{ .matcher = .{ .keyword_literal = "shared" } });
+                try seq1.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "shared" } } });
+                try seq2.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "shared" } } });
             }
-            try seq1.append(alloc, .{ .matcher = .{ .symbol_literal = "(" } });
-            try seq2.append(alloc, .{ .matcher = .{ .symbol_literal = "{" } });
+            try seq1.append(alloc, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } });
+            try seq2.append(alloc, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } } });
 
             const patterns = &[_]Pattern{
                 .{ .type_name = "pattern_a", .sequence = seq1.items, .captures = &.{} },
@@ -546,7 +534,7 @@ test "preservation: non-colliding grammars terminal state carries one event and 
             // Walk to terminal a
             var state_a: usize = 0;
             for (seq1.items) |elem| {
-                const step_res = automaton.step(state_a, .{ .kind = if (elem.matcher == .symbol_literal) .delimiter else .keyword, .start = 0, .end = if (elem.matcher == .symbol_literal) 1 else 6, .line = 1, .col = 0 }, if (elem.matcher == .symbol_literal) "(" else "shared");
+                const step_res = automaton.step(state_a, .{ .kind = if (elem.matcher.kind == .punctuation) .delimiter else .keyword, .start = 0, .end = if (elem.matcher.kind == .punctuation) 1 else 6, .line = 1, .col = 0 }, if (elem.matcher.kind == .punctuation) "(" else "shared");
                 try testing.expect(step_res != null);
                 state_a = step_res.?.next;
             }
@@ -556,7 +544,7 @@ test "preservation: non-colliding grammars terminal state carries one event and 
             // Walk to terminal b
             var state_b: usize = 0;
             for (seq2.items) |elem| {
-                const step_res = automaton.step(state_b, .{ .kind = if (elem.matcher == .symbol_literal) .delimiter else .keyword, .start = 0, .end = if (elem.matcher == .symbol_literal) 1 else 6, .line = 1, .col = 0 }, if (elem.matcher == .symbol_literal) "{" else "shared");
+                const step_res = automaton.step(state_b, .{ .kind = if (elem.matcher.kind == .punctuation) .delimiter else .keyword, .start = 0, .end = if (elem.matcher.kind == .punctuation) 1 else 6, .line = 1, .col = 0 }, if (elem.matcher.kind == .punctuation) "{" else "shared");
                 try testing.expect(step_res != null);
                 state_b = step_res.?.next;
             }
@@ -592,7 +580,7 @@ test "property: identical-sequence patterns retain all events on shared terminal
             // Build identical sequence for both patterns
             var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..seq_len) |_| {
-                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
+                try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "kw" } } });
             }
 
             const patterns = &[_]Pattern{
@@ -639,7 +627,7 @@ test "property: matchesTransition correctness for keyword_literal" {
 
     try minish.check(testing.allocator, text_gen, struct {
         fn prop(keyword_text: []const u8) !void {
-            const matcher: TokenMatcher = .{ .keyword_literal = keyword_text };
+            const matcher: ComposableMatcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = keyword_text } };
 
             // Case 1: kind=.keyword, text matches → full_match
             try testing.expectEqual(MatchResult.full_match, matchesTransition(matcher, .keyword, keyword_text));
@@ -667,7 +655,7 @@ test "step: keyword match returns full_match quality" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
+        .sequence = &.{.{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }},
         .captures = &.{},
     }};
 
@@ -686,7 +674,7 @@ test "step: identifier matching keyword_literal returns relaxed_match quality" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
+        .sequence = &.{.{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }},
         .captures = &.{},
     }};
 
@@ -706,7 +694,7 @@ test "step: non-keyword non-identifier token does not match keyword_literal" {
 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
-        .sequence = &.{.{ .matcher = .{ .keyword_literal = "fn" } }},
+        .sequence = &.{.{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }},
         .captures = &.{},
     }};
 
@@ -728,16 +716,16 @@ test "compile: two identical-sequence patterns produce shared terminal state wit
         .{
             .type_name = "function",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{.{ .field_name = "name", .position = 0 }},
         },
         .{
             .type_name = "call",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "callee", .position = 0 } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{.{ .field_name = "callee", .position = 0 }},
         },
@@ -778,7 +766,7 @@ test "compile: single pattern terminal carries exactly one event and root zero" 
     const patterns = &[_]Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
         },
         .captures = &.{},
     }};
@@ -799,16 +787,16 @@ test "compile: shared-prefix patterns create distinct terminals each with one ev
         .{
             .type_name = "func",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{},
         },
         .{
             .type_name = "block",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .symbol_literal = "{" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } } },
             },
             .captures = &.{},
         },
@@ -842,14 +830,14 @@ test "compile: identical-sequence same-type alternatives land on one terminal in
         .{
             .type_name = "same",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "a", .position = 0 } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "a", .position = 0 } } },
             },
             .captures = &.{.{ .field_name = "a", .position = 0 }},
         },
         .{
             .type_name = "same",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "b", .position = 0 } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "b", .position = 0 } } },
             },
             .captures = &.{.{ .field_name = "b", .position = 0 }},
         },
@@ -869,27 +857,27 @@ test "compile: identical-sequence same-type alternatives land on one terminal in
 // Feature: operator-token-matching, Unit: matchesTransition punctuation matching
 // **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 7.2, 8.1, 8.2, 8.3**
 test "matchesTransition: operator tokens full-match equal-text punctuation literal" {
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .operator, "-") == .full_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .operator, "+") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "&" }, .operator, "&") == .full_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "?" }, .operator, "?") == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .operator, "-") == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .operator, "+") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "&" } }, .operator, "&") == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "?" } }, .operator, "?") == .full_match);
 }
 
 test "matchesTransition: punctuation literals reject non-punctuation tokens" {
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .identifier, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .keyword, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .string, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .number, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .newline, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .indent, "-") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "-" }, .comment, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .identifier, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .keyword, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .string, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .number, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .newline, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .indent, "-") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "-" } }, .comment, "-") == .no_match);
 }
 
 test "matchesTransition: symbol and delimiter matching preserved" {
-    try testing.expect(matchesTransition(.{ .symbol_literal = "(" }, .delimiter, "(") == .full_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = ":" }, .symbol, ":") == .full_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = "(" }, .delimiter, ")") == .no_match);
-    try testing.expect(matchesTransition(.{ .symbol_literal = ":" }, .symbol, ";") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "(" } }, .delimiter, "(") == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = ":" } }, .symbol, ":") == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = "(" } }, .delimiter, ")") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .punctuation, .text = .{ .exact = ":" } }, .symbol, ";") == .no_match);
 }
 
 // Feature: operator-token-matching, Property 1: Operator tokens full-match an equal-text
@@ -902,7 +890,7 @@ test "property: operator tokens full-match an equal-text punctuation literal" {
     try minish.check(testing.allocator, idx_gen, struct {
         fn prop(idx: u8) !void {
             const c = ops[idx];
-            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
             try testing.expect(matchesTransition(m, .operator, &[1]u8{c}) == .full_match);
             // Different operator text → no match, never relaxed.
             const other = ops[(idx + 1) % ops.len];
@@ -922,7 +910,7 @@ test "property: symbol and delimiter matching is preserved" {
         fn prop(idx: u8) !void {
             const c = if (idx < syms.len) syms[idx] else delims[idx - syms.len];
             const kind: TokenKind = if (idx < syms.len) .symbol else .delimiter;
-            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
             try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == .full_match);
         }
     }.prop, .{ .num_runs = 100 });
@@ -944,7 +932,7 @@ test "property: punctuation literals reject non-punctuation tokens" {
         fn prop(vals: struct { u8, u8 }) !void {
             const c = punct[vals[0]];
             const kind = kinds[vals[1]];
-            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
             // Even when the token text equals the literal, non-punctuation kinds reject.
             try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == .no_match);
         }
@@ -967,7 +955,7 @@ test "property: punctuation matching is single-token and exact" {
         fn prop(vals: struct { u8, u8 }) !void {
             const c = punct[vals[0]];
             const kind = all_kinds[vals[1]];
-            const m: TokenMatcher = .{ .symbol_literal = &[1]u8{c} };
+            const m: ComposableMatcher = .{ .kind = .punctuation, .text = .{ .exact = &[1]u8{c} } };
             const is_punct_kind = kind == .operator or kind == .symbol or kind == .delimiter;
             const expected: MatchResult = if (is_punct_kind) .full_match else .no_match;
             try testing.expect(matchesTransition(m, kind, &[1]u8{c}) == expected);
@@ -979,35 +967,35 @@ test "property: punctuation matching is single-token and exact" {
 // Feature: number-token-primitive, Unit: compiler match and equality
 // **Validates: Requirements 4.1, 4.2, 5.1, 5.2**
 test "matchesTransition: number matcher matches numeric tokens only" {
-    try testing.expect(matchesTransition(.{ .number = {} }, .number, "42") == .full_match);
-    try testing.expect(matchesTransition(.{ .number = {} }, .number, "x") == .full_match); // kind wildcard, text ignored
-    try testing.expect(matchesTransition(.{ .number = {} }, .identifier, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .number = {} }, .keyword, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .number = {} }, .symbol, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .number = {} }, .delimiter, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .number = {} }, .operator, "42") == .no_match);
-    try testing.expect(matchesTransition(.{ .number = {} }, .string, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .number, "42") == .full_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .number, "x") == .full_match); // kind wildcard, text ignored
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .identifier, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .keyword, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .symbol, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .delimiter, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .operator, "42") == .no_match);
+    try testing.expect(matchesTransition(.{ .kind = .{ .one = .number } }, .string, "42") == .no_match);
 }
 
 test "matchersEqual: number matchers equal each other, never other variants" {
-    try testing.expect(matchersEqual(.{ .number = {} }, .{ .number = {} }));
-    const variants = [_]TokenMatcher{
-        .{ .keyword_literal = "fn" },
-        .{ .symbol_literal = "(" },
-        .{ .identifier = {} },
-        .{ .capture = .{ .field_name = "n", .position = 0 } },
-        .{ .identifier_literal = "Config" },
+    try testing.expect(matchersEqual(.{ .kind = .{ .one = .number } }, .{ .kind = .{ .one = .number } }));
+    const variants = [_]ComposableMatcher{
+        .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } },
+        .{ .kind = .punctuation, .text = .{ .exact = "(" } },
+        .{ .kind = .{ .one = .identifier } },
+        .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "n", .position = 0 } },
+        .{ .kind = .{ .one = .identifier }, .text = .{ .exact = "Config" } },
     };
     for (variants) |v| {
-        try testing.expect(!matchersEqual(v, .{ .number = {} }));
-        try testing.expect(!matchersEqual(.{ .number = {} }, v));
+        try testing.expect(!matchersEqual(v, .{ .kind = .{ .one = .number } }));
+        try testing.expect(!matchersEqual(.{ .kind = .{ .one = .number } }, v));
     }
 }
 
 test "automaton step: number matcher advances one token with no capture" {
     const auto = Automaton{ .states = &.{
         .{ .transitions = &.{.{
-            .matcher = .{ .number = {} },
+            .matcher = .{ .kind = .{ .one = .number } },
             .next_state = 1,
         }}, .events = &.{} },
         .{ .transitions = &.{}, .events = &.{} },
@@ -1035,7 +1023,7 @@ test "property: number matcher matches numeric tokens only, by kind, without cap
     try minish.check(testing.allocator, tuple_gen, struct {
         fn prop(vals: struct { u8, []const u8 }) !void {
             const kind = kinds[vals[0]];
-            const m: TokenMatcher = .{ .number = {} };
+            const m: ComposableMatcher = .{ .kind = .{ .one = .number } };
             const expected: MatchResult = if (kind == .number) .full_match else .no_match;
             try testing.expect(matchesTransition(m, kind, vals[1]) == expected);
         }
@@ -1045,13 +1033,13 @@ test "property: number matcher matches numeric tokens only, by kind, without cap
 // Feature: number-token-primitive, Property 4: number-matcher equality
 // **Validates: Requirements 5.1, 5.2**
 test "property: number-matcher equality" {
-    const samples = [_]TokenMatcher{
-        .{ .keyword_literal = "fn" },
-        .{ .symbol_literal = "(" },
-        .{ .identifier = {} },
-        .{ .capture = .{ .field_name = "n", .position = 0 } },
-        .{ .identifier_literal = "Config" },
-        .{ .number = {} },
+    const samples = [_]ComposableMatcher{
+        .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } },
+        .{ .kind = .punctuation, .text = .{ .exact = "(" } },
+        .{ .kind = .{ .one = .identifier } },
+        .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "n", .position = 0 } },
+        .{ .kind = .{ .one = .identifier }, .text = .{ .exact = "Config" } },
+        .{ .kind = .{ .one = .number } },
     };
     const tuple_gen = comptime gen.tuple2(
         u8,
@@ -1066,8 +1054,8 @@ test "property: number-matcher equality" {
             const b = samples[vals[1]];
             const expected = vals[0] == vals[1];
             try testing.expectEqual(expected, matchersEqual(a, b));
-            const a_is_number = a == .number;
-            const b_is_number = b == .number;
+            const a_is_number = a.kind == .one and a.kind.one == .number;
+            const b_is_number = b.kind == .one and b.kind.one == .number;
             if (a_is_number != b_is_number) {
                 try testing.expect(!matchersEqual(a, b));
             }
@@ -1088,7 +1076,7 @@ test "compile: parameterized capture transition carries sep/suffix" {
     const patterns = &[_]Pattern{.{
         .type_name = "t",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = "!?" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = "!?" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = "!?" }},
     }};
@@ -1102,7 +1090,7 @@ test "compile: parameterized capture transition carries sep/suffix" {
 test "automaton step: surfaces capture metadata on the transition" {
     const auto = Automaton{ .states = &.{
         .{ .transitions = &.{.{
-            .matcher = .{ .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = null } },
+            .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = null } },
             .next_state = 1,
             .capture = .{ .field_name = "name", .position = 0, .separator = ".", .suffix_set = null },
         }}, .events = &.{} },

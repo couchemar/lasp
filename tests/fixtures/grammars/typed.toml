@@ -1,0 +1,11 @@
+[[patterns]]
+type = "msg"
+sequence = ["$s:STRING"]
+
+[[patterns]]
+type = "num"
+sequence = ["$n:NUMBER"]
+
+[[patterns]]
+type = "exact_key"
+sequence = ["key:STRING"]

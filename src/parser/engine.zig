@@ -95,15 +95,32 @@ fn shouldSkip(kind: TokenKind) bool {
     };
 }
 
+/// True when any pattern sequence references the string kind. In that case string
+/// tokens participate in matching (so `$field:STRING` / `string` can match);
+/// otherwise they are skipped exactly as before, preserving byte-identity.
+fn grammarUsesString(patterns: []const loader.Pattern) bool {
+    for (patterns) |p| {
+        for (p.sequence) |elem| {
+            if (elem.matcher.kind == .one and elem.matcher.kind.one == .string) return true;
+        }
+    }
+    return false;
+}
+
 /// Computes the max possible confidence score for a pattern's matchers.
 fn patternMaxScore(sequence: []const loader.SequenceElement, weights: loader.EvidenceWeights) f32 {
     var total: f32 = 0.0;
     for (sequence) |elem| {
-        total += switch (elem.matcher) {
-            .keyword_literal => weights.keyword,
-            .symbol_literal => weights.symbol,
-            .identifier, .capture, .identifier_literal => weights.identifier,
-            .number => weights.symbol,
+        total += switch (elem.matcher.kind) {
+            .any => 0.0,
+            .one => |k| switch (k) {
+                .keyword => weights.keyword,
+                .identifier => weights.identifier,
+                .string => weights.symbol,
+                .operator, .symbol, .delimiter, .number => weights.symbol,
+                else => 0.0,
+            },
+            .punctuation => weights.symbol,
         };
     }
     return total;
@@ -321,6 +338,7 @@ pub fn parse(
     var delim_depth: u32 = 0;
 
     var i: usize = 0;
+    const include_strings = grammarUsesString(patterns);
     while (i < tokens.len) : (i += 1) {
         const token = tokens[i];
         const text = source[token.start..token.end];
@@ -350,7 +368,7 @@ pub fn parse(
             }
         }
 
-        if (shouldSkip(token.kind)) continue;
+        if (shouldSkip(token.kind) and !(include_strings and token.kind == .string)) continue;
 
         // Push to lookback before automaton stepping
         lookback.push(text);
@@ -736,6 +754,7 @@ fn bufferCandidate(
                 .identifier => weights.identifier,
                 .delimiter, .symbol, .operator => weights.symbol,
                 .number => weights.symbol,
+                .string => weights.symbol,
                 else => 0.0,
             };
         }
@@ -866,9 +885,9 @@ test "parse: single pattern match emits event" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -900,8 +919,8 @@ test "parse: identifier_literal matching pattern emits event" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "test_literal",
         .sequence = &.{
-            .{ .matcher = .{ .identifier_literal = "Config" } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .text = .{ .exact = "Config" } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{},
     }};
@@ -928,7 +947,7 @@ test "parse: no matching pattern emits nothing" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }, .{ .matcher = .{ .kind = .{ .one = .identifier } } } },
         .captures = &.{},
     }};
 
@@ -950,7 +969,7 @@ test "parse: skip tokens between structural tokens" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }, .{ .matcher = .{ .kind = .{ .one = .identifier } } } },
         .captures = &.{},
     }};
 
@@ -978,9 +997,9 @@ test "parse: confidence computation for known tokens" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .identifier = {} } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{},
     }};
@@ -1006,7 +1025,7 @@ test "parse: multiple pattern matches" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .identifier } } }, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } } },
         .captures = &.{},
     }};
 
@@ -1172,7 +1191,7 @@ test "parse: position = start at col 0 emits event" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }, .{ .matcher = .{ .kind = .{ .one = .identifier } } } },
         .captures = &.{},
         .position = .start,
     }};
@@ -1196,7 +1215,7 @@ test "parse: position = start at col > 0 discards event" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
-        .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }, .{ .matcher = .{ .kind = .{ .one = .identifier } } } },
         .captures = &.{},
         .position = .start,
     }};
@@ -1219,7 +1238,7 @@ test "parse: block delimiters set block_start on events" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .identifier } } }, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } } },
         .captures = &.{},
     }};
 
@@ -1244,7 +1263,7 @@ test "parse: no blocks section means block_start is null" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .identifier } } }, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } } },
         .captures = &.{},
     }};
 
@@ -1267,7 +1286,7 @@ test "parse: unmatched close delimiter does not crash" {
 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "call",
-        .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
+        .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .identifier } } }, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } } },
         .captures = &.{},
     }};
 
@@ -1303,8 +1322,8 @@ test "property: engine pattern match correctness" {
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
-                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                 },
                 .captures = &.{.{ .field_name = "name", .position = 1 }},
             }};
@@ -1341,7 +1360,7 @@ test "property: engine skip token transparency" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "function",
-                .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
+                .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }, .{ .matcher = .{ .kind = .{ .one = .identifier } } } },
                 .captures = &.{},
             }};
 
@@ -1376,7 +1395,7 @@ test "property: event field invariants" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
+                .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .identifier } } }, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } } },
                 .captures = &.{},
             }};
 
@@ -1437,7 +1456,7 @@ test "property: position constraint enforcement" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "function",
-                .sequence = &.{ .{ .matcher = .{ .keyword_literal = "fn" } }, .{ .matcher = .{ .identifier = {} } } },
+                .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } }, .{ .matcher = .{ .kind = .{ .one = .identifier } } } },
                 .captures = &.{},
                 .position = .start,
             }};
@@ -1508,7 +1527,7 @@ test "property: block stack annotates events correctly" {
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
-                .sequence = &.{ .{ .matcher = .{ .identifier = {} } }, .{ .matcher = .{ .symbol_literal = "(" } } },
+                .sequence = &.{ .{ .matcher = .{ .kind = .{ .one = .identifier } } }, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } } },
                 .captures = &.{},
             }};
 
@@ -1591,9 +1610,9 @@ test "property: relaxed match produces lower confidence than full match" {
             // Build a pattern with num_keywords keyword_literals + 1 symbol
             var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..num_keywords) |_| {
-                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
+                try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "kw" } } });
             }
-            try seq.append(alloc, .{ .matcher = .{ .symbol_literal = "(" } });
+            try seq.append(alloc, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } });
 
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "test",
@@ -1660,7 +1679,7 @@ test "property: backward compatibility full keyword match produces confidence 1.
             // Build a pattern of all keyword_literals
             var seq: std.ArrayList(loader.SequenceElement) = .empty;
             for (0..num_keywords) |_| {
-                try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
+                try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "kw" } } });
             }
 
             const patterns = &[_]loader.Pattern{.{
@@ -1725,11 +1744,11 @@ test "property: perfect match produces confidence 1.0" {
 
             for (0..pattern_len) |i| {
                 if (i % 2 == 0) {
-                    try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "kw" } });
+                    try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "kw" } } });
                     @memcpy(buf[offset .. offset + 2], "kw");
                     try tokens_list.append(alloc, .{ .kind = .keyword, .start = offset, .end = offset + 2, .line = 1, .col = offset });
                 } else {
-                    try seq.append(alloc, .{ .matcher = .{ .identifier = {} } });
+                    try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .identifier } } });
                     @memcpy(buf[offset .. offset + 2], "id");
                     try tokens_list.append(alloc, .{ .kind = .identifier, .start = offset, .end = offset + 2, .line = 1, .col = offset });
                 }
@@ -1763,9 +1782,9 @@ test "parse: keyword as identifier token produces confidence < 1.0 (relaxed matc
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .identifier = {} } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{},
     }};
@@ -1794,9 +1813,9 @@ test "parse: full keyword match produces confidence = 1.0" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .identifier = {} } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{},
     }};
@@ -1824,9 +1843,9 @@ test "parse: mixed relaxed and full matches in same pattern" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "pub_function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "pub" } },
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .identifier = {} } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "pub" } } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier } } },
         },
         .captures = &.{},
     }};
@@ -1865,11 +1884,11 @@ test "property: optional elements affect confidence monotonically" {
             // Required: fn, $name:IDENTIFIER
             // Optional: ( and optionally {
             var seq: std.ArrayList(loader.SequenceElement) = .empty;
-            try seq.append(alloc, .{ .matcher = .{ .keyword_literal = "fn" } });
-            try seq.append(alloc, .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } });
-            try seq.append(alloc, .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true });
+            try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } });
+            try seq.append(alloc, .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } });
+            try seq.append(alloc, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } }, .is_optional = true });
             if (two_optionals) {
-                try seq.append(alloc, .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = true });
+                try seq.append(alloc, .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } }, .is_optional = true });
             }
 
             const patterns = &[_]loader.Pattern{.{
@@ -1930,9 +1949,9 @@ test "parse: optional element present produces confidence = 1.0" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } }, .is_optional = true },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -1959,9 +1978,9 @@ test "parse: optional element absent produces confidence < 1.0 but event still e
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } }, .is_optional = true },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -1995,8 +2014,8 @@ test "parse: all-optional pattern with none matching emits no event (Minimum_Evi
     const patterns = &[_]loader.Pattern{.{
         .type_name = "test",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" }, .is_optional = true },
-            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } }, .is_optional = true },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } }, .is_optional = true },
         },
         .captures = &.{},
     }};
@@ -2025,10 +2044,10 @@ test "parse: mix of required and optional, optional absent produces confidence <
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-            .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true },
-            .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = true },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } }, .is_optional = true },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } }, .is_optional = true },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -2196,9 +2215,9 @@ test "parse: single pattern emitted normally with buffered emission (no regressi
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
     }};
@@ -2232,17 +2251,17 @@ test "parse: competing patterns with shared prefix, longer match wins" {
         .{
             .type_name = "fn_decl",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
             },
             .captures = &.{},
         },
         .{
             .type_name = "fn_call",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{},
         },
@@ -2274,17 +2293,17 @@ test "parse: competing patterns, shorter match emitted when longer doesn't compl
         .{
             .type_name = "fn_decl",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
             },
             .captures = &.{},
         },
         .{
             .type_name = "fn_call",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{},
         },
@@ -2317,17 +2336,17 @@ test "parse: competing patterns, end of stream flushes buffered candidate" {
         .{
             .type_name = "fn_decl",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
             },
             .captures = &.{},
         },
         .{
             .type_name = "fn_call",
             .sequence = &.{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
-                .{ .matcher = .{ .identifier = {} } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{},
         },
@@ -2549,9 +2568,9 @@ test "property: custom weights flow through to confidence" {
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
-                    .{ .matcher = .{ .identifier = {} } },
-                    .{ .matcher = .{ .symbol_literal = "(" } },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                    .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                 },
                 .captures = &.{},
             }};
@@ -2618,9 +2637,9 @@ test "parse: custom weights produce different confidence than defaults for same 
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .identifier = {} } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{},
     }};
@@ -2694,8 +2713,8 @@ test "property: depth-0 capture value filtering" {
                 const pattern = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2720,8 +2739,8 @@ test "property: depth-0 capture value filtering" {
                 const pattern = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2755,8 +2774,8 @@ test "property: depth-0 capture value filtering" {
                 const pattern_no_field = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2810,8 +2829,8 @@ test "property: depth-1 preceding token constraint" {
                 const pattern = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2831,8 +2850,8 @@ test "property: depth-1 preceding token constraint" {
                 const pattern = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2861,8 +2880,8 @@ test "property: depth-1 preceding token constraint" {
                 const pattern_null_prev = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2918,8 +2937,8 @@ test "property: depth-N lookback window constraint" {
                 const pattern = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2949,8 +2968,8 @@ test "property: depth-N lookback window constraint" {
                 const pattern = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -2992,8 +3011,8 @@ test "property: depth-N lookback window constraint" {
                 const pattern_outside = loader.Pattern{
                     .type_name = "test",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                     .constraints = &.{.{
@@ -3066,7 +3085,7 @@ test "property: dynamic LookbackBuffer capacity" {
             const constraints3 = &[_]loader.Constraint{constraint3};
 
             const dummy_seq = &[_]loader.SequenceElement{
-                .{ .matcher = .{ .keyword_literal = "fn" } },
+                .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
             };
 
             const patterns = &[_]loader.Pattern{
@@ -3123,8 +3142,8 @@ test "evaluateConstraints: depth-0 rejects when captured value matches" {
     const pattern = loader.Pattern{
         .type_name = "method",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .constraints = &.{.{
@@ -3147,8 +3166,8 @@ test "evaluateConstraints: depth-0 allows when captured value does not match" {
     const pattern = loader.Pattern{
         .type_name = "method",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .constraints = &.{.{
@@ -3171,8 +3190,8 @@ test "evaluateConstraints: depth-0 skips when field not found in captures" {
     const pattern = loader.Pattern{
         .type_name = "method",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .constraints = &.{.{
@@ -3195,8 +3214,8 @@ test "evaluateConstraints: depth-1 rejects when preceding token matches" {
     const pattern = loader.Pattern{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .constraints = &.{.{
@@ -3219,8 +3238,8 @@ test "evaluateConstraints: depth-1 passes at start of stream (null prev token)" 
     const pattern = loader.Pattern{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .constraints = &.{.{
@@ -3248,8 +3267,8 @@ test "evaluateConstraints: depth-N rejects when lookback contains matching token
     const pattern = loader.Pattern{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .constraints = &.{.{
@@ -3276,8 +3295,8 @@ test "evaluateConstraints: multiple constraints short-circuit on first rejection
     const pattern = loader.Pattern{
         .type_name = "method",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .constraints = &.{
@@ -3322,8 +3341,8 @@ test "parse: combined position + constraints evaluation order" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 0 }},
         .position = .start,
@@ -3404,8 +3423,8 @@ test "property: identical-sequence patterns coexist and route correctly" {
                 .{
                     .type_name = "function",
                     .sequence = &.{
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-                        .{ .matcher = .{ .symbol_literal = "(" } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+                        .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 0 }},
                     .position = .start,
@@ -3413,8 +3432,8 @@ test "property: identical-sequence patterns coexist and route correctly" {
                 .{
                     .type_name = "call",
                     .sequence = &.{
-                        .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
-                        .{ .matcher = .{ .symbol_literal = "(" } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "callee", .position = 0 } } },
+                        .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                     },
                     .captures = &.{.{ .field_name = "callee", .position = 0 }},
                 },
@@ -3483,18 +3502,18 @@ test "preservation: non-colliding grammars event stream is preserved" {
                 .{
                     .type_name = "function",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "fn" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-                        .{ .matcher = .{ .symbol_literal = "(" } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                 },
                 .{
                     .type_name = "struct_def",
                     .sequence = &.{
-                        .{ .matcher = .{ .keyword_literal = "struct" } },
-                        .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-                        .{ .matcher = .{ .symbol_literal = "{" } },
+                        .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "struct" } } },
+                        .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+                        .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } } },
                     },
                     .captures = &.{.{ .field_name = "name", .position = 1 }},
                 },
@@ -3544,9 +3563,9 @@ test "preservation: single function pattern grammar event stream" {
     const patterns = &[_]loader.Pattern{.{
         .type_name = "function",
         .sequence = &.{
-            .{ .matcher = .{ .keyword_literal = "fn" } },
-            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-            .{ .matcher = .{ .symbol_literal = "(" } },
+            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
         },
         .captures = &.{.{ .field_name = "name", .position = 1 }},
         .position = .start,
@@ -3580,8 +3599,8 @@ test "parse: function vs call colliding grammar emits function for col 0 and cal
         .{
             .type_name = "function",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{.{ .field_name = "name", .position = 0 }},
             .position = .start,
@@ -3589,8 +3608,8 @@ test "parse: function vs call colliding grammar emits function for col 0 and cal
         .{
             .type_name = "call",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "callee", .position = 0 } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{.{ .field_name = "callee", .position = 0 }},
         },
@@ -3654,8 +3673,8 @@ test "parse: --node function on colliding grammar filters to only function heads
         .{
             .type_name = "function",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{.{ .field_name = "name", .position = 0 }},
             .position = .start,
@@ -3663,8 +3682,8 @@ test "parse: --node function on colliding grammar filters to only function heads
         .{
             .type_name = "call",
             .sequence = &.{
-                .{ .matcher = .{ .capture = .{ .field_name = "callee", .position = 0 } } },
-                .{ .matcher = .{ .symbol_literal = "(" } },
+                .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "callee", .position = 0 } } },
+                .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
             },
             .captures = &.{.{ .field_name = "callee", .position = 0 }},
         },
@@ -3758,24 +3777,24 @@ fn idItem(text: []const u8) TestTokenItem {
 }
 
 fn setKwCaptureSeq(seq: *[2]loader.SequenceElement, kw: []const u8, field: []const u8) void {
-    seq[0] = .{ .matcher = .{ .keyword_literal = kw } };
-    seq[1] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 1 } } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = kw } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = field, .position = 1 } } };
 }
 
 fn setKwCaptureParenSeq(seq: *[3]loader.SequenceElement, kw: []const u8, field: []const u8) void {
-    seq[0] = .{ .matcher = .{ .keyword_literal = kw } };
-    seq[1] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 1 } } };
-    seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = kw } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = field, .position = 1 } } };
+    seq[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } };
 }
 
 fn setKwCaptureOptParenSeq(seq: *[3]loader.SequenceElement, kw: []const u8, field: []const u8) void {
-    seq[0] = .{ .matcher = .{ .keyword_literal = kw } };
-    seq[1] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 1 } } };
-    seq[2] = .{ .matcher = .{ .symbol_literal = "(" }, .is_optional = true };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = kw } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = field, .position = 1 } } };
+    seq[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } }, .is_optional = true };
 }
 
 fn setSingleCaptureSeq(seq: *[1]loader.SequenceElement, field: []const u8) void {
-    seq[0] = .{ .matcher = .{ .capture = .{ .field_name = field, .position = 0 } } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = field, .position = 0 } } };
 }
 
 fn distinctStrings(a: []const u8, b: []const u8) bool {
@@ -4162,9 +4181,9 @@ test "property: different-type overlap collapses to one tiebreak-selected primar
             var seq_a: [2]loader.SequenceElement = undefined;
             var seq_b: [3]loader.SequenceElement = undefined;
             setKwCaptureSeq(&seq_a, inp.kw, "name");
-            seq_b[0] = .{ .matcher = .{ .keyword_literal = inp.kw } };
-            seq_b[1] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } };
-            seq_b[2] = .{ .matcher = .{ .keyword_literal = "?" } };
+            seq_b[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = inp.kw } } };
+            seq_b[1] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } };
+            seq_b[2] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "?" } } };
 
             const patterns = &[_]loader.Pattern{
                 .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
@@ -4507,12 +4526,12 @@ test "parse: operator-anchored pattern scores identically to symbol-anchored pat
     // relaxed (identifier token) so confidence < 1 and the symbol weight is observable.
     var seq_a: [3]loader.SequenceElement = undefined;
     var seq_b: [3]loader.SequenceElement = undefined;
-    seq_a[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
-    seq_a[1] = .{ .matcher = .{ .identifier = {} } };
-    seq_a[2] = .{ .matcher = .{ .symbol_literal = "(" } };
-    seq_b[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
-    seq_b[1] = .{ .matcher = .{ .identifier = {} } };
-    seq_b[2] = .{ .matcher = .{ .symbol_literal = "-" } };
+    seq_a[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } };
+    seq_a[1] = .{ .matcher = .{ .kind = .{ .one = .identifier } } };
+    seq_a[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } };
+    seq_b[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } };
+    seq_b[1] = .{ .matcher = .{ .kind = .{ .one = .identifier } } };
+    seq_b[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "-" } } };
 
     const patterns_a = &[_]loader.Pattern{.{
         .type_name = "a",
@@ -4561,12 +4580,12 @@ test "property: operator matches contribute the symbol weight" {
 
             var seq_a: [3]loader.SequenceElement = undefined;
             var seq_b: [3]loader.SequenceElement = undefined;
-            seq_a[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
-            seq_a[1] = .{ .matcher = .{ .identifier = {} } };
-            seq_a[2] = .{ .matcher = .{ .symbol_literal = "(" } };
-            seq_b[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
-            seq_b[1] = .{ .matcher = .{ .identifier = {} } };
-            seq_b[2] = .{ .matcher = .{ .symbol_literal = "-" } };
+            seq_a[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } };
+            seq_a[1] = .{ .matcher = .{ .kind = .{ .one = .identifier } } };
+            seq_a[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } };
+            seq_b[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } };
+            seq_b[1] = .{ .matcher = .{ .kind = .{ .one = .identifier } } };
+            seq_b[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "-" } } };
 
             const patterns_a = &[_]loader.Pattern{.{
                 .type_name = "a",
@@ -4604,10 +4623,10 @@ test "parse: -module attribute anchors on the leading '-' operator" {
     const alloc = arena.allocator();
 
     var seq: [4]loader.SequenceElement = undefined;
-    seq[0] = .{ .matcher = .{ .symbol_literal = "-" } };
-    seq[1] = .{ .matcher = .{ .keyword_literal = "module" } };
-    seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
-    seq[3] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 3 } } };
+    seq[0] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "-" } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "module" } } };
+    seq[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } };
+    seq[3] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 3 } } };
     const patterns = &[_]loader.Pattern{.{
         .type_name = "module_attr",
         .sequence = &seq,
@@ -4638,8 +4657,8 @@ test "parse: multi-character operator literal compiles but never matches single-
     const alloc = arena.allocator();
 
     var seq: [2]loader.SequenceElement = undefined;
-    seq[0] = .{ .matcher = .{ .symbol_literal = "->" } };
-    seq[1] = .{ .matcher = .{ .keyword_literal = "module" } };
+    seq[0] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "->" } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "module" } } };
     const patterns = &[_]loader.Pattern{.{
         .type_name = "arrow_attr",
         .sequence = &seq,
@@ -4667,10 +4686,10 @@ test "property: erlang attribute anchoring end-to-end" {
             const alloc = arena.allocator();
 
             var seq: [4]loader.SequenceElement = undefined;
-            seq[0] = .{ .matcher = .{ .symbol_literal = "-" } };
-            seq[1] = .{ .matcher = .{ .keyword_literal = "module" } };
-            seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
-            seq[3] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 3 } } };
+            seq[0] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "-" } } };
+            seq[1] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "module" } } };
+            seq[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } };
+            seq[3] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 3 } } };
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "module_attr",
                 .sequence = &seq,
@@ -4712,9 +4731,9 @@ test "property: backward compatibility of existing grammar output" {
             // A symbol/delimiter-only grammar (pre-feature surface) must emit the same
             // events as before: one full-match event per occurrence with confidence 1.0.
             var seq: [3]loader.SequenceElement = undefined;
-            seq[0] = .{ .matcher = .{ .keyword_literal = vals[0] } };
-            seq[1] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } };
-            seq[2] = .{ .matcher = .{ .symbol_literal = "(" } };
+            seq[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = vals[0] } } };
+            seq[1] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } };
+            seq[2] = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } };
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "call",
                 .sequence = &seq,
@@ -4753,7 +4772,7 @@ test "parse: lone number pattern scores exactly 1.0" {
     const alloc = arena.allocator();
 
     var seq: [1]loader.SequenceElement = undefined;
-    seq[0] = .{ .matcher = .{ .number = {} } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .number } } };
     const patterns = &[_]loader.Pattern{.{
         .type_name = "num",
         .sequence = &seq,
@@ -4776,8 +4795,8 @@ test "parse: composed capture + optional number pattern scores sensibly" {
     const alloc = arena.allocator();
 
     var seq: [2]loader.SequenceElement = undefined;
-    seq[0] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } };
-    seq[1] = .{ .matcher = .{ .number = {} }, .is_optional = true };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .number } }, .is_optional = true };
     const patterns = &[_]loader.Pattern{.{
         .type_name = "decl",
         .sequence = &seq,
@@ -4817,7 +4836,7 @@ test "property: a lone required number match scores 1.0 with the symbol weight" 
             const weights = loader.EvidenceWeights{ .symbol = sym_weight };
 
             var seq: [1]loader.SequenceElement = undefined;
-            seq[0] = .{ .matcher = .{ .number = {} } };
+            seq[0] = .{ .matcher = .{ .kind = .{ .one = .number } } };
             const patterns = &[_]loader.Pattern{.{
                 .type_name = "num",
                 .sequence = &seq,
@@ -4837,7 +4856,7 @@ test "property: a lone required number match scores 1.0 with the symbol weight" 
 // --- Multi-Token Captures (spec: multi-token-captures) ---
 
 fn capturePattern(seq: *[1]loader.SequenceElement, captures: *[1]loader.Capture, cap: loader.Capture) loader.Pattern {
-    seq[0] = .{ .matcher = .{ .capture = cap } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = cap } };
     captures[0] = cap;
     return .{ .type_name = "span", .sequence = seq, .captures = captures };
 }
@@ -4914,8 +4933,8 @@ test "parse: later element matches the first token after the span" {
     const alloc = arena.allocator();
 
     var seq: [2]loader.SequenceElement = undefined;
-    seq[0] = .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0, .separator = "." } } };
-    seq[1] = .{ .matcher = .{ .keyword_literal = "fn" } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0, .separator = "." } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } };
     const patterns = &[_]loader.Pattern{.{
         .type_name = "decl",
         .sequence = &seq,
@@ -4949,7 +4968,7 @@ test "parse: depth-0 constraint evaluates against the full span value" {
             .values = &.{"A.B"},
         }},
     }};
-    seq[0] = .{ .matcher = .{ .capture = cap } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = cap } };
     const automaton = try compiler.compile(patterns, alloc);
 
     const items = [_]TestTokenItem{ idItem("A"), .{ .kind = .symbol, .text = "." }, idItem("B") };
@@ -5215,8 +5234,8 @@ test "property: span scan advances the token index monotonically" {
 // --- Per-Pattern Priors (spec: per-pattern-priors) ---
 
 fn priorPattern(seq: *[2]loader.SequenceElement, prior: f32) loader.Pattern {
-    seq[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
-    seq[1] = .{ .matcher = .{ .identifier = {} } };
+    seq[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } };
+    seq[1] = .{ .matcher = .{ .kind = .{ .one = .identifier } } };
     return .{ .type_name = "decl", .sequence = seq, .captures = &.{}, .prior = prior };
 }
 
@@ -5278,8 +5297,8 @@ test "property: default prior is a no-op" {
             const alloc = arena.allocator();
 
             var seq: [2]loader.SequenceElement = undefined;
-            seq[0] = .{ .matcher = .{ .keyword_literal = "fn" } };
-            seq[1] = .{ .matcher = .{ .identifier = {} } };
+            seq[0] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } };
+            seq[1] = .{ .matcher = .{ .kind = .{ .one = .identifier } } };
             const patterns_implicit = &[_]loader.Pattern{.{
                 .type_name = "decl",
                 .sequence = &seq,
@@ -5580,4 +5599,64 @@ test "property: alternatives ordering" {
             }
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// --- Composable Matcher Model (spec: composable-matcher-model) ---
+
+// Feature: composable-matcher-model, Unit: typed captures and string wildcard
+// **Validates: Requirements 3.5, 4.2, 4.3**
+test "parse: typed captures record number and string text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        var seq: [1]loader.SequenceElement = undefined;
+        seq[0] = .{ .matcher = .{ .kind = .{ .one = .number }, .capture = .{ .field_name = "n", .position = 0 } } };
+        const patterns = &[_]loader.Pattern{.{
+            .type_name = "num",
+            .sequence = &seq,
+            .captures = &.{.{ .field_name = "n", .position = 0 }},
+        }};
+        const automaton = try compiler.compile(patterns, alloc);
+        const items = [_]TestTokenItem{numItem("42")};
+        const stream = try buildStream(alloc, &items);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        try testing.expectEqualStrings("42", result[0].captures[0].value);
+    }
+    {
+        var seq: [1]loader.SequenceElement = undefined;
+        seq[0] = .{ .matcher = .{ .kind = .{ .one = .string }, .capture = .{ .field_name = "s", .position = 0 } } };
+        const patterns = &[_]loader.Pattern{.{
+            .type_name = "msg",
+            .sequence = &seq,
+            .captures = &.{.{ .field_name = "s", .position = 0 }},
+        }};
+        const automaton = try compiler.compile(patterns, alloc);
+        const items = [_]TestTokenItem{ .{ .kind = .string, .text = "\"hi\"" } };
+        const stream = try buildStream(alloc, &items);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        try testing.expectEqualStrings("\"hi\"", result[0].captures[0].value);
+    }
+    {
+        // string wildcard matches a string token; a number token does not.
+        var seq: [1]loader.SequenceElement = undefined;
+        seq[0] = .{ .matcher = .{ .kind = .{ .one = .string } } };
+        const patterns = &[_]loader.Pattern{.{
+            .type_name = "any_str",
+            .sequence = &seq,
+            .captures = &.{},
+        }};
+        const automaton = try compiler.compile(patterns, alloc);
+        const items = [_]TestTokenItem{ .{ .kind = .string, .text = "\"x\"" } };
+        const stream = try buildStream(alloc, &items);
+        const result = try parse(automaton, stream.tokens, stream.source, patterns, .{}, .{}, false, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        const items2 = [_]TestTokenItem{numItem("7")};
+        const stream2 = try buildStream(alloc, &items2);
+        const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, .{}, .{}, false, alloc);
+        try testing.expectEqual(@as(usize, 0), result2.len);
+    }
 }

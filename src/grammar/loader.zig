@@ -1,5 +1,7 @@
 const std = @import("std");
 const toml = @import("toml");
+const tokenizer = @import("../parser/tokenizer.zig");
+const TokenKind = tokenizer.TokenKind;
 
 // --- Data Types ---
 
@@ -42,7 +44,7 @@ pub const Constraint = struct {
 };
 
 pub const SequenceElement = struct {
-    matcher: TokenMatcher,
+    matcher: ComposableMatcher,
     is_optional: bool = false,
 };
 
@@ -55,14 +57,25 @@ pub const Pattern = struct {
     prior: f32 = 1.0,
 };
 
-pub const TokenMatcher = union(enum) {
-    keyword_literal: []const u8,
-    symbol_literal: []const u8,
-    identifier: void,
-    capture: Capture,
-    identifier_literal: []const u8,
-    number: void,
+/// Kind axis: a resolved reference, not a per-kind variant. The fixed default Kind_Table
+/// is wrapped here; a later grammar-defined-token-kinds feature swaps the table source.
+pub const KindRef = union(enum) {
+    any,
+    one: TokenKind,
+    punctuation,
 };
+
+pub const TextConstraint = union(enum) {
+    any,
+    exact: []const u8,
+};
+
+pub const ComposableMatcher = struct {
+    kind: KindRef,
+    text: TextConstraint = .any,
+    capture: ?Capture = null,
+};
+
 
 pub const Capture = struct {
     field_name: []const u8,
@@ -101,6 +114,7 @@ pub const GrammarError = error{
     InvalidPositionValue,
     InvalidWeightValue,
     InvalidPriorValue,
+    InvalidKindName,
     InvalidConstraintType,
     InvalidConstraintDepth,
     InvalidConstraintField,
@@ -155,16 +169,29 @@ const CaptureParams = struct {
     suffix_set: ?[]const u8,
 };
 
-// Parses the tail of a $field:... sequence element: either bare "IDENTIFIER"
-// (single-token capture) or "IDENTIFIER(sep="...", suffix="...")".
-fn parseCaptureTail(tail: []const u8, allocator: std.mem.Allocator) GrammarError!CaptureParams {
-    const kind = "IDENTIFIER";
-    if (std.mem.eql(u8, tail, kind)) {
-        return .{ .separator = null, .suffix_set = null };
+/// Resolves a kind name against the fixed default Kind_Table. Unknown name → null.
+/// The single resolution point a later grammar-defined-token-kinds feature swaps.
+fn resolveKind(name: []const u8) ?KindRef {
+    if (std.mem.eql(u8, name, "IDENTIFIER")) return .{ .one = .identifier };
+    if (std.mem.eql(u8, name, "NUMBER")) return .{ .one = .number };
+    if (std.mem.eql(u8, name, "STRING")) return .{ .one = .string };
+    return null;
+}
+
+/// Parses the tail of a $field:KIND... sequence element: either bare "KIND"
+/// (single-token capture) or "KIND(sep="...", suffix="...")".
+fn parseCaptureTail(tail: []const u8, allocator: std.mem.Allocator) GrammarError!struct { kind: KindRef, span: CaptureParams } {
+    const colon = std.mem.indexOfScalar(u8, tail, '(') orelse tail.len;
+    const kind_name = tail[0..colon];
+    const kind = resolveKind(kind_name) orelse return error.InvalidKindName;
+    const rest = tail[colon..];
+    if (rest.len == 0) {
+        return .{ .kind = kind, .span = .{ .separator = null, .suffix_set = null } };
     }
-    if (tail.len > kind.len + 2 and std.mem.startsWith(u8, tail, kind) and tail[kind.len] == '(' and tail[tail.len - 1] == ')') {
-        const params = tail[kind.len + 1 .. tail.len - 1];
-        return parseParamList(params, allocator);
+    if (rest.len >= 2 and rest[0] == '(' and rest[rest.len - 1] == ')') {
+        const params = rest[1 .. rest.len - 1];
+        const span = try parseParamList(params, allocator);
+        return .{ .kind = kind, .span = span };
     }
     return error.InvalidCaptureFormat;
 }
@@ -210,40 +237,50 @@ fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.All
         s = s[0 .. s.len - 1];
     }
 
-    // Capture: $name:IDENTIFIER or $name:IDENTIFIER(sep="...", suffix="...")
+    // Capture: $field:KIND[(params)] — kind resolved via resolveKind.
     if (s.len > 0 and s[0] == '$') {
         const colon_idx = std.mem.indexOf(u8, s, ":") orelse return error.InvalidCaptureFormat;
         if (colon_idx < 2) return error.InvalidCaptureFormat; // need at least $x
         const field_name = try allocator.dupe(u8, s[1..colon_idx]);
         const tail = s[colon_idx + 1 ..];
-        const params = try parseCaptureTail(tail, allocator);
+        const parsed = try parseCaptureTail(tail, allocator);
         const cap = Capture{
             .field_name = field_name,
             .position = position,
-            .separator = params.separator,
-            .suffix_set = params.suffix_set,
+            .separator = parsed.span.separator,
+            .suffix_set = parsed.span.suffix_set,
         };
-        return .{ .element = .{ .matcher = .{ .capture = cap }, .is_optional = optional }, .capture = cap };
+        const matcher = ComposableMatcher{ .kind = parsed.kind, .capture = cap };
+        return .{ .element = .{ .matcher = matcher, .is_optional = optional }, .capture = cap };
     }
-    // Identifier wildcard
+    // Kind wildcards: identifier, number (string added in task 5)
     if (std.mem.eql(u8, s, "identifier")) {
-        return .{ .element = .{ .matcher = .{ .identifier = {} }, .is_optional = optional }, .capture = null };
+        return .{ .element = .{ .matcher = .{ .kind = .{ .one = .identifier } }, .is_optional = optional }, .capture = null };
     }
-    // Number wildcard
     if (std.mem.eql(u8, s, "number")) {
-        return .{ .element = .{ .matcher = .{ .number = {} }, .is_optional = optional }, .capture = null };
+        return .{ .element = .{ .matcher = .{ .kind = .{ .one = .number } }, .is_optional = optional }, .capture = null };
     }
-    // EXACT IDENTIFIER matching (Config:IDENTIFIER)
-    if (std.mem.endsWith(u8, s, ":IDENTIFIER") and s.len > 11 and s[0] != '$') {
-        const exact_text = try allocator.dupe(u8, s[0 .. s.len - 11]);
-        return .{ .element = .{ .matcher = .{ .identifier_literal = exact_text }, .is_optional = optional }, .capture = null };
+    if (std.mem.eql(u8, s, "string")) {
+        return .{ .element = .{ .matcher = .{ .kind = .{ .one = .string } }, .is_optional = optional }, .capture = null };
+    }
+    // EXACT KIND matching (Name:KIND) — not starting with '$'
+    if (s[0] != '$') {
+        if (std.mem.indexOfScalar(u8, s, ':')) |colon_idx| {
+            if (colon_idx > 0) {
+                const kind_name = s[colon_idx + 1 ..];
+                if (kind_name.len == 0) return error.InvalidKindName;
+                const kind = resolveKind(kind_name) orelse return error.InvalidKindName;
+                const exact_text = try allocator.dupe(u8, s[0..colon_idx]);
+                return .{ .element = .{ .matcher = .{ .kind = kind, .text = .{ .exact = exact_text } }, .is_optional = optional }, .capture = null };
+            }
+        }
     }
     // Punctuation literal (single char: symbol, delimiter, or operator)
     if (isPunctuation(s)) {
-        return .{ .element = .{ .matcher = .{ .symbol_literal = try allocator.dupe(u8, s) }, .is_optional = optional }, .capture = null };
+        return .{ .element = .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = try allocator.dupe(u8, s) } }, .is_optional = optional }, .capture = null };
     }
     // Keyword literal
-    return .{ .element = .{ .matcher = .{ .keyword_literal = try allocator.dupe(u8, s) }, .is_optional = optional }, .capture = null };
+    return .{ .element = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = try allocator.dupe(u8, s) } }, .is_optional = optional }, .capture = null };
 }
 
 /// Parses a TOML grammar file from bytes into a Grammar struct.
@@ -535,35 +572,70 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
         for (pattern.sequence, 0..) |elem, i| {
             if (i > 0) try w.writeAll(", ");
             try w.writeAll("\"");
-            switch (elem.matcher) {
-                .keyword_literal => |kw| try w.writeAll(kw),
-                .symbol_literal => |sym| try w.writeAll(sym),
-                .identifier => try w.writeAll("identifier"),
-                .capture => |cap| {
-                    try w.writeAll("$");
-                    try w.writeAll(cap.field_name);
-                    try w.writeAll(":IDENTIFIER");
-                    if (cap.separator != null or cap.suffix_set != null) {
-                        try w.writeAll("(");
-                        if (cap.separator) |sep| {
-                            try w.writeAll("sep=\\\"");
-                            try writeEscaped(w, sep);
-                            try w.writeAll("\\\"");
-                        }
-                        if (cap.suffix_set) |suf| {
-                            if (cap.separator != null) try w.writeAll(", ");
-                            try w.writeAll("suffix=\\\"");
-                            try writeEscaped(w, suf);
-                            try w.writeAll("\\\"");
-                        }
-                        try w.writeAll(")");
+            const m = elem.matcher;
+            if (m.capture) |cap| {
+                // Capture: $field:KIND[(sep=..., suffix=...)]
+                try w.writeAll("$");
+                try w.writeAll(cap.field_name);
+                try w.writeAll(":");
+                if (m.kind == .one) {
+                    switch (m.kind.one) {
+                        .identifier => try w.writeAll("IDENTIFIER"),
+                        .number => try w.writeAll("NUMBER"),
+                        .string => try w.writeAll("STRING"),
+                        else => {},
                     }
+                }
+                if (cap.separator != null or cap.suffix_set != null) {
+                    try w.writeAll("(");
+                    if (cap.separator) |sep| {
+                        try w.writeAll("sep=\\\"");
+                        try writeEscaped(w, sep);
+                        try w.writeAll("\\\"");
+                    }
+                    if (cap.suffix_set) |suf| {
+                        if (cap.separator != null) try w.writeAll(", ");
+                        try w.writeAll("suffix=\\\"");
+                        try writeEscaped(w, suf);
+                        try w.writeAll("\\\"");
+                    }
+                    try w.writeAll(")");
+                }
+            } else switch (m.kind) {
+                .any => {},
+                .one => |k| switch (k) {
+                    .identifier => switch (m.text) {
+                        .any => try w.writeAll("identifier"),
+                        .exact => |t| {
+                            try w.writeAll(t);
+                            try w.writeAll(":IDENTIFIER");
+                        },
+                    },
+                    .number => switch (m.text) {
+                        .any => try w.writeAll("number"),
+                        .exact => |t| {
+                            try w.writeAll(t);
+                            try w.writeAll(":NUMBER");
+                        },
+                    },
+                    .string => switch (m.text) {
+                        .any => try w.writeAll("string"),
+                        .exact => |t| {
+                            try w.writeAll(t);
+                            try w.writeAll(":STRING");
+                        },
+                    },
+                    .keyword => {
+                        if (m.text == .exact) try w.writeAll(m.text.exact);
+                    },
+                    .operator, .symbol, .delimiter => {
+                        if (m.text == .exact) try w.writeAll(m.text.exact);
+                    },
+                    else => {},
                 },
-                .identifier_literal => |id| {
-                    try w.writeAll(id);
-                    try w.writeAll(":IDENTIFIER");
+                .punctuation => {
+                    if (m.text == .exact) try w.writeAll(m.text.exact);
                 },
-                .number => try w.writeAll("number"),
             }
             if (elem.is_optional) try w.writeAll("?");
             try w.writeAll("\"");
@@ -781,11 +853,11 @@ test "parseGrammar: capture parsing" {
 
     const seq = grammar.patterns[0].sequence;
     try testing.expectEqual(@as(usize, 3), seq.len);
-    try testing.expect(seq[0].matcher == .keyword_literal);
-    try testing.expect(seq[1].matcher == .capture);
-    try testing.expectEqualStrings("name", seq[1].matcher.capture.field_name);
-    try testing.expectEqual(@as(usize, 1), seq[1].matcher.capture.position);
-    try testing.expect(seq[2].matcher == .symbol_literal);
+    try testing.expect(seq[0].matcher.kind == .one and seq[0].matcher.kind.one == .keyword);
+    try testing.expect(seq[1].matcher.capture != null);
+    try testing.expectEqualStrings("name", seq[1].matcher.capture.?.field_name);
+    try testing.expectEqual(@as(usize, 1), seq[1].matcher.capture.?.position);
+    try testing.expect(seq[2].matcher.kind == .punctuation);
 }
 
 test "parseGrammar: identifier_literal parsing" {
@@ -801,9 +873,9 @@ test "parseGrammar: identifier_literal parsing" {
 
     const seq = grammar.patterns[0].sequence;
     try testing.expectEqual(@as(usize, 2), seq.len);
-    try testing.expect(seq[0].matcher == .identifier_literal);
-    try testing.expectEqualStrings("Config", seq[0].matcher.identifier_literal);
-    try testing.expect(seq[1].matcher == .identifier);
+    try testing.expect(seq[0].matcher.kind == .one and seq[0].matcher.kind.one == .identifier and seq[0].matcher.text == .exact);
+    try testing.expectEqualStrings("Config", seq[0].matcher.text.exact);
+    try testing.expect(seq[1].matcher.kind == .one and seq[1].matcher.kind.one == .identifier and seq[1].matcher.text == .any);
 }
 
 test "parseGrammar: missing patterns returns error" {
@@ -1079,8 +1151,8 @@ test "formatGrammar: depth=0 constraint with field serialized" {
             .{
                 .type_name = "method",
                 .sequence = &.{
-                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-                    .{ .matcher = .{ .symbol_literal = "(" } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                 },
                 .captures = &.{
                     .{ .field_name = "name", .position = 0 },
@@ -1132,8 +1204,8 @@ test "formatGrammar: depth=1 constraint without field serialized" {
             .{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-                    .{ .matcher = .{ .symbol_literal = "(" } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                 },
                 .captures = &.{
                     .{ .field_name = "name", .position = 0 },
@@ -1184,8 +1256,8 @@ test "formatGrammar: multiple constraints on one pattern" {
             .{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 0 } } },
-                    .{ .matcher = .{ .symbol_literal = "(" } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 0 } } },
+                    .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                 },
                 .captures = &.{
                     .{ .field_name = "name", .position = 0 },
@@ -1247,8 +1319,8 @@ test "formatGrammar: no constraints emits no constraints section" {
             .{
                 .type_name = "call",
                 .sequence = &.{
-                    .{ .matcher = .{ .identifier = {} } },
-                    .{ .matcher = .{ .symbol_literal = "(" } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                    .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                 },
                 .captures = &.{},
             },
@@ -1294,9 +1366,9 @@ test "property: grammar TOML round-trip" {
                     .{
                         .type_name = "function",
                         .sequence = &.{
-                            .{ .matcher = .{ .keyword_literal = "fn" } },
-                            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-                            .{ .matcher = .{ .symbol_literal = "(" } },
+                            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+                            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                         },
                         .captures = &.{
                             .{ .field_name = "name", .position = 1 },
@@ -1376,7 +1448,7 @@ test "property: comment config round-trip" {
                     .{
                         .type_name = "function",
                         .sequence = &.{
-                            .{ .matcher = .{ .keyword_literal = "fn" } },
+                            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
                         },
                         .captures = &.{},
                     },
@@ -1455,9 +1527,9 @@ test "property: grammar TOML round-trip with position" {
                     .{
                         .type_name = "function",
                         .sequence = &.{
-                            .{ .matcher = .{ .keyword_literal = "fn" } },
-                            .{ .matcher = .{ .capture = .{ .field_name = "name", .position = 1 } } },
-                            .{ .matcher = .{ .symbol_literal = "(" } },
+                            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                            .{ .matcher = .{ .kind = .{ .one = .identifier }, .capture = .{ .field_name = "name", .position = 1 } } },
+                            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                         },
                         .captures = &.{
                             .{ .field_name = "name", .position = 1 },
@@ -1926,10 +1998,10 @@ test "property: optional element parsing round-trip" {
 
             // Build a Grammar with a single pattern containing one element
             const elem: SequenceElement = switch (matcher_type) {
-                0 => .{ .matcher = .{ .keyword_literal = "fn" }, .is_optional = is_optional },
-                1 => .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = is_optional },
-                2 => .{ .matcher = .{ .identifier = {} }, .is_optional = is_optional },
-                3 => .{ .matcher = .{ .identifier_literal = "Config" }, .is_optional = is_optional },
+                0 => .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } }, .is_optional = is_optional },
+                1 => .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } }, .is_optional = is_optional },
+                2 => .{ .matcher = .{ .kind = .{ .one = .identifier } }, .is_optional = is_optional },
+                3 => .{ .matcher = .{ .kind = .{ .one = .identifier }, .text = .{ .exact = "Config" } }, .is_optional = is_optional },
                 else => unreachable,
             };
 
@@ -1943,7 +2015,7 @@ test "property: optional element parsing round-trip" {
                     .{
                         .type_name = "test_pattern",
                         .sequence = &.{
-                            .{ .matcher = .{ .keyword_literal = "def" } },
+                            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "def" } } },
                             elem,
                         },
                         .captures = &.{},
@@ -1964,22 +2036,8 @@ test "property: optional element parsing round-trip" {
             try testing.expectEqual(is_optional, parsed_elem.is_optional);
 
             // Verify the matcher type is preserved
-            const orig_tag: u3 = switch (elem.matcher) {
-                .keyword_literal => 0,
-                .symbol_literal => 1,
-                .identifier => 2,
-                .capture => 3,
-                .identifier_literal => 4,
-                .number => 5,
-            };
-            const parsed_tag: u3 = switch (parsed_elem.matcher) {
-                .keyword_literal => 0,
-                .symbol_literal => 1,
-                .identifier => 2,
-                .capture => 3,
-                .identifier_literal => 4,
-                .number => 5,
-            };
+            const orig_tag: u8 = matcherTag(elem.matcher);
+            const parsed_tag: u8 = matcherTag(parsed_elem.matcher);
             try testing.expectEqual(orig_tag, parsed_tag);
         }
     }.prop, .{ .num_runs = 100 });
@@ -2001,8 +2059,8 @@ test "parseGrammar: optional symbol_literal with ? suffix" {
     const seq = grammar.patterns[0].sequence;
     try testing.expectEqual(@as(usize, 3), seq.len);
     // "{?" → symbol_literal "{" with is_optional = true
-    try testing.expect(seq[2].matcher == .symbol_literal);
-    try testing.expectEqualStrings("{", seq[2].matcher.symbol_literal);
+    try testing.expect(seq[2].matcher.kind == .punctuation);
+    try testing.expectEqualStrings("{", seq[2].matcher.text.exact);
     try testing.expect(seq[2].is_optional);
     // First two elements should NOT be optional
     try testing.expect(!seq[0].is_optional);
@@ -2023,11 +2081,11 @@ test "parseGrammar: optional keyword_literal with ? suffix" {
     const seq = grammar.patterns[0].sequence;
     try testing.expectEqual(@as(usize, 2), seq.len);
     // "fn?" → keyword_literal "fn" with is_optional = true
-    try testing.expect(seq[0].matcher == .keyword_literal);
-    try testing.expectEqualStrings("fn", seq[0].matcher.keyword_literal);
+    try testing.expect(seq[0].matcher.kind == .one and seq[0].matcher.kind.one == .keyword);
+    try testing.expectEqualStrings("fn", seq[0].matcher.text.exact);
     try testing.expect(seq[0].is_optional);
     // "identifier" → identifier with is_optional = false
-    try testing.expect(seq[1].matcher == .identifier);
+    try testing.expect(seq[1].matcher.kind == .one and seq[1].matcher.kind.one == .identifier);
     try testing.expect(!seq[1].is_optional);
 }
 
@@ -2045,7 +2103,7 @@ test "parseGrammar: optional identifier with ? suffix" {
     const seq = grammar.patterns[0].sequence;
     try testing.expectEqual(@as(usize, 2), seq.len);
     // "identifier?" → identifier with is_optional = true
-    try testing.expect(seq[1].matcher == .identifier);
+    try testing.expect(seq[1].matcher.kind == .one and seq[1].matcher.kind.one == .identifier);
     try testing.expect(seq[1].is_optional);
 }
 
@@ -2062,9 +2120,9 @@ test "formatGrammar: round-trip preserves optional elements" {
             .{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
-                    .{ .matcher = .{ .identifier = {} } },
-                    .{ .matcher = .{ .symbol_literal = "{" }, .is_optional = true },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                    .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "{" } }, .is_optional = true },
                 },
                 .captures = &.{},
             },
@@ -2079,8 +2137,8 @@ test "formatGrammar: round-trip preserves optional elements" {
     try testing.expect(!parsed.patterns[0].sequence[0].is_optional);
     try testing.expect(!parsed.patterns[0].sequence[1].is_optional);
     try testing.expect(parsed.patterns[0].sequence[2].is_optional);
-    try testing.expect(parsed.patterns[0].sequence[2].matcher == .symbol_literal);
-    try testing.expectEqualStrings("{", parsed.patterns[0].sequence[2].matcher.symbol_literal);
+    try testing.expect(parsed.patterns[0].sequence[2].matcher.kind == .punctuation);
+    try testing.expectEqualStrings("{", parsed.patterns[0].sequence[2].matcher.text.exact);
 }
 
 // --- Phase 5: Configurable Weights Property Tests ---
@@ -2222,9 +2280,9 @@ test "property: grammar TOML round-trip with weights" {
                     .{
                         .type_name = "function",
                         .sequence = &.{
-                            .{ .matcher = .{ .keyword_literal = "fn" } },
-                            .{ .matcher = .{ .identifier = {} } },
-                            .{ .matcher = .{ .symbol_literal = "(" } },
+                            .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                            .{ .matcher = .{ .kind = .{ .one = .identifier } } },
+                            .{ .matcher = .{ .kind = .punctuation, .text = .{ .exact = "(" } } },
                         },
                         .captures = &.{},
                     },
@@ -2307,8 +2365,8 @@ test "parseGrammar: round-trip with all weight fields" {
             .{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
-                    .{ .matcher = .{ .identifier = {} } },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier } } },
                 },
                 .captures = &.{},
             },
@@ -2838,8 +2896,8 @@ test "formatGrammar: round-trip with comments section" {
             .{
                 .type_name = "function",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
-                    .{ .matcher = .{ .identifier = {} } },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
+                    .{ .matcher = .{ .kind = .{ .one = .identifier } } },
                 },
                 .captures = &.{},
             },
@@ -2876,7 +2934,7 @@ test "formatGrammar: comments with special characters escaped" {
             .{
                 .type_name = "test",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
                 },
                 .captures = &.{},
             },
@@ -2919,7 +2977,7 @@ test "formatGrammar: empty config omits [comments] section" {
             .{
                 .type_name = "test",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
                 },
                 .captures = &.{},
             },
@@ -2959,7 +3017,7 @@ test "formatGrammar: default config produces explicit section" {
             .{
                 .type_name = "test",
                 .sequence = &.{
-                    .{ .matcher = .{ .keyword_literal = "fn" } },
+                    .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "fn" } } },
                 },
                 .captures = &.{},
             },
@@ -3023,8 +3081,8 @@ test "parseSequenceElement: operator characters route to symbol_literal" {
     for (ops) |c| {
         const s = [1]u8{c};
         const res = try parseSequenceElement(&s, 0, alloc);
-        try testing.expect(res.element.matcher == .symbol_literal);
-        try testing.expectEqualStrings(&s, res.element.matcher.symbol_literal);
+        try testing.expect(res.element.matcher.kind == .punctuation);
+        try testing.expectEqualStrings(&s, res.element.matcher.text.exact);
     }
 
     // Existing symbol/delimiter characters continue to route identically.
@@ -3032,8 +3090,8 @@ test "parseSequenceElement: operator characters route to symbol_literal" {
     for (sym_delim) |c| {
         const s = [1]u8{c};
         const res = try parseSequenceElement(&s, 0, alloc);
-        try testing.expect(res.element.matcher == .symbol_literal);
-        try testing.expectEqualStrings(&s, res.element.matcher.symbol_literal);
+        try testing.expect(res.element.matcher.kind == .punctuation);
+        try testing.expectEqualStrings(&s, res.element.matcher.text.exact);
     }
 }
 
@@ -3044,22 +3102,22 @@ test "parseSequenceElement: non-punctuation routes to non-punctuation matchers" 
 
     {
         const res = try parseSequenceElement("module", 0, alloc);
-        try testing.expect(res.element.matcher == .keyword_literal);
-        try testing.expectEqualStrings("module", res.element.matcher.keyword_literal);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .keyword);
+        try testing.expectEqualStrings("module", res.element.matcher.text.exact);
     }
     {
         const res = try parseSequenceElement("$name:IDENTIFIER", 0, alloc);
-        try testing.expect(res.element.matcher == .capture);
-        try testing.expectEqualStrings("name", res.element.matcher.capture.field_name);
+        try testing.expect(res.element.matcher.capture != null);
+        try testing.expectEqualStrings("name", res.element.matcher.capture.?.field_name);
     }
     {
         const res = try parseSequenceElement("Config:IDENTIFIER", 0, alloc);
-        try testing.expect(res.element.matcher == .identifier_literal);
-        try testing.expectEqualStrings("Config", res.element.matcher.identifier_literal);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier and res.element.matcher.text == .exact);
+        try testing.expectEqualStrings("Config", res.element.matcher.text.exact);
     }
     {
         const res = try parseSequenceElement("identifier", 0, alloc);
-        try testing.expect(res.element.matcher == .identifier);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier);
     }
 }
 
@@ -3070,8 +3128,8 @@ test "parseSequenceElement: optional suffix preserved on punctuation routing" {
 
     const res = try parseSequenceElement("-?", 0, alloc);
     try testing.expect(res.element.is_optional);
-    try testing.expect(res.element.matcher == .symbol_literal);
-    try testing.expectEqualStrings("-", res.element.matcher.symbol_literal);
+    try testing.expect(res.element.matcher.kind == .punctuation);
+    try testing.expectEqualStrings("-", res.element.matcher.text.exact);
 }
 
 // Feature: operator-token-matching, Property 4: Loader routes punctuation characters
@@ -3090,8 +3148,8 @@ test "property: loader routes punctuation characters to the punctuation matcher"
             const c = punct[idx];
             const s = [1]u8{c};
             const res = try parseSequenceElement(&s, 0, alloc);
-            try testing.expect(res.element.matcher == .symbol_literal);
-            try testing.expectEqualStrings(&s, res.element.matcher.symbol_literal);
+            try testing.expect(res.element.matcher.kind == .punctuation);
+            try testing.expectEqualStrings(&s, res.element.matcher.text.exact);
         }
     }.prop, .{ .num_runs = 100 });
 
@@ -3104,9 +3162,9 @@ test "property: loader routes punctuation characters to the punctuation matcher"
 
             const res = try parseSequenceElement(word, 0, alloc);
             if (std.mem.eql(u8, word, "identifier")) {
-                try testing.expect(res.element.matcher == .identifier);
+                try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier);
             } else {
-                try testing.expect(res.element.matcher == .keyword_literal);
+                try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .keyword);
             }
         }
     }.prop, .{ .num_runs = 100 });
@@ -3121,13 +3179,13 @@ test "parseSequenceElement: number parses to non-capturing number matcher" {
 
     {
         const res = try parseSequenceElement("number", 0, alloc);
-        try testing.expect(res.element.matcher == .number);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
         try testing.expect(!res.element.is_optional);
         try testing.expect(res.capture == null);
     }
     {
         const res = try parseSequenceElement("number?", 0, alloc);
-        try testing.expect(res.element.matcher == .number);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
         try testing.expect(res.element.is_optional);
         try testing.expect(res.capture == null);
     }
@@ -3141,8 +3199,8 @@ test "parseSequenceElement: near-miss number strings fall through to keyword lit
     const near_misses = [_][]const u8{ "numbers", "number2", "Number" };
     for (near_misses) |nm| {
         const res = try parseSequenceElement(nm, 0, alloc);
-        try testing.expect(res.element.matcher == .keyword_literal);
-        try testing.expectEqualStrings(nm, res.element.matcher.keyword_literal);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .keyword);
+        try testing.expectEqualStrings(nm, res.element.matcher.text.exact);
     }
 }
 
@@ -3178,7 +3236,7 @@ test "property: number and number? parse to a non-capturing number matcher" {
             const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"num\"\nsequence = [\"{s}\"]\n", .{elem_text});
             const grammar = try parseGrammar(source, alloc);
             const elem = grammar.patterns[0].sequence[0];
-            try testing.expect(elem.matcher == .number);
+            try testing.expect(elem.matcher.kind == .one and elem.matcher.kind.one == .number);
             try testing.expectEqual(optional, elem.is_optional);
             try testing.expectEqual(@as(usize, 0), grammar.patterns[0].captures.len);
         }
@@ -3214,20 +3272,20 @@ test "property: existing primitives are unaffected by the number branch" {
 
             const res = try parseSequenceElement(form, 0, alloc);
             switch (vals[0]) {
-                0 => try testing.expect(res.element.matcher == .identifier),
+                0 => try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier),
                 1 => {
-                    try testing.expect(res.element.matcher == .identifier_literal);
-                    try testing.expectEqualStrings("Config", res.element.matcher.identifier_literal);
+                    try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier and res.element.matcher.text == .exact);
+                    try testing.expectEqualStrings("Config", res.element.matcher.text.exact);
                 },
                 2 => {
-                    try testing.expect(res.element.matcher == .capture);
-                    try testing.expectEqualStrings("name", res.element.matcher.capture.field_name);
+                    try testing.expect(res.element.matcher.capture != null);
+                    try testing.expectEqualStrings("name", res.element.matcher.capture.?.field_name);
                 },
                 3 => {
-                    try testing.expect(res.element.matcher == .symbol_literal);
-                    try testing.expectEqualStrings(&[1]u8{punct[vals[0]]}, res.element.matcher.symbol_literal);
+                    try testing.expect(res.element.matcher.kind == .punctuation);
+                    try testing.expectEqualStrings(&[1]u8{punct[vals[0]]}, res.element.matcher.text.exact);
                 },
-                else => try testing.expect(res.element.matcher == .keyword_literal),
+                else => try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .keyword),
             }
         }
     }.prop, .{ .num_runs = 100 });
@@ -3263,15 +3321,24 @@ test "property: round-trip through grammar formatting" {
     }.prop, .{ .num_runs = 100 });
 }
 
-fn matcherTag(m: TokenMatcher) u3 {
-    return switch (m) {
-        .keyword_literal => 0,
-        .symbol_literal => 1,
-        .identifier => 2,
-        .capture => 3,
-        .identifier_literal => 4,
-        .number => 5,
+fn matcherTag(m: ComposableMatcher) u8 {
+    const kind_tag: u8 = switch (m.kind) {
+        .any => 0,
+        .one => |k| switch (k) {
+            .keyword => 1,
+            .operator, .symbol, .delimiter => 2,
+            .identifier => 3,
+            .number => 4,
+            .string => 5,
+            else => 6,
+        },
+        .punctuation => 2,
     };
+    const text_tag: u8 = switch (m.text) {
+        .any => 0,
+        .exact => 1,
+    };
+    return kind_tag * 4 + text_tag;
 }
 
 // Feature: number-token-primitive, Property 7: grammars without number are byte-for-byte
@@ -3309,35 +3376,35 @@ test "parseSequenceElement: parameterized capture forms" {
 
     {
         const res = try parseSequenceElement("$name:IDENTIFIER", 0, alloc);
-        try testing.expect(res.element.matcher == .capture);
-        try testing.expect(res.element.matcher.capture.separator == null);
-        try testing.expect(res.element.matcher.capture.suffix_set == null);
-        try testing.expectEqualStrings("name", res.element.matcher.capture.field_name);
+        try testing.expect(res.element.matcher.capture != null);
+        try testing.expect(res.element.matcher.capture.?.separator == null);
+        try testing.expect(res.element.matcher.capture.?.suffix_set == null);
+        try testing.expectEqualStrings("name", res.element.matcher.capture.?.field_name);
     }
     {
         const res = try parseSequenceElement("$name:IDENTIFIER(sep=\".\")", 0, alloc);
-        try testing.expectEqualStrings(".", res.element.matcher.capture.separator.?);
-        try testing.expect(res.element.matcher.capture.suffix_set == null);
+        try testing.expectEqualStrings(".", res.element.matcher.capture.?.separator.?);
+        try testing.expect(res.element.matcher.capture.?.suffix_set == null);
     }
     {
         const res = try parseSequenceElement("$name:IDENTIFIER(suffix=\"!?\")", 0, alloc);
-        try testing.expect(res.element.matcher.capture.separator == null);
-        try testing.expectEqualStrings("!?", res.element.matcher.capture.suffix_set.?);
+        try testing.expect(res.element.matcher.capture.?.separator == null);
+        try testing.expectEqualStrings("!?", res.element.matcher.capture.?.suffix_set.?);
     }
     {
         const res = try parseSequenceElement("$name:IDENTIFIER(sep=\"::\", suffix=\"!?\")", 0, alloc);
-        try testing.expectEqualStrings("::", res.element.matcher.capture.separator.?);
-        try testing.expectEqualStrings("!?", res.element.matcher.capture.suffix_set.?);
+        try testing.expectEqualStrings("::", res.element.matcher.capture.?.separator.?);
+        try testing.expectEqualStrings("!?", res.element.matcher.capture.?.suffix_set.?);
     }
     {
         const res = try parseSequenceElement("$name:IDENTIFIER(suffix=\"!?\", sep=\".\")", 0, alloc);
-        try testing.expectEqualStrings(".", res.element.matcher.capture.separator.?);
-        try testing.expectEqualStrings("!?", res.element.matcher.capture.suffix_set.?);
+        try testing.expectEqualStrings(".", res.element.matcher.capture.?.separator.?);
+        try testing.expectEqualStrings("!?", res.element.matcher.capture.?.suffix_set.?);
     }
     {
         const res = try parseSequenceElement("$name:IDENTIFIER(sep=\".\")?", 0, alloc);
         try testing.expect(res.element.is_optional);
-        try testing.expectEqualStrings(".", res.element.matcher.capture.separator.?);
+        try testing.expectEqualStrings(".", res.element.matcher.capture.?.separator.?);
     }
 }
 
@@ -3394,14 +3461,14 @@ test "property: parameter list parses to the correct capture fields" {
             };
             const res = try parseSequenceElement(elem, 0, alloc);
             const cap = res.element.matcher.capture;
-            try testing.expectEqualStrings(inp.field, cap.field_name);
-            try testing.expectEqual(inp.mode == 0 or inp.mode == 2, cap.separator == null);
-            try testing.expectEqual(inp.mode == 0 or inp.mode == 1, cap.suffix_set == null);
+            try testing.expectEqualStrings(inp.field, cap.?.field_name);
+            try testing.expectEqual(inp.mode == 0 or inp.mode == 2, cap.?.separator == null);
+            try testing.expectEqual(inp.mode == 0 or inp.mode == 1, cap.?.suffix_set == null);
             if (inp.mode == 1 or inp.mode == 3) {
-                try testing.expectEqualStrings(inp.sep, cap.separator.?);
+                try testing.expectEqualStrings(inp.sep, cap.?.separator.?);
             }
             if (inp.mode == 2 or inp.mode == 3) {
-                try testing.expectEqualStrings(inp.suffix, cap.suffix_set.?);
+                try testing.expectEqualStrings(inp.suffix, cap.?.suffix_set.?);
             }
         }
     }.prop, .{ .num_runs = 100 });
@@ -3631,4 +3698,98 @@ test "formatGrammar: prior emitted before constraints and only when non-default"
     const prior_pos = std.mem.indexOf(u8, formatted, "prior = 0.4").?;
     const constraints_pos = std.mem.indexOf(u8, formatted, "[[patterns.constraints]]").?;
     try testing.expect(prior_pos < constraints_pos);
+}
+
+// Feature: composable-matcher-model, Unit: new surface forms
+// **Validates: Requirements 3.1, 3.2, 3.4, 4.1, 4.4, 9.1, 9.2**
+test "parseSequenceElement: typed captures and kind wildcards" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        const res = try parseSequenceElement("$n:NUMBER", 0, alloc);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
+        try testing.expect(res.element.matcher.capture != null);
+        try testing.expectEqualStrings("n", res.element.matcher.capture.?.field_name);
+    }
+    {
+        const res = try parseSequenceElement("$s:STRING", 0, alloc);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .string);
+        try testing.expect(res.element.matcher.capture != null);
+        try testing.expectEqualStrings("s", res.element.matcher.capture.?.field_name);
+    }
+    {
+        const res = try parseSequenceElement("string", 0, alloc);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .string);
+        try testing.expect(res.element.matcher.text == .any);
+        try testing.expect(res.element.matcher.capture == null);
+    }
+    {
+        const res = try parseSequenceElement("limit:NUMBER", 0, alloc);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
+        try testing.expect(res.element.matcher.text == .exact);
+        try testing.expectEqualStrings("limit", res.element.matcher.text.exact);
+        try testing.expect(res.element.matcher.capture == null);
+    }
+    {
+        const res = try parseSequenceElement("tag:STRING", 0, alloc);
+        try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .string);
+        try testing.expect(res.element.matcher.text == .exact);
+        try testing.expectEqualStrings("tag", res.element.matcher.text.exact);
+    }
+    {
+        const bad = [_][]const u8{ "$f:BOGUS", "Name:BOGUS" };
+        for (bad) |elem| {
+            try testing.expectError(error.InvalidKindName, parseSequenceElement(elem, 0, alloc));
+        }
+    }
+}
+
+// Feature: composable-matcher-model, Property 8: Unknown-kind rejection
+// **Validates: Requirements 3.4, 9.2**
+test "property: unknown kind names are rejected" {
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alpha });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"$f:{s}\"]\n", .{word});
+            const result = parseGrammar(source, alloc);
+            if (std.mem.eql(u8, word, "IDENTIFIER") or std.mem.eql(u8, word, "NUMBER") or std.mem.eql(u8, word, "STRING")) {
+                const grammar = try result;
+                try testing.expect(grammar.patterns[0].captures.len > 0);
+            } else {
+                try testing.expectError(error.InvalidKindName, result);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: composable-matcher-model, Property 6: new-form round-trip
+// **Validates: Requirements 7.1, 7.4**
+test "property: new surface forms round-trip" {
+    const word_gen = gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha });
+
+    try minish.check(testing.allocator, word_gen, struct {
+        fn prop(word: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const source = try std.fmt.allocPrint(alloc,
+                "[[patterns]]\ntype = \"t\"\nsequence = [\"$a:NUMBER\", \"$b:STRING\", \"string\", \"{s}:NUMBER\"]\n",
+                .{word});
+            const grammar = try parseGrammar(source, alloc);
+            const formatted = try formatGrammar(grammar, alloc);
+            const re = try parseGrammar(formatted, alloc);
+            try testing.expectEqual(grammar.patterns[0].sequence.len, re.patterns[0].sequence.len);
+            for (grammar.patterns[0].sequence, re.patterns[0].sequence) |a, b| {
+                try testing.expectEqual(matcherTag(a.matcher), matcherTag(b.matcher));
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
 }

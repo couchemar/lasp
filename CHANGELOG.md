@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Composable matcher model: the six matcher variants collapse into one `{kind, text, capture}` struct with a resolved kind reference (the seam for future grammar-defined token kinds). New surface forms: typed captures `$field:NUMBER` / `$field:STRING`, the `string` kind wildcard, and exact-text over any kind (`Name:KIND`); unknown kind names are rejected at load time with a descriptive CLI error. Byte-for-byte identical output for all pre-feature grammars (string tokens join matching only when a grammar references the string kind).
+
 ## [0.3.0] - 2026-10-23
 
 ### Added

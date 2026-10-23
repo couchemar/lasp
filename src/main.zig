@@ -110,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
                     error.InvalidPositionValue => "invalid position value, expected 'start'",
                     error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
                     error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
+                    error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
                     error.InvalidConstraintType => "invalid constraint type",
                     error.InvalidConstraintDepth => "invalid constraint depth",
                     error.InvalidConstraintField => "invalid constraint field",
@@ -180,6 +181,7 @@ pub fn main(init: std.process.Init) !void {
                         error.InvalidPositionValue => "invalid position value, expected 'start'",
                         error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
                         error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
+                        error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
                         error.InvalidConstraintDepth => "invalid constraint depth",
                         error.InvalidConstraintField => "invalid constraint field",
                         error.InvalidConstraintValues => "invalid constraint values",
@@ -1902,4 +1904,32 @@ test "integration: --alternatives leaves names-only output unchanged" {
         allocator.free(with_flag.stderr);
     }
     try std.testing.expectEqualStrings(plain.stdout, with_flag.stdout);
+}
+
+// Feature: composable-matcher-model, Integration: typed captures emit values
+// **Validates: Requirements 3.5, 4.1, 8.2**
+test "integration: typed captures and string wildcard emit values" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/typed_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/typed.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), events_arr.len);
+    try std.testing.expectEqualStrings("msg", events_arr[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("\"hello\"", events_arr[0].object.get("s").?.string);
+    try std.testing.expectEqualStrings("num", events_arr[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("42", events_arr[1].object.get("n").?.string);
+    try std.testing.expectEqualStrings("msg", events_arr[2].object.get("type").?.string);
+    try std.testing.expectEqualStrings("\"key\"", events_arr[2].object.get("s").?.string);
 }

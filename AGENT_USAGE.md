@@ -394,13 +394,19 @@ block_close = "-}"
 
 - `line`: up to 16 prefixes, each 1–8 chars; a line comment runs to end-of-line.
 - `block_open`/`block_close`: 1–8 chars, must be supplied together (one alone is an error); unclosed block comments extend to EOF.
-- Longest match wins for overlapping prefixes (`-` vs `--`).
-- Declaring the right prefix (e.g. Erlang `%`) fixes the apostrophe-in-comment bug — a `'` inside a comment no longer opens a spurious string that swallows later code.
-
 ### Sequence elements
 
 | Element | Matches |
 |---------|---------|
+| `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
+| `"("` | Exact punctuation character — operator, symbol, or delimiter (`+ - * / = < > ! & \| ^ % ~ ( ) { } [ ] , ; : . @ ?`) |
+| `"identifier"` | Any identifier token |
+| `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
+| `"$n:NUMBER"` / `"$s:STRING"` | Typed captures — capture a number or string token's source text (string captures include the quotes) |
+| `"string"` | Any string token (kind wildcard) |
+| `"limit:NUMBER"` / `"tag:STRING"` | Exact-text constraint over the named kind |
+| `"$name:IDENTIFIER(sep=\".\")"` | Captures a separator-joined path (`A.B.C`); separator matched by source-byte adjacency, so `"::"` works whether or not the tokenizer splits it |
+
 | `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
 | `"("` | Exact punctuation character — operator, symbol, or delimiter (`+ - * / = < > ! & \| ^ % ~ ( ) { } [ ] , ; : . @ ?`) |
 | `"identifier"` | Any identifier token |

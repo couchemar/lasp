@@ -40,7 +40,6 @@ pub const evidence_weights = struct {
     pub const block: f32 = 0.3;
     pub const relaxed_keyword: f32 = 0.1;
 };
-
 /// Returns the evidence weight for a given token kind.
 pub fn weightForKind(kind: TokenKind) f32 {
     return switch (kind) {
@@ -48,6 +47,7 @@ pub fn weightForKind(kind: TokenKind) f32 {
         .identifier => evidence_weights.identifier,
         .delimiter, .symbol => evidence_weights.symbol,
         .number => evidence_weights.symbol,
+        .string => evidence_weights.symbol,
         else => 0.0,
     };
 }

@@ -46,6 +46,17 @@ pub fn serializeTokens(tokens: []const Token, writer: anytype) !void {
     try writer.writeAll("] }");
 }
 
+// Writes a string with JSON escaping (backslash and double quote).
+fn writeJsonEscaped(w: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '\\' => try w.writeAll("\\\\"),
+            '"' => try w.writeAll("\\\""),
+            else => try w.writeByte(c),
+        }
+    }
+}
+
 const events_mod = @import("../parser/events.zig");
 const StructuralEvent = events_mod.StructuralEvent;
 
@@ -95,7 +106,7 @@ pub fn serializeEventsWithAlternatives(events_list: []const StructuralEvent, inc
             try writer.writeAll(", \"");
             try writer.writeAll(cap.field_name);
             try writer.writeAll("\": \"");
-            try writer.writeAll(cap.value);
+            try writeJsonEscaped(writer, cap.value);
             try writer.writeAll("\"");
         }
 
@@ -111,7 +122,7 @@ pub fn serializeEventsWithAlternatives(events_list: []const StructuralEvent, inc
                     try writer.writeAll(", \"");
                     try writer.writeAll(cap.field_name);
                     try writer.writeAll("\": \"");
-                    try writer.writeAll(cap.value);
+                    try writeJsonEscaped(writer, cap.value);
                     try writer.writeAll("\"");
                 }
                 try writer.writeAll(" }");
