@@ -441,7 +441,7 @@ lasp query 'call[name!="print"]' file.rs -g grammars/rust.toml --names-only
 # Composable pipeline
 echo 'fn add() {}' | lasp parse - -g grammars/rust.toml --node function --names-only
 
-# Version: released builds print plain semver; dev builds print X.Y.Z-dev+<short-commit>
+# Version: released builds print plain semver (requires a matching git tag + clean tree); dev builds print X.Y.Z-dev+<short-commit>
 lasp --version
 lasp -V
 lasp version

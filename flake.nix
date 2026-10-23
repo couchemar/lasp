@@ -46,7 +46,7 @@
             if self ? dirtyRev then true else false;
           gitArgs =
             if versionCommit == null then ""
-            else "-Dgit_commit=${versionCommit} -Dgit_dirty=${if versionDirty then "true" else "false"}";
+            else "-Dgit_commit=${versionCommit} -Dgit_dirty=${if versionDirty then "true" else "false"} -Dgit_tagged=false";
         in
         {
           packages = {
