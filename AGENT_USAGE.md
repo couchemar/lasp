@@ -225,6 +225,7 @@ cat src/main.zig | .bin/lasp query 'function[name!="main"]' - -g examples/gramma
 - `[field="value"]` — equality: include events where capture `field` equals `value`
 - `[field!="value"]` — negation: include events where `field` is absent or differs from `value`
 - `[confidence>N]` — threshold: include events with confidence strictly above N (0.0–1.0)
+- `[args>N]` / `[args=N]` / `[args!=N]` — numeric conditions on integer count fields (`[[patterns.count]]`): unquoted numeric values compare against the event's integer fields; `!=` includes events lacking the field, `=`/`>` exclude them (a `"..."`-quoted value always compares against string captures)
 - Multiple conditions are AND-combined: all must pass
 
 ### Differences from `--node`
@@ -445,24 +446,42 @@ arrow = { literal_set = ["->", "=>"] }
 
 | Element | Matches |
 |---------|---------|
-| `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
-| `"("` | Exact punctuation character — operator, symbol, or delimiter (`+ - * / = < > ! & \| ^ % ~ ( ) { } [ ] , ; : . @ ?`) |
-| `"identifier"` | Any identifier token |
-| `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
-| `"$n:NUMBER"` / `"$s:STRING"` | Typed captures — capture a number or string token's source text (string captures include the quotes) |
-| `"string"` | Any string token (kind wildcard) |
-| `"limit:NUMBER"` / `"tag:STRING"` | Exact-text constraint over the named kind |
-| `"$name:IDENTIFIER(sep=\".\")"` | Captures a separator-joined path (`A.B.C`); separator matched by source-byte adjacency, so `"::"` works whether or not the tokenizer splits it |
 
 | `"fn"` | Exact keyword text (also matches identifiers with reduced confidence) |
 | `"("` | Exact punctuation character — operator, symbol, or delimiter (`+ - * / = < > ! & \| ^ % ~ ( ) { } [ ] , ; : . @ ?`) |
 | `"identifier"` | Any identifier token |
 | `"$name:IDENTIFIER"` | Identifier, captured into `name` field |
-| `"$name:IDENTIFIER(sep=\".\")"` | Captures a separator-joined path (`A.B.C`); separator matched by source-byte adjacency, so `"::"` works whether or not the tokenizer splits it |
-| `"$name:IDENTIFIER(suffix=\"!?\")"` | Absorbs at most one trailing character from the set (`foo!`) |
-| `"$name:IDENTIFIER(sep=\".\", suffix=\"!?\")"` | Both — qualified path with optional trailing sigil |
+| `"$name:IDENTIFIER(sep=...)"` | **Removed** — parenthesized capture parameters are rejected (`ParenthesizedCaptureParam`); use `[[patterns.capture]]` tables |
+| `"$name:IDENTIFIER(suffix=...)"` | **Removed** — see `[[patterns.capture]]` |
 | Same `type` on multiple `[[patterns]]` | Alternatives of one type; overlap collapses to longest match → grammar order |
-| `"ident"` (declared in `[tokens]`) | Any token of that vocabulary kind (custom kinds match by their vocabulary id) |
+
+
+### Capture modifier tables (`[[patterns.capture]]`)
+
+```toml
+[[patterns]]
+type = "fn"
+sequence = ["identifier", "$n:IDENTIFIER"]
+
+[[patterns.capture]]
+field = "n"
+separator = "."
+suffix = "!?"
+```
+
+Attaches separator/suffix span behavior to a bare capture (the removed `$field:KIND(sep=...)` form). `field` must name a capture; one table per field; at least one of `separator`/`suffix` (1–8 bytes).
+
+### Count tables (`[[patterns.count]]`)
+
+```toml
+[[patterns.count]]
+field = "args"
+open = "("
+close = ")"
+separator = ","
+```
+
+Counts depth-1 `separator` tokens inside the first balanced `open`…`close` pair after the match and emits `field` as an **integer** (JSON bare number, queryable with numeric conditions like `[args>1]`, and rendered first by `--names-only`). Validation: four required non-empty 1–8-byte strings, ≤16 tables, no field collisions with captures/earlier counts.
 
 ### Prior (per-pattern confidence multiplier)
 
@@ -550,3 +569,4 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | `query` without grammar | stderr message, non-zero exit |
 | Malformed query selector | stderr message, non-zero exit |
 | No args | Usage message on stderr, non-zero exit (same as `--help`) |
+| Downstream reader closes the pipe early (e.g. `\| head`, `\| less` quit) | Broken pipe (EPIPE) is a clean exit: nothing on stderr, zero exit — like `grep`/`jq`. Other stdout write failures (disk full, I/O error) still error non-zero |

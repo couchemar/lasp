@@ -96,8 +96,15 @@ pub fn parse(selector: []const u8, allocator: std.mem.Allocator) ParseError!Quer
         // 2c. Read value
         const value: AttributeValue = switch (op) {
             .eq, .neq => blk: {
-                // Expect quoted string value
-                if (trimmed[pos] != '"') return ParseError.MissingValue;
+                // Quoted string value, or unquoted numeric value (count fields).
+                if (trimmed[pos] != '"') {
+                    const val_start = pos;
+                    while (pos < trimmed.len and trimmed[pos] != ']') : (pos += 1) {}
+                    const val_raw = std.mem.trim(u8, trimmed[val_start..pos], " \t");
+                    if (val_raw.len == 0) return ParseError.MissingValue;
+                    const num = std.fmt.parseFloat(f32, val_raw) catch return ParseError.InvalidNumericValue;
+                    break :blk .{ .number = num };
+                }
                 pos += 1; // skip opening quote
                 const val_start = pos;
                 while (pos < trimmed.len and trimmed[pos] != '"') : (pos += 1) {}
@@ -279,4 +286,32 @@ test "parse error: invalid operator" {
 test "parse error: invalid numeric value" {
     const result = parse("call[confidence>abc]", testing.allocator);
     try testing.expectError(ParseError.InvalidNumericValue, result);
+}
+
+// Feature: plain-toml-capture-tables, Unit: unquoted numeric values for =/!=
+// **Validates: Requirement 8.1**
+test "parse: unquoted numeric values for eq/neq" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        const f = try parse("fn[args=2]", alloc);
+        try testing.expectEqual(.eq, f.conditions[0].op);
+        try testing.expect(f.conditions[0].value == .number);
+        try testing.expectApproxEqRel(@as(f32, 2.0), f.conditions[0].value.number, 0.001);
+    }
+    {
+        const f = try parse("fn[args!=0]", alloc);
+        try testing.expectEqual(.neq, f.conditions[0].op);
+        try testing.expect(f.conditions[0].value == .number);
+    }
+    {
+        const f = try parse("fn[args=\"2\"]", alloc);
+        try testing.expect(f.conditions[0].value == .string);
+        try testing.expectEqualStrings("2", f.conditions[0].value.string);
+    }
+    {
+        try testing.expectError(ParseError.InvalidNumericValue, parse("fn[args=abc]", alloc));
+    }
 }

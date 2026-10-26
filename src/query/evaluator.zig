@@ -2,6 +2,7 @@ const std = @import("std");
 const events_mod = @import("../parser/events.zig");
 const StructuralEvent = events_mod.StructuralEvent;
 const CaptureEntry = events_mod.CaptureEntry;
+const IntegerField = events_mod.IntegerField;
 const filter_mod = @import("filter.zig");
 const QueryFilter = filter_mod.QueryFilter;
 const TypeSelector = filter_mod.TypeSelector;
@@ -56,7 +57,11 @@ fn matchesFilter(event: StructuralEvent, query_filter: QueryFilter) bool {
 fn matchesCondition(event: StructuralEvent, cond: AttributeCondition) bool {
     switch (cond.op) {
         .eq => {
-            // Look up field in captures; include only if found and value matches
+            // Numeric (unquoted) value → compare against integer count fields.
+            if (cond.value == .number) {
+                const int_value = lookupInt(event.int_fields, cond.field);
+                return if (int_value) |v| @as(f32, @floatFromInt(v)) == cond.value.number else false;
+            }
             const capture_value = lookupCapture(event.captures, cond.field);
             if (capture_value) |val| {
                 return std.mem.eql(u8, val, cond.value.string);
@@ -64,7 +69,10 @@ fn matchesCondition(event: StructuralEvent, cond: AttributeCondition) bool {
             return false; // field not found → exclude
         },
         .neq => {
-            // Include if field not found OR value differs
+            if (cond.value == .number) {
+                const int_value = lookupInt(event.int_fields, cond.field);
+                return if (int_value) |v| @as(f32, @floatFromInt(v)) != cond.value.number else true;
+            }
             const capture_value = lookupCapture(event.captures, cond.field);
             if (capture_value) |val| {
                 return !std.mem.eql(u8, val, cond.value.string);
@@ -73,6 +81,10 @@ fn matchesCondition(event: StructuralEvent, cond: AttributeCondition) bool {
         },
         .gt => {
             const threshold = cond.value.number;
+            // Integer count fields compare as true integers first.
+            if (lookupInt(event.int_fields, cond.field)) |v| {
+                return @as(f32, @floatFromInt(v)) > threshold;
+            }
             // Special-case: confidence field reads event.confidence directly
             if (std.mem.eql(u8, cond.field, "confidence")) {
                 return event.confidence > threshold;
@@ -86,6 +98,16 @@ fn matchesCondition(event: StructuralEvent, cond: AttributeCondition) bool {
             return false; // field not found → exclude
         },
     }
+}
+
+/// Looks up a field name in the integer-field slice.
+fn lookupInt(int_fields: []const IntegerField, field: []const u8) ?u32 {
+    for (int_fields) |f| {
+        if (std.mem.eql(u8, f.field_name, field)) {
+            return f.value;
+        }
+    }
+    return null;
 }
 
 /// Looks up a field name in the captures slice.
@@ -801,6 +823,152 @@ test "property: evaluator preserves input and order" {
                 }
                 try testing.expect(found);
             }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: plain-toml-capture-tables, Unit: numeric query conditions
+// **Validates: Requirements 8.1, 8.2, 8.3, 8.4**
+test "numeric conditions on count fields" {
+    const ev = [_]StructuralEvent{
+        .{
+            .type_name = "fn",
+            .captures = &.{.{ .field_name = "name", .value = "f" }},
+            .start = 0,
+            .end = 10,
+            .line = 1,
+            .col = 0,
+            .confidence = 1.0,
+            .int_fields = &.{.{ .field_name = "args", .value = 2 }},
+        },
+        .{
+            .type_name = "fn",
+            .captures = &.{.{ .field_name = "name", .value = "f" }},
+            .start = 0,
+            .end = 10,
+            .line = 1,
+            .col = 0,
+            .confidence = 1.0,
+            .int_fields = &.{.{ .field_name = "args", .value = 0 }},
+        },
+        .{
+            .type_name = "fn",
+            .captures = &.{.{ .field_name = "name", .value = "f" }},
+            .start = 0,
+            .end = 10,
+            .line = 1,
+            .col = 0,
+            .confidence = 1.0,
+            .int_fields = &.{.{ .field_name = "args", .value = 5 }},
+        },
+    };
+
+    {
+        const f = QueryFilter{
+            .type_selector = .{ .named = "fn" },
+            .conditions = &.{.{ .field = "args", .op = .eq, .value = .{ .number = 2 } }},
+        };
+        const result = try evaluate(&ev, f, testing.allocator);
+        defer testing.allocator.free(result);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        try testing.expectEqual(@as(u32, 2), result[0].int_fields[0].value);
+    }
+
+    {
+        const f = QueryFilter{
+            .type_selector = .{ .named = "fn" },
+            .conditions = &.{.{ .field = "args", .op = .gt, .value = .{ .number = 1 } }},
+        };
+        const result = try evaluate(&ev, f, testing.allocator);
+        defer testing.allocator.free(result);
+        try testing.expectEqual(@as(usize, 2), result.len);
+    }
+
+    {
+        const f = QueryFilter{
+            .type_selector = .{ .named = "fn" },
+            .conditions = &.{.{ .field = "args", .op = .neq, .value = .{ .number = 0 } }},
+        };
+        const result = try evaluate(&ev, f, testing.allocator);
+        defer testing.allocator.free(result);
+        try testing.expectEqual(@as(usize, 2), result.len);
+    }
+}
+
+test "numeric conditions: absent field excludes for eq, includes for neq, excludes for gt" {
+    const ev = [_]StructuralEvent{
+        makeEvent("fn", &.{}, 1.0),
+    };
+    {
+        const f = QueryFilter{
+            .type_selector = .{ .named = "fn" },
+            .conditions = &.{.{ .field = "args", .op = .eq, .value = .{ .number = 2 } }},
+        };
+        const result = try evaluate(&ev, f, testing.allocator);
+        defer testing.allocator.free(result);
+        try testing.expectEqual(@as(usize, 0), result.len);
+    }
+    {
+        const f = QueryFilter{
+            .type_selector = .{ .named = "fn" },
+            .conditions = &.{.{ .field = "args", .op = .neq, .value = .{ .number = 2 } }},
+        };
+        const result = try evaluate(&ev, f, testing.allocator);
+        defer testing.allocator.free(result);
+        try testing.expectEqual(@as(usize, 1), result.len);
+    }
+    {
+        const f = QueryFilter{
+            .type_selector = .{ .named = "fn" },
+            .conditions = &.{.{ .field = "args", .op = .gt, .value = .{ .number = 1 } }},
+        };
+        const result = try evaluate(&ev, f, testing.allocator);
+        defer testing.allocator.free(result);
+        try testing.expectEqual(@as(usize, 0), result.len);
+    }
+}
+
+// Feature: plain-toml-capture-tables, Property 8: Numeric query comparison on
+// count fields
+test "property: numeric query comparison on count fields" {
+    const tuple_gen = comptime gen.tuple2(
+        u8,
+        u8,
+        gen.intRange(u8, 0, 20),
+        gen.intRange(u8, 0, 3),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8 }) !void {
+            const args: u32 = vals[0];
+            const cond_idx = vals[1];
+            const events = [_]StructuralEvent{.{
+                .type_name = "fn",
+                .captures = &.{.{ .field_name = "name", .value = "f" }},
+                .start = 0,
+                .end = 10,
+                .line = 1,
+                .col = 0,
+                .confidence = 1.0,
+                .int_fields = &.{.{ .field_name = "args", .value = args }},
+            }};
+
+            const threshold: f32 = @floatFromInt(args +% 2);
+            const cond = switch (cond_idx) {
+                0 => AttributeCondition{ .field = "args", .op = .eq, .value = .{ .number = threshold } },
+                1 => AttributeCondition{ .field = "args", .op = .gt, .value = .{ .number = @as(f32, @floatFromInt(args -% 1)) } },
+                else => AttributeCondition{ .field = "args", .op = .neq, .value = .{ .number = threshold } },
+            };
+            const f = QueryFilter{ .type_selector = .{ .named = "fn" }, .conditions = &.{cond} };
+            const result = try evaluate(&events, f, testing.allocator);
+            defer testing.allocator.free(result);
+
+            const match = switch (cond_idx) {
+                0 => @as(f32, @floatFromInt(args)) == threshold,
+                1 => @as(f32, @floatFromInt(args)) > @as(f32, @floatFromInt(args -% 1)),
+                else => @as(f32, @floatFromInt(args)) != threshold,
+            };
+            try testing.expectEqual(match, result.len == 1);
         }
     }.prop, .{ .num_runs = 100 });
 }

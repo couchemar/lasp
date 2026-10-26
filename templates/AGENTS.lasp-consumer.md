@@ -117,7 +117,7 @@ lasp query '*[confidence>0.8]' <file> -g .lasp/grammars/<lang>.toml
 | `function[name="foo"]` | type is function and captured `name` equals `foo` |
 | `call[callee!="print"]` | `callee` is absent or not equal to `print` |
 | `*[confidence>0.7]` | confidence strictly above 0.7 |
-| `function[name="foo"][confidence>0.8]` | multiple conditions, AND-combined |
+| `function[args>1]` | numeric condition on an integer count field (`[[patterns.count]]`) — unquoted number compares against the field; `=`/`!=` also work |
 
 ### Stdin
 Use `-` as the file path to read source from stdin:
@@ -187,8 +187,8 @@ close = "}"
 | `"-"` | Anchor sigil constructs on their leading operator — e.g. `["-", "module", "("]` for Erlang `-module(...)`, `["@", ...]` for Elixir attributes, `["&", ...]` for capture refs |
 | `"identifier"` | Any identifier token |
 | `"$name:IDENTIFIER"` | Identifier, captured into the `name` field (single token) |
-| `"$name:IDENTIFIER(sep=\".\")"` | Captures a separator-joined span in full (`A.B.C`); `sep` is author-supplied, matched by source-byte adjacency (`::` works too) |
-| `"$name:IDENTIFIER(suffix=\"!?\")"` | Captures the identifier plus at most one trailing char from the author-supplied set (`resolve_type!`) |
+| `"$name:IDENTIFIER(sep=...)"` | **Removed** — parenthesized capture parameters are rejected; use `[[patterns.capture]]` tables |
+| `"$name:IDENTIFIER(suffix=...)"` | **Removed** — see `[[patterns.capture]]` |
 | `"number"` | Any numeric token (kind wildcard; supports `number?`; captures nothing) |
 | `"Config:IDENTIFIER"` | Identifier with exact text `Config` (no capture) |
 | `"fn?"` / `"(?"` | Optional element — boosts confidence when present, doesn't block when absent |
@@ -207,6 +207,33 @@ arrow = { literal_set = ["->", "=>"] }
 - `literal_set`: longest matching literal (non-empty members).
 - Patterns reference kinds by name: bare `ident`, exact-text `foo:ident`, or typed capture `$field:ident`. Built-in names keep their default semantics; unknown custom names with class/span recognizers behave like identifiers, literal-set kinds like symbols.
 - A grammar without `[tokens]` is byte-for-byte identical to pre-feature output. Invalid declarations (empty/inverted char sets, empty spans/literal sets, zero or multiple recognizers, empty names) are grammar errors.
+
+### Capture modifier tables (`[[patterns.capture]]`)
+Attaches separator/suffix span behavior to a field already declared bare in `sequence` (the removed `$field:KIND(sep=...)` form):
+```toml
+[[patterns]]
+type = "fn"
+sequence = ["identifier", "$n:IDENTIFIER"]
+
+[[patterns.capture]]
+field = "n"
+separator = "."
+suffix = "!?"
+```
+- `field` must name a capture from `sequence`; one table per field; at least one of `separator`/`suffix` (1–8 bytes each).
+
+### Count tables (`[[patterns.count]]`)
+Counts depth-1 `separator` tokens inside the first balanced `open`…`close` pair after the match and emits `field` as an **integer**:
+```toml
+[[patterns.count]]
+field = "args"
+open = "("
+close = ")"
+separator = ","
+```
+- Emitted as a bare JSON number (never a quoted string), queryable with numeric conditions (`[args>1]`), and rendered first by `--names-only`.
+- Validation: each of `field`/`open`/`close`/`separator` required non-empty (1–8 bytes), ≤16 tables per pattern, no collisions with captures or earlier count fields.
+
 ### Position constraint
 Restrict a pattern to column 0 (line start):
 ```toml
@@ -292,7 +319,7 @@ prior = 0.8
 
 **Token events (no grammar):** `type` (identifier, keyword, symbol, string, number, operator, newline, indent, comment, delimiter), `start`, `end` (byte offsets), `line` (1-based), `col` (0-based).
 
-**Structural events (with grammar):** `type`, `start`, `end`, `line`, `col`, `confidence` (0.0–1.0), optional `block_start`, and captured fields such as `name` / `callee`.
+**Structural events (with grammar):** `type`, `start`, `end`, `line`, `col`, `confidence` (0.0–1.0), optional `block_start`, captured fields such as `name` / `callee`, and integer count fields (bare JSON numbers) from `[[patterns.count]]` tables.
 
 ### Confidence
 | Score | Meaning |

@@ -14,6 +14,13 @@ pub const CaptureEntry = struct {
 /// (grammar-projected token resemblance, advisory).
 pub const CandidateSource = enum { grammar, resemblance };
 
+/// An integer-valued result field (e.g. from a [[patterns.count]] table),
+/// rendered as a JSON number — not a quoted string capture.
+pub const IntegerField = struct {
+    field_name: []const u8,
+    value: u32,
+};
+
 /// A non-winning candidate from the same Candidate_Set as a winning event.
 pub const Alternative = struct {
     type_name: []const u8,
@@ -34,6 +41,7 @@ pub const StructuralEvent = struct {
     block_start: ?usize = null,
     block_end: ?usize = null,
     alternatives: []const Alternative = &.{},
+    int_fields: []const IntegerField = &.{},
 };
 
 /// Evidence weights for confidence scoring.

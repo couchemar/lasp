@@ -110,6 +110,13 @@ pub fn serializeEventsWithAlternatives(events_list: []const StructuralEvent, inc
             try writer.writeAll("\"");
         }
 
+        // Integer fields render as bare JSON numbers — never quoted (Req 7.1).
+        for (event.int_fields) |f| {
+            try writer.writeAll(", \"");
+            try writer.writeAll(f.field_name);
+            try writer.writeAll("\": ");
+            try writer.print("{d}", .{f.value});
+        }
         if (include_alternatives) {
             try writer.writeAll(", \"alternatives\": [");
             for (event.alternatives, 0..) |alt, j| {
@@ -778,4 +785,78 @@ test "serializeEventsWithAlternatives: resemblance output is valid JSON" {
     try testing.expectApproxEqRel(@as(f64, 0.83), resemblance_alt.get("membership").?.float, 0.001);
     const grammar_alt = alts[1].object;
     try testing.expect(grammar_alt.get("source") == null);
+}
+
+// Feature: plain-toml-capture-tables, Unit: integer serialization
+// **Validates: Requirements 7.1, 7.2, 7.3**
+test "serializeEventsWithAlternatives: count-only event renders bare integer" {
+    const ev = StructuralEvent{
+        .type_name = "fn",
+        .captures = &.{},
+        .start = 0,
+        .end = 9,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .int_fields = &.{.{ .field_name = "args", .value = 2 }},
+    };
+    const result = try serializeEventsToStringWithAlternatives(&.{ev}, false);
+    defer testing.allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"args\": 2") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"args\": \"2\"") == null);
+}
+
+test "serializeEventsWithAlternatives: zero count renders 0; int fields ride alongside captures" {
+    const ev = StructuralEvent{
+        .type_name = "fn",
+        .captures = &.{.{ .field_name = "name", .value = "add" }},
+        .start = 0,
+        .end = 9,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .int_fields = &.{
+            .{ .field_name = "args", .value = 0 },
+            .{ .field_name = "nested", .value = 3 },
+        },
+    };
+    const result = try serializeEventsToStringWithAlternatives(&.{ev}, false);
+    defer testing.allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\": \"add\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"args\": 0") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"nested\": 3") != null);
+}
+
+// Feature: plain-toml-capture-tables, Property 7: Integer fields serialize as
+// valid bare-integer JSON
+test "property: integer fields serialize as valid bare-integer JSON" {
+    const n_gen = gen.intRange(u8, 0, 90);
+    try minish.check(testing.allocator, n_gen, struct {
+        fn prop(n: u8) !void {
+            const ev = StructuralEvent{
+                .type_name = "fn",
+                .captures = &.{.{ .field_name = "name", .value = "f" }},
+                .start = 0,
+                .end = 9,
+                .line = 1,
+                .col = 0,
+                .confidence = 1.0,
+                .int_fields = &.{
+                    .{ .field_name = "args", .value = n },
+                    .{ .field_name = "x", .value = n + 1 },
+                },
+            };
+            const result = try serializeEventsToStringWithAlternatives(&.{ev}, false);
+            defer testing.allocator.free(result);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object.get("events").?.array.items[0].object;
+            const args = obj.get("args").?;
+            try testing.expect(args == .integer);
+            try testing.expectEqual(@as(i64, n), args.integer);
+            const name = obj.get("name").?;
+            try testing.expect(name == .string);
+            try testing.expectEqualStrings("f", name.string);
+        }
+    }.prop, .{ .num_runs = 100 });
 }

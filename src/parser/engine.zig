@@ -496,6 +496,7 @@ pub fn parse(
                         lookback,
                         block_stack,
                         tokens,
+                        source,
                         last_matched_end,
                         weights,
                         allocator,
@@ -636,6 +637,7 @@ pub fn parse(
                                 lookback,
                                 block_stack,
                                 tokens,
+                                source,
                                 last_matched_end,
                                 weights,
                                 allocator,
@@ -672,6 +674,7 @@ pub fn parse(
                             lookback,
                             block_stack,
                             tokens,
+                            source,
                             last_matched_end,
                             weights,
                             allocator,
@@ -751,6 +754,76 @@ fn evaluateConstraints(
     return true;
 }
 
+const CountResult = struct { count: u32 };
+
+/// Forward-only balanced scan for one CountSpec. Finds the first token whose
+/// text == open at/after `search_from`, sets region depth := 1, then walks
+/// forward: depth += 1 on another open, depth -= 1 on close; counts tokens whose
+/// text == separator while depth == 1. Ends at the close that returns depth to 0,
+/// or at EOF. Returns the Count_Value (0 if no open found or region empty of
+/// non-delimiter/non-separator content, else separators+1). Visits each token in
+/// the region at most once; never rewinds; does NOT touch the main index.
+fn countRegionScan(
+    tokens: []const Token,
+    source: []const u8,
+    search_from: usize,
+    spec: loader.CountSpec,
+) CountResult {
+    var idx = search_from;
+    while (idx < tokens.len) : (idx += 1) {
+        if (std.mem.eql(u8, source[tokens[idx].start..tokens[idx].end], spec.open)) break;
+    }
+    if (idx >= tokens.len) return .{ .count = 0 };
+
+    var depth: u32 = 1;
+    var separators: u32 = 0;
+    var saw_content = false;
+    idx += 1;
+    while (idx < tokens.len) : (idx += 1) {
+        const text = source[tokens[idx].start..tokens[idx].end];
+        if (std.mem.eql(u8, text, spec.open)) {
+            depth += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, text, spec.close)) {
+            depth -= 1;
+            if (depth == 0) break;
+            continue;
+        }
+        if (depth == 1) {
+            if (std.mem.eql(u8, text, spec.separator)) {
+                separators += 1;
+            } else {
+                saw_content = true;
+            }
+        }
+    }
+
+    if (!saw_content) return .{ .count = 0 };
+    const total = separators + 1;
+    return .{ .count = @min(total, std.math.maxInt(u32)) };
+}
+
+/// Builds the integer-field list for a buffered candidate's pattern from its
+/// count specs. Empty when the pattern declares none (byte-identical path).
+fn buildIntFields(
+    pattern: loader.Pattern,
+    tokens: []const Token,
+    source: []const u8,
+    last_matched_end: usize,
+    allocator: std.mem.Allocator,
+) ![]const events_mod.IntegerField {
+    if (pattern.count_specs.len == 0) return &.{};
+    var search_from: usize = 0;
+    while (search_from < tokens.len and tokens[search_from].start < last_matched_end) : (search_from += 1) {}
+
+    var fields: std.ArrayList(events_mod.IntegerField) = .empty;
+    for (pattern.count_specs) |spec| {
+        const cr = countRegionScan(tokens, source, search_from, spec);
+        try fields.append(allocator, .{ .field_name = spec.field, .value = cr.count });
+    }
+    return fields.toOwnedSlice(allocator);
+}
 /// Checks constraints (position) and confidence,
 /// then buffers a candidate event if all checks pass. Used for the normal
 /// (non-optional-skip) code path.
@@ -769,6 +842,7 @@ fn bufferCandidate(
     lookback: LookbackBuffer,
     block_stack: BlockStack,
     tokens: []const Token,
+    source: []const u8,
     last_matched_end: usize,
     weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
@@ -850,9 +924,15 @@ fn bufferCandidate(
         }
     }
 
+    const int_fields = if (pattern) |p|
+        try buildIntFields(p, tokens, source, last_matched_end, allocator)
+    else
+        &.{};
+
     const event = StructuralEvent{
         .type_name = event_info.type_name,
         .captures = try event_captures.toOwnedSlice(allocator),
+        .int_fields = int_fields,
         .start = pattern_start,
         .end = last_matched_end,
         .line = pattern_line,
@@ -886,6 +966,7 @@ fn bufferCandidateWithMinEvidence(
     lookback: LookbackBuffer,
     block_stack: BlockStack,
     tokens: []const Token,
+    source: []const u8,
     last_matched_end: usize,
     weights: loader.EvidenceWeights,
     allocator: std.mem.Allocator,
@@ -926,6 +1007,7 @@ fn bufferCandidateWithMinEvidence(
         lookback,
         block_stack,
         tokens,
+        source,
         last_matched_end,
         weights,
         allocator,
@@ -6024,5 +6106,190 @@ test "parse: typed captures record number and string text" {
         const stream2 = try buildStream(alloc, &items2);
         const result2 = try parse(automaton, stream2.tokens, stream2.source, patterns, null, .{}, .{}, false, false, alloc);
         try testing.expectEqual(@as(usize, 0), result2.len);
+    }
+}
+
+// --- plain-toml-capture-tables count scan tests ---
+
+fn countSpec(field: []const u8, open: []const u8, close: []const u8, separator: []const u8) loader.CountSpec {
+    return .{ .field = field, .open = open, .close = close, .separator = separator };
+}
+
+fn tokensFromTexts(texts: []const []const u8) ![]Token {
+    const tokens = try testing.allocator.alloc(Token, texts.len);
+    var pos: usize = 0;
+    for (texts, 0..) |t, i| {
+        tokens[i] = .{ .kind = .identifier, .start = pos, .end = pos + t.len, .line = 1, .col = pos };
+        pos += t.len;
+    }
+    return tokens;
+}
+
+fn countTest(tokens: []const Token, source: []const u8, search_from: usize, spec: loader.CountSpec, expected: u32) !void {
+    const result = countRegionScan(tokens, source, search_from, spec);
+    try testing.expectEqual(expected, result.count);
+}
+
+test "countRegionScan: hand-built token stream unit cases" {
+    {
+        const texts = [_][]const u8{"("};
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        try countTest(tokens, "(", 0, countSpec("n", "(", ")", ","), 0);
+    }
+    {
+        const texts = [_][]const u8{ "(", "a", ")" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        try countTest(tokens, "(a)", 0, countSpec("n", "(", ")", ","), 1);
+    }
+    {
+        const texts = [_][]const u8{ "(", "a", ",", "b", ")" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        try countTest(tokens, "(a,b)", 0, countSpec("n", "(", ")", ","), 2);
+    }
+    {
+        const texts = [_][]const u8{ "(", "a", ",", "(", "b", ",", "c", ")", ")" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        try countTest(tokens, "(a,(b,c))", 0, countSpec("n", "(", ")", ","), 2);
+    }
+    {
+        const texts = [_][]const u8{ "(", "a", ",", "b" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        try countTest(tokens, "(a,b", 0, countSpec("n", "(", ")", ","), 2);
+    }
+    {
+        const texts = [_][]const u8{ "a", "b" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        try countTest(tokens, "ab", 0, countSpec("n", "(", ")", ","), 0);
+    }
+    {
+        const texts = [_][]const u8{ "(", ",", ")" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        try countTest(tokens, "(,)", 0, countSpec("n", "(", ")", ","), 0);
+    }
+}
+
+// Feature: plain-toml-capture-tables, Properties 1-4
+test "property: count scan depth-correct and deterministic" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 24, .charset = .custom, .custom_chars = "abc()," });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            const spec = countSpec("n", "(", ")", ",");
+            // One token per character (closed token stream for the scanner).
+            const tokens = try testing.allocator.alloc(Token, src.len);
+            defer testing.allocator.free(tokens);
+            for (src, 0..) |_, i| {
+                tokens[i] = .{ .kind = .identifier, .start = i, .end = i + 1, .line = 1, .col = i };
+            }
+
+            const r1 = countRegionScan(tokens, src, 0, spec);
+            const r2 = countRegionScan(tokens, src, 0, spec);
+            try testing.expectEqual(r1.count, r2.count);
+
+            var depth: u32 = 0;
+            var in_region = false;
+            var separators: u32 = 0;
+            var saw_content = false;
+            for (src) |ch| {
+                if (ch == '(') {
+                    in_region = true;
+                    depth += 1;
+                    continue;
+                }
+                if (!in_region) continue;
+                if (ch == ')') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                    continue;
+                }
+                if (ch == ',') {
+                    if (depth == 1) separators += 1;
+                    continue;
+                }
+                if (ch == 'a' or ch == 'b' or ch == 'c') {
+                    if (depth == 1) saw_content = true;
+                }
+            }
+            const expected: u32 = if (!in_region) 0 else if (!saw_content) 0 else @min(separators + 1, std.math.maxInt(u32));
+            try testing.expectEqual(expected, r1.count);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+test "parse: count table emits integer field on winner" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar_source =
+        \\[[patterns]]
+        \\type = "fn"
+        \\sequence = ["identifier", "$n:IDENTIFIER"]
+        \\
+        \\[[patterns.count]]
+        \\field = "args"
+        \\open = "("
+        \\close = ")"
+        \\separator = ","
+    ;
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+    const src = "fn add(a, b, c)";
+    const tokens = try tokenizer.tokenize(src, grammar.keyword_table, grammar.comments, alloc);
+    const result = try parse(automaton, tokens, src, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, false, false, alloc);
+
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqual(@as(usize, 1), result[0].int_fields.len);
+    try testing.expectEqualStrings("args", result[0].int_fields[0].field_name);
+    try testing.expectEqual(@as(u32, 3), result[0].int_fields[0].value);
+    try testing.expectEqual(@as(usize, 1), result[0].captures.len);
+    try testing.expectEqualStrings("add", result[0].captures[0].value);
+}
+
+test "parse: zero-arity count renders 0; no count table yields empty int_fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar_source =
+        \\[[patterns]]
+        \\type = "fn"
+        \\sequence = ["identifier", "$n:IDENTIFIER"]
+        \\
+        \\[[patterns.count]]
+        \\field = "args"
+        \\open = "("
+        \\close = ")"
+        \\separator = ","
+    ;
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+
+    {
+        const src = "fn add()";
+        const tokens = try tokenizer.tokenize(src, grammar.keyword_table, grammar.comments, alloc);
+        const result = try parse(automaton, tokens, src, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, false, false, alloc);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        try testing.expectEqual(@as(u32, 0), result[0].int_fields[0].value);
+    }
+
+    {
+        const plain_source =
+            \\[[patterns]]
+            \\type = "fn"
+            \\sequence = ["identifier", "$n:IDENTIFIER"]
+        ;
+        const plain = try loader.parseGrammar(plain_source, alloc);
+        const plain_auto = try compiler.compile(plain.patterns, alloc);
+        const src = "fn add(a, b)";
+        const tokens = try tokenizer.tokenize(src, plain.keyword_table, plain.comments, alloc);
+        const result = try parse(plain_auto, tokens, src, plain.patterns, plain.tokens, plain.blocks, plain.weights, false, false, alloc);
+        try testing.expectEqual(@as(usize, 0), result[0].int_fields.len);
     }
 }

@@ -205,10 +205,7 @@ fn run(
             // Output: names-only or JSON
             if (parsed.names_only) {
                 for (filtered) |event| {
-                    if (event.captures.len > 0) {
-                        try stdout.writeAll(event.captures[0].value);
-                        try stdout.writeAll("\n");
-                    }
+                    try writeNamesOnlyLine(stdout, event);
                 }
             } else {
                 try json.serializeEvents(filtered, stdout);
@@ -246,6 +243,13 @@ fn run(
                         error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
                         error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
                         error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
+                        error.InvalidCountTable => "error: [[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)",
+                        error.TooManyCountTables => "error: too many [[patterns.count]] tables (max 16)",
+                        error.DuplicateCountField => "error: [[patterns.count]] field duplicates a capture or earlier count field",
+                        error.InvalidCaptureTable => "error: [[patterns.capture]] must declare a non-empty field and at least one of separator/suffix (1-8 bytes)",
+                        error.UnknownCaptureField => "error: [[patterns.capture]] field is not a declared capture",
+                        error.DuplicateCaptureField => "error: [[patterns.capture]] duplicate table for the same field",
+                        error.ParenthesizedCaptureParam => "error: parenthesized capture parameters are removed; use [[patterns.capture]] tables",
                         error.OutOfMemory => "out of memory",
                         else => "unknown grammar error",
                     };
@@ -276,10 +280,7 @@ fn run(
                 // Output dispatch: names-only or JSON
                 if (parsed.names_only) {
                     for (structural_events) |event| {
-                        if (event.captures.len > 0) {
-                            try stdout.writeAll(event.captures[0].value);
-                            try stdout.writeAll("\n");
-                        }
+                        try writeNamesOnlyLine(stdout, event);
                     }
                 } else {
                     try json.serializeEventsWithAlternatives(structural_events, collect_alternatives, stdout);
@@ -298,6 +299,19 @@ fn run(
     try stdout.flush();
 }
 
+/// --names-only rendering: an integer field precedes string captures in emission
+/// order, so when present it renders as decimal digits on its own line;
+/// otherwise the first capture value renders (unchanged behavior).
+fn writeNamesOnlyLine(stdout: *std.Io.Writer, event: events.StructuralEvent) !void {
+    if (event.int_fields.len > 0) {
+        try stdout.print("{d}\n", .{event.int_fields[0].value});
+        return;
+    }
+    if (event.captures.len > 0) {
+        try stdout.writeAll(event.captures[0].value);
+        try stdout.writeAll("\n");
+    }
+}
 test {
     std.testing.refAllDecls(@This());
 }
@@ -354,6 +368,83 @@ test "property: file read round trip" {
             try std.testing.expectEqualSlices(u8, data, content);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: plain-toml-capture-tables, Integration
+// **Validates: Requirements 4.1, 5.1, 7.1, 8.1, 8.2, 12.1**
+test "integration: count tables emit integer fields in JSON" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/counts_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/counts.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), events_arr.len);
+
+    const args0 = events_arr[0].object.get("args").?;
+    try std.testing.expect(args0 == .integer);
+    try std.testing.expectEqual(@as(i64, 3), args0.integer);
+
+    const args1 = events_arr[1].object.get("args").?;
+    try std.testing.expectEqual(@as(i64, 0), args1.integer);
+
+    const args2 = events_arr[2].object.get("args").?;
+    try std.testing.expectEqual(@as(i64, 1), args2.integer);
+}
+
+test "integration: query on count field + names-only renders count first" {
+    const allocator = std.testing.allocator;
+
+    const q = try runLasp(allocator, &.{
+        "query",
+        "fn[args>1]",
+        "tests/fixtures/counts_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/counts.toml",
+    });
+    defer {
+        allocator.free(q.stdout);
+        allocator.free(q.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, q.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, q.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), events_arr.len);
+    try std.testing.expectEqual(@as(i64, 3), events_arr[0].object.get("args").?.integer);
+
+    const n = try runLasp(allocator, &.{
+        "query",
+        "fn[args>0]",
+        "tests/fixtures/counts_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/counts.toml",
+        "--names-only",
+    });
+    defer {
+        allocator.free(n.stdout);
+        allocator.free(n.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, n.term);
+    // Integer field comes first in emission order → counts, not capture text.
+    var count_lines: usize = 0;
+    var rest: []const u8 = n.stdout;
+    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        const line = rest[0..nl];
+        if (std.mem.eql(u8, line, "3") or std.mem.eql(u8, line, "1")) count_lines += 1;
+        rest = rest[nl + 1 ..];
+    }
+    try std.testing.expectEqual(@as(usize, 2), count_lines);
 }
 
 // --- Integration Tests ---

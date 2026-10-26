@@ -1,0 +1,14 @@
+[[patterns]]
+type = "fn"
+sequence = ["identifier", "$n:IDENTIFIER"]
+
+[[patterns.count]]
+field = "args"
+open = "("
+close = ")"
+separator = ","
+
+[[patterns.capture]]
+field = "n"
+separator = "."
+suffix = "!?"
