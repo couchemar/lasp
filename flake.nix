@@ -44,13 +44,17 @@
             else null;
           versionDirty =
             if self ? dirtyRev then true else false;
-          gitArgs =
+          # The tag fact is NOT derivable from flake `self` metadata (no tag
+          # names are exposed), so it is a deliberate, maintainer-supplied
+          # signal: `gitTagged` defaults to false (dev) and is set true only by
+          # the dedicated `packages.released` output. The clean-tree and
+          # changelog-match conditions are still enforced in build.zig, so a
+          # dirty or mismatched `.#released` build still reports dev.
+          mkGitArgs = gitTagged:
             if versionCommit == null then ""
-            else "-Dgit_commit=${versionCommit} -Dgit_dirty=${if versionDirty then "true" else "false"} -Dgit_tagged=false";
-        in
-        {
-          packages = {
-            default = pkgs.stdenv.mkDerivation {
+            else "-Dgit_commit=${versionCommit} -Dgit_dirty=${if versionDirty then "true" else "false"} -Dgit_tagged=${if gitTagged then "true" else "false"}";
+          mkLasp = { gitTagged ? false }:
+            pkgs.stdenv.mkDerivation {
               pname = "lasp";
               inherit version;
               src = ./.;
@@ -61,7 +65,7 @@
 
               buildPhase = ''
                 runHook preBuild
-                zig build -Doptimize=ReleaseSafe ${gitArgs} \
+                zig build -Doptimize=ReleaseSafe ${mkGitArgs gitTagged} \
                   --cache-dir $(pwd)/.zig-cache \
                   --global-cache-dir $(pwd)/.zig-global-cache \
                   --prefix $out
@@ -74,8 +78,12 @@
                 runHook postInstall
               '';
             };
-
+        in
+        {
+          packages = {
+            default = mkLasp { gitTagged = false; };
             lasp = self.packages.${system}.default;
+            released = mkLasp { gitTagged = true; };
           };
 
           apps.default = {

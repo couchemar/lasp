@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.1] - 2026-10-26
+
+### Fixed
+
+- Nix released-build reporting: a Nix build can now report a plain released semver. `flake.nix` gains a dedicated `packages.released` output (`mkLasp { gitTagged = true; }`) that supplies `-Dgit_tagged=true` to `zig build`; the default `packages.default` / `packages.lasp` stays `gitTagged = false` (dev). Building the tagged, clean release commit via `nix build .#released` now reports `X.Y.Z` instead of `X.Y.Z-dev+<commit>`. Hermetic (no `git` in the sandbox, no network); the clean-tree and changelog-match conditions in `build.zig` still apply, so a dirty or mismatched `nix build .#released` still reports dev. `build.zig` is unchanged — the `-Dgit_tagged` option (default `false`) already existed. (Spec: nix-release-version)
 
 ## [0.4.0] - 2026-10-26
 
