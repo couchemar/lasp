@@ -594,7 +594,7 @@ test "serializeEventsWithAlternatives: winner with two alternatives" {
         .col = 0,
         .confidence = 0.9,
         .alternatives = &.{
-            .{ .type_name = "call", .confidence = 0.5, .captures = &.{.{ .field_name = "callee", .value = "run" } } },
+            .{ .type_name = "call", .confidence = 0.5, .captures = &.{.{ .field_name = "callee", .value = "run" }} },
             .{ .type_name = "ref", .confidence = 0.3, .captures = &.{} },
         },
     };
@@ -726,8 +726,7 @@ test "serializeEventsWithAlternatives: resemblance alternative carries source ma
 
     // Exact bytes: resemblance alternative carries type, confidence, source,
     // resembled kind name, and membership score.
-    try testing.expect(std.mem.indexOf(u8, result,
-        "\"alternatives\": [ { \"type\": \"number\", \"confidence\": 0.83, \"source\": \"resemblance\", \"resembled_kind\": \"number\", \"membership\": 0.83 } ]") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"alternatives\": [ { \"type\": \"number\", \"confidence\": 0.83, \"source\": \"resemblance\", \"resembled_kind\": \"number\", \"membership\": 0.83 } ]") != null);
 }
 
 test "serializeEventsWithAlternatives: resemblance marker absent when flag off or grammar-sourced" {

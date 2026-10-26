@@ -1556,7 +1556,6 @@ test "property: comment does not swallow subsequent code" {
     }.prop, .{ .num_runs = 100 });
 }
 
-
 // --- Grammar vocabulary scan tests (configurable-token-kinds) ---
 
 fn ccAlpha() CharClass {

@@ -1335,7 +1335,6 @@ test "property: resemblance bounded, no fabricated structure, deterministic, lin
                 try testing.expectEqual(a.end, b.end);
             }
 
-
             // P6: identical primary structure vs flag-off.
             try testing.expectEqual(off.len, on1.len);
             for (off, on1) |a, b| {
@@ -4204,9 +4203,9 @@ test "property: union membership emits the shared type" {
             setKwCaptureSeq(&seq_c, kw_c, "c");
 
             const patterns = &[_]loader.Pattern{
-                .{ .type_name = shared_type, .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 1 } } },
-                .{ .type_name = shared_type, .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 1 } } },
-                .{ .type_name = shared_type, .sequence = &seq_c, .captures = &.{.{ .field_name = "c", .position = 1 } } },
+                .{ .type_name = shared_type, .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 1 }} },
+                .{ .type_name = shared_type, .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 1 }} },
+                .{ .type_name = shared_type, .sequence = &seq_c, .captures = &.{.{ .field_name = "c", .position = 1 }} },
             };
             const automaton = try compiler.compile(patterns, alloc);
 
@@ -4273,8 +4272,8 @@ test "property: disjoint same-type alternatives emit, carrying the matched alter
             setKwCaptureSeq(&seq_b, inp.kw_b, "b");
 
             const patterns = &[_]loader.Pattern{
-                .{ .type_name = inp.shared_type, .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 1 } } },
-                .{ .type_name = inp.shared_type, .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 1 } } },
+                .{ .type_name = inp.shared_type, .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 1 }} },
+                .{ .type_name = inp.shared_type, .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 1 }} },
             };
             const automaton = try compiler.compile(patterns, alloc);
 
@@ -4331,8 +4330,8 @@ test "property: prefix longest-wins" {
             setKwCaptureParenSeq(&seq_b, inp.kw, "name");
 
             const patterns = &[_]loader.Pattern{
-                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
             };
             const automaton = try compiler.compile(patterns, alloc);
 
@@ -4385,8 +4384,8 @@ test "property: prefix short-only emits the shorter" {
             setKwCaptureParenSeq(&seq_b, inp.kw, "name");
 
             const patterns = &[_]loader.Pattern{
-                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
             };
             const automaton = try compiler.compile(patterns, alloc);
 
@@ -4486,8 +4485,8 @@ test "property: optional-tail and union forms yield equivalent primaries" {
             setKwCaptureSeq(&seq_a, inp.kw, "name");
             setKwCaptureParenSeq(&seq_b, inp.kw, "name");
             const union_patterns = &[_]loader.Pattern{
-                .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-                .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+                .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
             };
             const union_automaton = try compiler.compile(union_patterns, alloc);
 
@@ -4551,8 +4550,8 @@ test "property: different-type overlap collapses to one tiebreak-selected primar
             seq_b[2] = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = "?" } } };
 
             const patterns = &[_]loader.Pattern{
-                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+                .{ .type_name = type_short, .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+                .{ .type_name = type_long, .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
             };
             const automaton = try compiler.compile(patterns, alloc);
 
@@ -4617,8 +4616,8 @@ test "property: backward compatibility for non-overlapping, non-prefix grammars"
             setKwCaptureSeq(&seq_a, inp.kw_a, "name");
             setKwCaptureSeq(&seq_b, inp.kw_b, "other");
             const patterns = &[_]loader.Pattern{
-                .{ .type_name = "type_a", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-                .{ .type_name = "type_b", .sequence = &seq_b, .captures = &.{.{ .field_name = "other", .position = 1 } } },
+                .{ .type_name = "type_a", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+                .{ .type_name = "type_b", .sequence = &seq_b, .captures = &.{.{ .field_name = "other", .position = 1 }} },
             };
             const automaton = try compiler.compile(patterns, alloc);
 
@@ -4706,8 +4705,8 @@ test "property: identical-sequence union coexists via the shadowing fix" {
             setSingleCaptureSeq(&seq_b, "b");
 
             const patterns = &[_]loader.Pattern{
-                .{ .type_name = "same", .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 0 } } },
-                .{ .type_name = "same", .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 0 } } },
+                .{ .type_name = "same", .sequence = &seq_a, .captures = &.{.{ .field_name = "a", .position = 0 }} },
+                .{ .type_name = "same", .sequence = &seq_b, .captures = &.{.{ .field_name = "b", .position = 0 }} },
             };
             const automaton = try compiler.compile(patterns, alloc);
             const term = automaton.states[1];
@@ -4742,8 +4741,8 @@ test "parse: prefix pair emits the long form once on long input" {
     setKwCaptureSeq(&seq_a, "fn", "name");
     setKwCaptureParenSeq(&seq_b, "fn", "name");
     const patterns = &[_]loader.Pattern{
-        .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
     };
     const automaton = try compiler.compile(patterns, alloc);
 
@@ -4767,8 +4766,8 @@ test "parse: prefix pair emits the short form on short input" {
     setKwCaptureSeq(&seq_a, "fn", "name");
     setKwCaptureParenSeq(&seq_b, "fn", "name");
     const patterns = &[_]loader.Pattern{
-        .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "decl", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
     };
     const automaton = try compiler.compile(patterns, alloc);
 
@@ -4792,8 +4791,8 @@ test "parse: same-type union with disjoint first tokens emits the shared type fo
     setKwCaptureSeq(&seq_a, "def", "name");
     setKwCaptureSeq(&seq_b, "class", "name");
     const patterns = &[_]loader.Pattern{
-        .{ .type_name = "thing", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-        .{ .type_name = "thing", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "thing", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+        .{ .type_name = "thing", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
     };
     const automaton = try compiler.compile(patterns, alloc);
 
@@ -4830,7 +4829,7 @@ test "parse: constraint-rejected terminal candidate does not produce a premature
                 .values = &.{"bad"},
             }},
         },
-        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "decl", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
     };
     const automaton = try compiler.compile(patterns, alloc);
 
@@ -4860,8 +4859,8 @@ test "parse: arbitrary non-language type strings are treated opaquely" {
     setKwCaptureSeq(&seq_a, "alpha", "name");
     setKwCaptureSeq(&seq_b, "beta", "name");
     const patterns = &[_]loader.Pattern{
-        .{ .type_name = "xyzzy", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 } } },
-        .{ .type_name = "42type", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 } } },
+        .{ .type_name = "xyzzy", .sequence = &seq_a, .captures = &.{.{ .field_name = "name", .position = 1 }} },
+        .{ .type_name = "42type", .sequence = &seq_b, .captures = &.{.{ .field_name = "name", .position = 1 }} },
     };
     const automaton = try compiler.compile(patterns, alloc);
 
@@ -5107,7 +5106,7 @@ test "property: backward compatibility of existing grammar output" {
             const automaton = try compiler.compile(patterns, alloc);
 
             const items = [_]TestTokenItem{
-                kwItem(vals[0]), idItem(vals[1]), LPAREN_ITEM, SEP_ITEM,
+                kwItem(vals[0]), idItem(vals[1]),  LPAREN_ITEM, SEP_ITEM,
                 kwItem(vals[0]), idItem("second"), LPAREN_ITEM,
             };
             const stream = try buildStream(alloc, &items);
@@ -5464,7 +5463,12 @@ test "property: suffix absorption takes exactly one adjacent set member" {
                 2 => "foo",
                 else => "foo!",
             };
-            const count: usize = switch (inp.mode) { 0 => 1, 1 => 2, 2 => 2, else => 3 };
+            const count: usize = switch (inp.mode) {
+                0 => 1,
+                1 => 2,
+                2 => 2,
+                else => 3,
+            };
             const items = src_items[0..count];
             const stream = try buildStream(alloc, items);
             const result = try parse(automaton, stream.tokens, stream.source, patterns, null, .{}, .{}, false, false, alloc);
@@ -5699,7 +5703,6 @@ test "property: monotonic demotion" {
         gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
     );
 
-
     try minish.check(testing.allocator, tuple_gen, struct {
         fn prop(vals: struct { u16, []const u8 }) !void {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -5740,7 +5743,6 @@ test "property: bounded boost" {
         gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
     );
 
-
     try minish.check(testing.allocator, tuple_gen, struct {
         fn prop(vals: struct { u16, []const u8 }) !void {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -5776,7 +5778,6 @@ test "property: threshold interaction" {
         gen.intRange(u16, 1, 200),
         gen.string(.{ .min_len = 1, .max_len = 6, .charset = .alpha }),
     );
-
 
     try minish.check(testing.allocator, tuple_gen, struct {
         fn prop(vals: struct { u16, []const u8 }) !void {
@@ -5999,7 +6000,7 @@ test "parse: typed captures record number and string text" {
             .captures = &.{.{ .field_name = "s", .position = 0 }},
         }};
         const automaton = try compiler.compile(patterns, alloc);
-        const items = [_]TestTokenItem{ .{ .kind = .string, .text = "\"hi\"" } };
+        const items = [_]TestTokenItem{.{ .kind = .string, .text = "\"hi\"" }};
         const stream = try buildStream(alloc, &items);
         const result = try parse(automaton, stream.tokens, stream.source, patterns, null, .{}, .{}, false, false, alloc);
         try testing.expectEqual(@as(usize, 1), result.len);
@@ -6015,7 +6016,7 @@ test "parse: typed captures record number and string text" {
             .captures = &.{},
         }};
         const automaton = try compiler.compile(patterns, alloc);
-        const items = [_]TestTokenItem{ .{ .kind = .string, .text = "\"x\"" } };
+        const items = [_]TestTokenItem{.{ .kind = .string, .text = "\"x\"" }};
         const stream = try buildStream(alloc, &items);
         const result = try parse(automaton, stream.tokens, stream.source, patterns, null, .{}, .{}, false, false, alloc);
         try testing.expectEqual(@as(usize, 1), result.len);

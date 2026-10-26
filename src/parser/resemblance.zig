@@ -121,11 +121,13 @@ test "membership: monotonic in continue fraction" {
 }
 
 test "resembledKind: argmax over char-class kinds with tie-break by order" {
-    const vocab = KindVocabulary{ .kinds = &.{
-        .{ .name = "words", .recognizer = .{ .char_class_run = .{ .start = ccOf("ab"), .cont = ccOf("ab") } } },
-        .{ .name = "nums", .recognizer = .{ .char_class_run = .{ .start = ccOf("0"), .cont = ccOf("01") } } },
-        .{ .name = "quoted", .recognizer = .{ .delimited_span = .{ .open = "'", .close = "'", .escape = null } } }, // no axis
-    } };
+    const vocab = KindVocabulary{
+        .kinds = &.{
+            .{ .name = "words", .recognizer = .{ .char_class_run = .{ .start = ccOf("ab"), .cont = ccOf("ab") } } },
+            .{ .name = "nums", .recognizer = .{ .char_class_run = .{ .start = ccOf("0"), .cont = ccOf("01") } } },
+            .{ .name = "quoted", .recognizer = .{ .delimited_span = .{ .open = "'", .close = "'", .escape = null } } }, // no axis
+        },
+    };
     // "0a1" scores highest against nums (first '0' in start, 1/2 continue).
     const hit = resembledKind("0a1", vocab).?;
     try testing.expectEqual(@as(usize, 1), hit.kind_index);
@@ -167,7 +169,7 @@ test "property: vector has one axis per char-class kind only" {
         fn prop(token: []const u8) !void {
             const vocab = KindVocabulary{ .kinds = &.{
                 .{ .name = "word", .recognizer = .{ .char_class_run = .{ .start = ccOf("ab"), .cont = ccOf("ab") } } },
-        .{ .name = "q", .recognizer = .{ .delimited_span = .{ .open = "'", .close = "'", .escape = null } } },
+                .{ .name = "q", .recognizer = .{ .delimited_span = .{ .open = "'", .close = "'", .escape = null } } },
                 .{ .name = "l", .recognizer = .{ .literal_set = &.{"->"} } },
                 .{ .name = "cc2", .recognizer = .{ .char_class_run = .{ .start = ccOf("xy"), .cont = ccOf("xy") } } },
             } };

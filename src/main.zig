@@ -62,6 +62,45 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
+    run(io, allocator, parsed, stdout) catch |err| switch (err) {
+        error.WriteFailed => {
+            // A broken pipe (downstream reader closed early) is a normal,
+            // expected event in shell pipelines: exit quietly and successfully.
+            // Any other write failure (or an unknown cause) stays fatal.
+            if (shouldCleanExitOnWriteFailed(stdout_writer.err)) return;
+            std.process.fatal("{s}", .{@errorName(err)});
+        },
+        else => return err,
+    };
+}
+
+/// True only when a stdout write failure's concrete cause is a broken pipe
+/// (EPIPE). Unknown cause (null) or any other error → false, so those stay
+/// fatal. Broken-pipe write failures are a normal, expected shell-pipeline
+/// event and become a clean exit.
+fn shouldCleanExitOnWriteFailed(cause: ?std.Io.File.Writer.Error) bool {
+    return if (cause) |c| c == error.BrokenPipe else false;
+}
+
+// Property 1 (classifier): the one decision the fix adds.
+// Broken pipe → clean exit; any other concrete cause or unknown (null) → fatal.
+test "broken pipe classifier: BrokenPipe cleans, others stay fatal" {
+    try std.testing.expect(shouldCleanExitOnWriteFailed(error.BrokenPipe));
+    try std.testing.expect(!shouldCleanExitOnWriteFailed(error.NoSpaceLeft));
+    try std.testing.expect(!shouldCleanExitOnWriteFailed(error.InputOutput));
+    try std.testing.expect(!shouldCleanExitOnWriteFailed(null));
+}
+
+/// Everything after stdout setup: help/version early returns, source read,
+/// command dispatch, trailing newline, and final flush — verbatim from the
+/// original `main` body so non-broken-pipe behavior is byte-identical.
+fn run(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parsed: cli.ParsedArgs,
+    stdout: *std.Io.Writer,
+) !void {
+
     // 4.5 Help report: exits before version and before any file I/O (Req 3, 6).
     if (parsed.command == .help) {
         try stdout.writeAll(cli.helpText(parsed.help_topic));
@@ -329,6 +368,148 @@ fn runLasp(allocator: std.mem.Allocator, args: []const []const u8) !struct { std
     return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
 }
 
+// --- Broken-pipe clean-exit tests (spec: broken-pipe-clean-exit) ---
+// The binary under test is `zig-out/bin/lasp` (freshly built). The large
+// fixture guarantees the child's stdout stream exceeds the OS pipe buffer
+// (~64 KiB), so closing the read end early forces a real EPIPE on the child's
+// subsequent writes (deterministic bug reproduction).
+
+fn makeLargeZigFixture(io: std.Io) ![]const u8 {
+    const path = "test_broken_pipe_large.zig";
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(io, &buf);
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        try w.interface.print("pub fn f{d}() void {{ var x: i32 = {d}; }}\n", .{ i, i });
+    }
+    try w.interface.flush();
+    file.close(io);
+    return path;
+}
+
+/// Spawns LASP, reads exactly `prefix_len` bytes of stdout, closes the read end
+/// (simulating `head -c N`), then waits. Returns the term and captured stderr.
+fn runLaspEarlyClose(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    prefix_len: usize,
+) !struct { term: std.process.Child.Term, stderr: []u8 } {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "zig-out/bin/lasp");
+    for (args) |a| try argv.append(allocator, a);
+
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = argv.items,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer if (child.stdout) |f| f.close(std.testing.io);
+    defer if (child.stderr) |f| f.close(std.testing.io);
+
+    // Drain a small prefix of stdout, then close the read end.
+    var buf: [4096]u8 = undefined;
+    if (child.stdout) |out| {
+        var prefix_read: usize = 0;
+        var r = out.reader(std.testing.io, &buf);
+        while (prefix_read < prefix_len) {
+            var slices = [1][]u8{buf[prefix_read..]};
+            const n = try r.interface.readVec(&slices);
+            if (n == 0) break;
+            prefix_read += n;
+        }
+        out.close(std.testing.io);
+        child.stdout = null;
+    }
+
+    const term = try child.wait(std.testing.io);
+
+    var stderr_out: []u8 = &[_]u8{};
+    if (child.stderr) |err_f| {
+        var ebuf: [4096]u8 = undefined;
+        var er = err_f.reader(std.testing.io, &ebuf);
+        stderr_out = try er.interface.allocRemaining(allocator, .limited(1 << 20));
+        child.stderr = null;
+    }
+    return .{ .term = term, .stderr = stderr_out };
+}
+
+// Property 1 (bug condition): a downstream reader that closes the pipe early
+// must not be a fatal error — clean exit 0 with empty stderr. On the unfixed
+// binary these tests FAIL (non-zero term, stderr contains `WriteFailed`),
+// confirming the bug; the same tests validate the fix later.
+
+test "broken pipe: parse (JSON) with early-closing reader exits cleanly" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeLargeZigFixture(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+
+    const result = try runLaspEarlyClose(allocator, &.{
+        "parse", fixture, "-g", "examples/grammars/zig.toml",
+    }, 64);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+}
+
+test "broken pipe: query with early-closing reader exits cleanly" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeLargeZigFixture(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+
+    const result = try runLaspEarlyClose(allocator, &.{
+        "query", "*", fixture, "-g", "examples/grammars/zig.toml",
+    }, 64);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+}
+
+test "broken pipe: --names-only with early-closing reader exits cleanly" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeLargeZigFixture(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+
+    const result = try runLaspEarlyClose(allocator, &.{
+        "parse", fixture, "-g", "examples/grammars/zig.toml", "--names-only",
+    }, 64);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+}
+
+// Property 2 (preservation): full-reading consumers keep complete output and
+// exit 0 — asserted across random valid-ish Zig sources (full-write domain).
+
+test "property: full-read parse preserves complete output and exit 0" {
+    const source_gen = gen.string(.{ .min_len = 16, .max_len = 512, .charset = .custom, .custom_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789(){}[];=+*/_ \n\t" });
+
+    try minish.check(std.testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            const allocator = std.testing.allocator;
+            const tmp_path = "test_broken_pipe_prop.tmp";
+            const io = std.testing.io;
+            const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+            var wbuf: [4096]u8 = undefined;
+            var writer = file.writer(io, &wbuf);
+            try writer.interface.writeAll(src);
+            try writer.interface.flush();
+            file.close(io);
+            defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+            const result = try runLasp(allocator, &.{ "parse", tmp_path, "-g", "examples/grammars/zig.toml" });
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+            try std.testing.expect(result.stdout.len > 0);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
 test "integration: parse produces valid JSON with expected token types" {
     const allocator = std.testing.allocator;
     const result = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig" });
@@ -406,7 +587,6 @@ test "integration: --version prints version and exits zero" {
 }
 
 // --- Integration Tests for CLI Help Text Feature ---
-
 
 test "integration: help command prints usage and exits zero" {
     const allocator = std.testing.allocator;
@@ -1970,7 +2150,6 @@ test "integration: typed captures and string wildcard emit values" {
     try std.testing.expectEqualStrings("msg", events_arr[2].object.get("type").?.string);
     try std.testing.expectEqualStrings("\"key\"", events_arr[2].object.get("s").?.string);
 }
-
 
 // Feature: configurable-token-kinds, Integration: Erlang vocabulary
 // **Validates: Requirements 6.2, 6.5, 10.1**

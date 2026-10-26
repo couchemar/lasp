@@ -36,7 +36,6 @@ pub const StructuralEvent = struct {
     alternatives: []const Alternative = &.{},
 };
 
-
 /// Evidence weights for confidence scoring.
 pub const evidence_weights = struct {
     pub const keyword: f32 = 0.5;

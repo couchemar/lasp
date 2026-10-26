@@ -50,7 +50,6 @@ fn computeVersionString(b: *std.Build, zon_version: []const u8, changelog_latest
     return zon_version;
 }
 
-
 /// Runs a child process and returns its stdout on success (exit 0), else null.
 /// Allocation is leaked intentionally: the build script is short-lived.
 fn runCapture(b: *std.Build, argv: []const []const u8) ?[]const u8 {

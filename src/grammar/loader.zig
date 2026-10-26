@@ -78,7 +78,6 @@ pub const ComposableMatcher = struct {
     capture: ?Capture = null,
 };
 
-
 pub const Capture = struct {
     field_name: []const u8,
     position: usize,
@@ -346,7 +345,6 @@ fn parseSequenceElementV(raw: []const u8, position: usize, allocator: std.mem.Al
     // Keyword literal
     return .{ .element = .{ .matcher = .{ .kind = .{ .one = .keyword }, .text = .{ .exact = try allocator.dupe(u8, s) } }, .is_optional = optional }, .capture = null };
 }
-
 
 /// Parses the optional [tokens] section into a KindVocabulary. Returns null when
 /// the section is absent. Each kind declaration must contain exactly one of
@@ -636,7 +634,6 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         // else: no block keys -> null (already set above)
     }
     // else: no [comments] section -> use default CommentConfig{}
-
 
     return Grammar{
         .language_name = language_name,
@@ -3718,9 +3715,7 @@ test "property: capture parameters survive the round-trip" {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"$a:IDENTIFIER\", \"$b:IDENTIFIER(sep=\\\"{s}\\\")\", \"$c:IDENTIFIER(suffix=\\\"{s}\\\")\", \"$d:IDENTIFIER(sep=\\\"{s}\\\", suffix=\\\"{s}\\\")\"]\n",
-                .{ inp.sep, inp.suffix, inp.sep, inp.suffix });
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"$a:IDENTIFIER\", \"$b:IDENTIFIER(sep=\\\"{s}\\\")\", \"$c:IDENTIFIER(suffix=\\\"{s}\\\")\", \"$d:IDENTIFIER(sep=\\\"{s}\\\", suffix=\\\"{s}\\\")\"]\n", .{ inp.sep, inp.suffix, inp.sep, inp.suffix });
             const grammar = try parseGrammar(source, alloc);
             const formatted = try formatGrammar(grammar, alloc);
             const re = try parseGrammar(formatted, alloc);
@@ -3802,9 +3797,7 @@ test "parseGrammar: invalid prior values rejected" {
 
     const bad = [_][]const u8{ "0.0", "-0.1", "2.5", "\"x\"" };
     for (bad) |val| {
-        const source = try std.fmt.allocPrint(alloc,
-            "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {s}\n",
-            .{val});
+        const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {s}\n", .{val});
         const result = parseGrammar(source, alloc);
         try testing.expectError(error.InvalidPriorValue, result);
     }
@@ -3832,9 +3825,7 @@ test "property: prior validation accepts in-range and rejects out-of-range" {
                 1 => try std.fmt.allocPrint(alloc, "0", .{}),
                 else => "\"x\"",
             };
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {s}\n",
-                .{text});
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {s}\n", .{text});
             const result = parseGrammar(source, alloc);
             const valid = vals[1] == 0 and value > 0.0 and value <= 2.0;
             if (valid) {
@@ -3859,9 +3850,7 @@ test "property: round-trip preserves prior" {
             const alloc = arena.allocator();
 
             const prior: f32 = @as(f32, @floatFromInt(pct)) / 100.0;
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {d}\n",
-                .{prior});
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\nprior = {d}\n", .{prior});
             const grammar = try parseGrammar(source, alloc);
             const formatted = try formatGrammar(grammar, alloc);
             const re = try parseGrammar(formatted, alloc);
@@ -3980,9 +3969,7 @@ test "property: new surface forms round-trip" {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"$a:NUMBER\", \"$b:STRING\", \"string\", \"{s}:NUMBER\"]\n",
-                .{word});
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"$a:NUMBER\", \"$b:STRING\", \"string\", \"{s}:NUMBER\"]\n", .{word});
             const grammar = try parseGrammar(source, alloc);
             const formatted = try formatGrammar(grammar, alloc);
             const re = try parseGrammar(formatted, alloc);
@@ -3993,7 +3980,6 @@ test "property: new surface forms round-trip" {
         }
     }.prop, .{ .num_runs = 100 });
 }
-
 
 // --- configurable-token-kinds loader tests ---
 
@@ -4256,9 +4242,7 @@ test "property: custom kind bare reference resolves to kind id" {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
             const alloc = arena.allocator();
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"{s}\"]\n\n[tokens]\n{s} = {{ char_class_run = {{ start = \"a-z\" }} }}\n",
-                .{ word, word });
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"{s}\"]\n\n[tokens]\n{s} = {{ char_class_run = {{ start = \"a-z\" }} }}\n", .{ word, word });
             const grammar = try parseGrammar(source, alloc);
             const elem = grammar.patterns[0].sequence[0];
             try testing.expect(elem.matcher.kind == .id);
@@ -4277,9 +4261,7 @@ test "property: unknown custom kind reference rejected" {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
             const alloc = arena.allocator();
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"$f:{s}\"]\n\n[tokens]\nother = {{ char_class_run = {{ start = \"a-z\" }} }}\n",
-                .{word});
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"$f:{s}\"]\n\n[tokens]\nother = {{ char_class_run = {{ start = \"a-z\" }} }}\n", .{word});
             const result = parseGrammar(source, alloc);
             if (!std.mem.eql(u8, word, "other")) {
                 try testing.expectError(error.InvalidKindName, result);
@@ -4306,9 +4288,7 @@ test "property: [tokens] validation rejects malformed declarations" {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
             const alloc = arena.allocator();
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n{s}",
-                .{bad_sources[idx]});
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n{s}", .{bad_sources[idx]});
             const result = parseGrammar(source, alloc);
             if (result) |_| {
                 try testing.expect(false); // malformed declaration must fail
@@ -4340,9 +4320,7 @@ test "property: [tokens] round-trip preserves vocabulary" {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            const source = try std.fmt.allocPrint(alloc,
-                "[[patterns]]\ntype = \"t\"\nsequence = [\"{s}\", \"$f:{s}\"]\n\n[tokens]\n{s} = {{ literal_set = [\"{s}\"] }}\n",
-                .{ name, name, name, lit });
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"{s}\", \"$f:{s}\"]\n\n[tokens]\n{s} = {{ literal_set = [\"{s}\"] }}\n", .{ name, name, name, lit });
             const grammar = try parseGrammar(source, alloc);
             const formatted = try formatGrammar(grammar, alloc);
             const re = try parseGrammar(formatted, alloc);
