@@ -1,0 +1,8 @@
+[[patterns]]
+type = "clause"
+sequence = ["identifier", "(", ")"]
+
+[[patterns.extent]]
+field = "region"
+terminator = "."
+at_column = 0

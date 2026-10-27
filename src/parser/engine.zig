@@ -756,24 +756,44 @@ fn evaluateConstraints(
 
 const CountResult = struct { count: u32 };
 
-/// Forward-only balanced scan for one CountSpec. Finds the first token whose
-/// text == open at/after `search_from`, sets region depth := 1, then walks
-/// forward: depth += 1 on another open, depth -= 1 on close; counts tokens whose
-/// text == separator while depth == 1. Ends at the close that returns depth to 0,
-/// or at EOF. Returns the Count_Value (0 if no open found or region empty of
-/// non-delimiter/non-separator content, else separators+1). Visits each token in
-/// the region at most once; never rewinds; does NOT touch the main index.
-fn countRegionScan(
+/// Result of a shared forward-only depth-balanced scan.
+const BalancedScan = struct {
+    found_open: bool,
+    closed: bool,
+    close_end: usize,
+    separators: u32,
+    saw_content: bool,
+    /// Tokens examined by this scan (linearity instrumentation).
+    visits: usize,
+};
+
+/// One forward-only, non-rewinding, depth-balanced loop shared by count and
+/// extent scans. Finds the first token whose text == `open` at/after
+/// `search_from`, sets depth := 1, then walks forward: depth += 1 on another
+/// `open`, depth -= 1 on `close` (first in-region match closes when open ==
+/// close — no nesting); when `separator` is non-null, tokens whose text equals
+/// it count at depth 1, and any other depth-1 token marks content. Ends at the
+/// `close` that returns depth to 0, or at EOF. Does NOT touch the main index.
+fn balancedScan(
     tokens: []const Token,
     source: []const u8,
     search_from: usize,
-    spec: loader.CountSpec,
-) CountResult {
+    open: []const u8,
+    close: []const u8,
+    separator: ?[]const u8,
+) BalancedScan {
     var idx = search_from;
     while (idx < tokens.len) : (idx += 1) {
-        if (std.mem.eql(u8, source[tokens[idx].start..tokens[idx].end], spec.open)) break;
+        if (std.mem.eql(u8, source[tokens[idx].start..tokens[idx].end], open)) break;
     }
-    if (idx >= tokens.len) return .{ .count = 0 };
+    if (idx >= tokens.len) return .{
+        .found_open = false,
+        .closed = false,
+        .close_end = source.len,
+        .separators = 0,
+        .saw_content = false,
+        .visits = idx - search_from,
+    };
 
     var depth: u32 = 1;
     var separators: u32 = 0;
@@ -781,31 +801,105 @@ fn countRegionScan(
     idx += 1;
     while (idx < tokens.len) : (idx += 1) {
         const text = source[tokens[idx].start..tokens[idx].end];
-        if (std.mem.eql(u8, text, spec.open)) {
+        // Check close first: when open == close, the first in-region match must
+        // close (R2.6 — no nesting); for distinct delimiters the two branches are
+        // mutually exclusive regardless of order.
+        if (std.mem.eql(u8, text, close)) {
+            depth -= 1;
+            if (depth == 0) {
+                return .{
+                    .found_open = true,
+                    .closed = true,
+                    .close_end = tokens[idx].end,
+                    .separators = separators,
+                    .saw_content = saw_content,
+                    .visits = idx - search_from + 1,
+                };
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, text, open)) {
             depth += 1;
             continue;
         }
-        if (std.mem.eql(u8, text, spec.close)) {
-            depth -= 1;
-            if (depth == 0) break;
-            continue;
-        }
         if (depth == 1) {
-            if (std.mem.eql(u8, text, spec.separator)) {
-                separators += 1;
-            } else {
-                saw_content = true;
+            if (separator) |sep| {
+                if (std.mem.eql(u8, text, sep)) {
+                    separators += 1;
+                    continue;
+                }
             }
+            saw_content = true;
         }
     }
 
-    if (!saw_content) return .{ .count = 0 };
-    const total = separators + 1;
+    return .{
+        .found_open = true,
+        .closed = false,
+        .close_end = source.len,
+        .separators = separators,
+        .saw_content = saw_content,
+        .visits = idx - search_from,
+    };
+}
+
+/// Thin wrapper over `balancedScan` deriving the Count_Value exactly as the
+/// pre-refactor scan did: 0 when no open was found or the region is empty of
+/// non-delimiter/non-separator content, else separators + 1.
+fn countRegionScan(
+    tokens: []const Token,
+    source: []const u8,
+    search_from: usize,
+    spec: loader.CountSpec,
+) CountResult {
+    const s = balancedScan(tokens, source, search_from, spec.open, spec.close, spec.separator);
+    if (!s.saw_content) return .{ .count = 0 };
+    const total = s.separators + 1;
     return .{ .count = @min(total, std.math.maxInt(u32)) };
 }
 
-/// Builds the integer-field list for a buffered candidate's pattern from its
-/// count specs. Empty when the pattern declares none (byte-identical path).
+/// Plain forward scan for the first token byte-equal to `terminator` (and,
+/// when `at_column` present, whose `Token.col` equals it). Returns that token's
+/// .end, or source.len (EOF) when none found.
+fn terminatorScan(
+    tokens: []const Token,
+    source: []const u8,
+    search_from: usize,
+    terminator: []const u8,
+    at_column: ?u16,
+) usize {
+    var idx = search_from;
+    while (idx < tokens.len) : (idx += 1) {
+        const tok = tokens[idx];
+        if (std.mem.eql(u8, source[tok.start..tok.end], terminator)) {
+            if (at_column) |col| {
+                if (tok.col != @as(usize, col)) continue;
+            }
+            return tok.end;
+        }
+    }
+    return source.len;
+}
+
+/// Computes a pattern's Region_Extent byte offset per its ExtentSpec.
+fn computeExtent(
+    spec: loader.ExtentSpec,
+    tokens: []const Token,
+    source: []const u8,
+    search_from: usize,
+) usize {
+    return switch (spec.mode) {
+        .balanced => |b| blk: {
+            const s = balancedScan(tokens, source, search_from, b.open, b.close, null);
+            break :blk if (s.closed) s.close_end else source.len;
+        },
+        .terminator => |t| terminatorScan(tokens, source, search_from, t.terminator, t.at_column),
+    };
+}
+
+/// Builds the integer-field list for a buffered candidate's pattern: count
+/// fields first, then the optional extent field (when `pattern.extent` is
+/// non-null). Empty when the pattern declares neither (byte-identical path).
 fn buildIntFields(
     pattern: loader.Pattern,
     tokens: []const Token,
@@ -813,7 +907,7 @@ fn buildIntFields(
     last_matched_end: usize,
     allocator: std.mem.Allocator,
 ) ![]const events_mod.IntegerField {
-    if (pattern.count_specs.len == 0) return &.{};
+    if (pattern.count_specs.len == 0 and pattern.extent == null) return &.{};
     var search_from: usize = 0;
     while (search_from < tokens.len and tokens[search_from].start < last_matched_end) : (search_from += 1) {}
 
@@ -821,6 +915,10 @@ fn buildIntFields(
     for (pattern.count_specs) |spec| {
         const cr = countRegionScan(tokens, source, search_from, spec);
         try fields.append(allocator, .{ .field_name = spec.field, .value = cr.count });
+    }
+    if (pattern.extent) |ext| {
+        const extent = computeExtent(ext, tokens, source, search_from);
+        try fields.append(allocator, .{ .field_name = ext.field, .value = @intCast(extent) });
     }
     return fields.toOwnedSlice(allocator);
 }
@@ -6292,4 +6390,403 @@ test "parse: zero-arity count renders 0; no count table yields empty int_fields"
         const result = try parse(plain_auto, tokens, src, plain.patterns, plain.tokens, plain.blocks, plain.weights, false, false, alloc);
         try testing.expectEqual(@as(usize, 0), result[0].int_fields.len);
     }
+}
+
+// --- region-extent scan tests ---
+
+fn extentSpecBalanced(field: []const u8, open: []const u8, close: []const u8) loader.ExtentSpec {
+    return .{ .field = field, .mode = .{ .balanced = .{ .open = open, .close = close } } };
+}
+
+fn extentSpecTerminator(field: []const u8, terminator: []const u8, at_column: ?u16) loader.ExtentSpec {
+    return .{ .field = field, .mode = .{ .terminator = .{ .terminator = terminator, .at_column = at_column } } };
+}
+
+test "computeExtent: balanced hand-built streams" {
+    // Outer close end.
+    {
+        const texts = [_][]const u8{ "{", "a", "{", "b", "}", "c", "}" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        const source = "{a{b}c}";
+        const spec = extentSpecBalanced("ext", "{", "}");
+        try testing.expectEqual(source.len, computeExtent(spec, tokens, source, 0));
+    }
+    // Unclosed → EOF.
+    {
+        const texts = [_][]const u8{ "{", "a", "{", "b" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        const source = "{a{b";
+        const spec = extentSpecBalanced("ext", "{", "}");
+        try testing.expectEqual(source.len, computeExtent(spec, tokens, source, 0));
+    }
+    // No open → EOF.
+    {
+        const texts = [_][]const u8{ "a", "b" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        const source = "ab";
+        const spec = extentSpecBalanced("ext", "{", "}");
+        try testing.expectEqual(source.len, computeExtent(spec, tokens, source, 0));
+    }
+    // open == close: first occurrence opens, second closes (no nesting).
+    {
+        const texts = [_][]const u8{ "\"", "x", "\"", "y" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        const source = "\"x\"y";
+        const spec = extentSpecBalanced("ext", "\"", "\"");
+        try testing.expectEqual(@as(usize, 3), computeExtent(spec, tokens, source, 0));
+    }
+}
+
+test "terminatorScan: first qualifying terminator end; col filter; EOF" {
+    // "." at col 0 skipped earlier non-col-0 "." (col 3).
+    {
+        const tokens = try testing.allocator.alloc(Token, 5);
+        defer testing.allocator.free(tokens);
+        tokens[0] = .{ .kind = .identifier, .start = 0, .end = 3, .line = 1, .col = 0 };
+        tokens[1] = .{ .kind = .symbol, .start = 3, .end = 4, .line = 1, .col = 3 };
+        tokens[2] = .{ .kind = .identifier, .start = 5, .end = 7, .line = 1, .col = 5 };
+        tokens[3] = .{ .kind = .symbol, .start = 7, .end = 8, .line = 2, .col = 0 };
+        tokens[4] = .{ .kind = .identifier, .start = 9, .end = 11, .line = 2, .col = 2 };
+        const source = "foo. ok.";
+        try testing.expectEqual(@as(usize, 8), terminatorScan(tokens, source, 0, ".", 0));
+    }
+    // No terminator → EOF.
+    {
+        const texts = [_][]const u8{ "foo", "bar" };
+        const tokens = try tokensFromTexts(&texts);
+        defer testing.allocator.free(tokens);
+        const source = "foobar";
+        try testing.expectEqual(source.len, terminatorScan(tokens, source, 0, ".", null));
+    }
+}
+
+// Feature: region-extent, Property 1: Balanced extent is the matching close end
+test "property: balanced extent is the matching close end offset" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 24, .charset = .custom, .custom_chars = "{}ab" });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            const tokens = try testing.allocator.alloc(Token, src.len);
+            defer testing.allocator.free(tokens);
+            for (src, 0..) |_, i| {
+                tokens[i] = .{ .kind = .identifier, .start = i, .end = i + 1, .line = 1, .col = i };
+            }
+            const spec = extentSpecBalanced("ext", "{", "}");
+            const got = computeExtent(spec, tokens, src, 0);
+
+            // Independent reference over the byte string.
+            const open_idx = std.mem.indexOfScalar(u8, src, '{') orelse src.len;
+            var expected: usize = src.len;
+            if (open_idx < src.len) {
+                var depth: u32 = 1;
+                var i = open_idx + 1;
+                while (i < src.len) : (i += 1) {
+                    if (src[i] == '{') {
+                        depth += 1;
+                    } else if (src[i] == '}') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            expected = i + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            try testing.expectEqual(expected, got);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Property 2: Equal open/close delimiter has no nesting
+test "property: equal open/close delimiter has no nesting" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 24, .charset = .custom, .custom_chars = "|ab" });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            const tokens = try testing.allocator.alloc(Token, src.len);
+            defer testing.allocator.free(tokens);
+            for (src, 0..) |_, i| {
+                tokens[i] = .{ .kind = .identifier, .start = i, .end = i + 1, .line = 1, .col = i };
+            }
+            const spec = extentSpecBalanced("ext", "|", "|");
+            const got = computeExtent(spec, tokens, src, 0);
+
+            const first = std.mem.indexOfScalar(u8, src, '|') orelse src.len;
+            var expected: usize = src.len;
+            if (first < src.len) {
+                if (std.mem.indexOfScalarPos(u8, src, first + 1, '|')) |second| {
+                    expected = second + 1;
+                }
+            }
+            try testing.expectEqual(expected, got);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Property 3: Terminator extent is the first qualifying
+// terminator end
+test "property: terminator extent is the first qualifying terminator end" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 24, .charset = .custom, .custom_chars = ".ab" });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            const tokens = try testing.allocator.alloc(Token, src.len);
+            defer testing.allocator.free(tokens);
+            for (src, 0..) |_, i| {
+                tokens[i] = .{ .kind = .identifier, .start = i, .end = i + 1, .line = 1, .col = i };
+            }
+            const spec = extentSpecTerminator("ext", ".", null);
+            const got = computeExtent(spec, tokens, src, 0);
+            const expected = if (std.mem.indexOfScalar(u8, src, '.')) |idx| idx + 1 else src.len;
+            try testing.expectEqual(expected, got);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Property 4: at_column constrains the qualifying
+// terminator by column
+test "property: at_column constrains the qualifying terminator by column" {
+    const tuple_gen = comptime gen.tuple2(
+        []const u8,
+        bool,
+        gen.string(.{ .min_len = 0, .max_len = 24, .charset = .custom, .custom_chars = ".ab" }),
+        gen.boolean(),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, bool }) !void {
+            const src = vals[0];
+            const dot_col_zero = vals[1];
+            const at_column: u16 = if (dot_col_zero) @as(u16, 0) else @as(u16, 5);
+            const tokens = try testing.allocator.alloc(Token, src.len);
+            defer testing.allocator.free(tokens);
+            var col: usize = 0;
+            for (src, 0..) |ch, i| {
+                const tok_col: usize = if (ch == '.') (if (dot_col_zero) 0 else 5) else col;
+                tokens[i] = .{ .kind = .identifier, .start = i, .end = i + 1, .line = 1, .col = tok_col };
+                if (ch != '.') col += 1;
+            }
+            const spec = extentSpecTerminator("ext", ".", at_column);
+            const got = computeExtent(spec, tokens, src, 0);
+
+            var expected: usize = src.len;
+            var i: usize = 0;
+            while (i < src.len) : (i += 1) {
+                if (src[i] == '.' and tokens[i].col == @as(usize, at_column)) {
+                    expected = i + 1;
+                    break;
+                }
+            }
+            try testing.expectEqual(expected, got);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Property 10: Region scans visit each token a bounded
+// number of times
+test "property: region scans visit each token at most once" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 200, .charset = .custom, .custom_chars = "{}ab" });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            const tokens = try testing.allocator.alloc(Token, src.len);
+            defer testing.allocator.free(tokens);
+            for (src, 0..) |_, i| {
+                tokens[i] = .{ .kind = .identifier, .start = i, .end = i + 1, .line = 1, .col = i };
+            }
+            const s = balancedScan(tokens, src, 0, "{", "}", null);
+            try testing.expect(s.visits <= src.len);
+            const s2 = balancedScan(tokens, src, 0, "{", "}", null);
+            try testing.expect(s2.visits <= src.len);
+            const term = terminatorScan(tokens, src, 0, ".", null);
+            try testing.expect(term <= src.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+test "parse: balanced extent emits integer field on winner (after counts)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar_source =
+        \\[[patterns]]
+        \\type = "fn"
+        \\sequence = ["identifier", "$n:IDENTIFIER"]
+        \\
+        \\[[patterns.count]]
+        \\field = "args"
+        \\open = "("
+        \\close = ")"
+        \\separator = ","
+        \\
+        \\[[patterns.extent]]
+        \\field = "body"
+        \\open = "{"
+        \\close = "}"
+    ;
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+    const src = "fn foo(a, b) { if (x) { y(); } }";
+    const tokens = try tokenizer.tokenize(src, grammar.keyword_table, grammar.comments, alloc);
+    const result = try parse(automaton, tokens, src, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, false, false, alloc);
+
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqual(@as(usize, 2), result[0].int_fields.len);
+    try testing.expectEqualStrings("args", result[0].int_fields[0].field_name);
+    try testing.expectEqual(@as(u32, 2), result[0].int_fields[0].value);
+    try testing.expectEqualStrings("body", result[0].int_fields[1].field_name);
+    const expected_extent = std.mem.lastIndexOfScalar(u8, src, '}').? + 1;
+    try testing.expectEqual(@as(u32, @intCast(expected_extent)), result[0].int_fields[1].value);
+}
+
+test "parse: terminator extent with at_column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const grammar_source =
+        \\[[patterns]]
+        \\type = "clause"
+        \\sequence = ["identifier", "(", ")"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "region"
+        \\terminator = "."
+        \\at_column = 0
+    ;
+    const grammar = try loader.parseGrammar(grammar_source, alloc);
+    const automaton = try compiler.compile(grammar.patterns, alloc);
+    const src = "foo() ->\n  x.y,\n  ok\n.\nbar() -> ok.\n";
+    const tokens = try tokenizer.tokenize(src, grammar.keyword_table, grammar.comments, alloc);
+    const result = try parse(automaton, tokens, src, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, false, false, alloc);
+
+    try testing.expectEqual(@as(usize, 2), result.len);
+    // The clause's terminating "." is the first col-0 dot: the standalone "." line.
+    const col0_dot = std.mem.indexOf(u8, src, ".\n").? + 1;
+    try testing.expectEqual(@as(u32, @intCast(col0_dot)), result[0].int_fields[0].value);
+}
+
+// Feature: region-extent, Property 5: Emitted extent is an in-bounds
+// non-negative integer
+test "property: emitted extent is an in-bounds non-negative integer" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 48, .charset = .custom, .custom_chars = "abcdef(){}" });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const grammar_source =
+                \\[[patterns]]
+                \\type = "fn"
+                \\sequence = ["identifier", "("]
+                \\
+                \\[[patterns.extent]]
+                \\field = "body"
+                \\open = "{"
+                \\close = "}"
+            ;
+            const grammar = try loader.parseGrammar(grammar_source, alloc);
+            const automaton = try compiler.compile(grammar.patterns, alloc);
+            const tokens = try tokenizer.tokenize(src, grammar.keyword_table, grammar.comments, alloc);
+            const result = try parse(automaton, tokens, src, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, false, false, alloc);
+            for (result) |ev| {
+                for (ev.int_fields) |f| {
+                    if (std.mem.eql(u8, f.field_name, "body")) {
+                        try testing.expect(f.value <= src.len);
+                    }
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Property 8: Extent computation is observationally
+// pure w.r.t. the event stream
+test "property: extent adds only its field to the event stream" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 48, .charset = .custom, .custom_chars = "abcdef(){}" });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const with_extent =
+                \\[[patterns]]
+                \\type = "fn"
+                \\sequence = ["identifier", "("]
+                \\
+                \\[[patterns.extent]]
+                \\field = "body"
+                \\open = "{"
+                \\close = "}"
+            ;
+            const without_extent =
+                \\[[patterns]]
+                \\type = "fn"
+                \\sequence = ["identifier", "("]
+            ;
+            const g1 = try loader.parseGrammar(with_extent, alloc);
+            const g2 = try loader.parseGrammar(without_extent, alloc);
+            const a1 = try compiler.compile(g1.patterns, alloc);
+            const a2 = try compiler.compile(g2.patterns, alloc);
+            const t1 = try tokenizer.tokenize(src, g1.keyword_table, g1.comments, alloc);
+            const t2 = try tokenizer.tokenize(src, g2.keyword_table, g2.comments, alloc);
+            const r1 = try parse(a1, t1, src, g1.patterns, g1.tokens, g1.blocks, g1.weights, false, false, alloc);
+            const r2 = try parse(a2, t2, src, g2.patterns, g2.tokens, g2.blocks, g2.weights, false, false, alloc);
+
+            try testing.expectEqual(r1.len, r2.len);
+            for (r1, r2) |a, b| {
+                try testing.expectEqualStrings(a.type_name, b.type_name);
+                try testing.expectEqual(a.start, b.start);
+                try testing.expectEqual(a.end, b.end);
+                try testing.expectApproxEqRel(a.confidence, b.confidence, 0.001);
+                try testing.expectEqual(a.captures.len, b.captures.len);
+                try testing.expectEqual(a.int_fields.len, b.int_fields.len + 1);
+                for (b.int_fields, 0..) |f, i| {
+                    try testing.expectEqualStrings(f.field_name, a.int_fields[i].field_name);
+                    try testing.expectEqual(f.value, a.int_fields[i].value);
+                }
+                try testing.expectEqualStrings("body", a.int_fields[a.int_fields.len - 1].field_name);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Property 11: Parsing is deterministic across runs
+test "property: parsing with extent is deterministic across runs" {
+    const source_gen = gen.string(.{ .min_len = 0, .max_len = 48, .charset = .custom, .custom_chars = "abcdef(){}" });
+    try minish.check(testing.allocator, source_gen, struct {
+        fn prop(src: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const grammar_source =
+                \\[[patterns]]
+                \\type = "fn"
+                \\sequence = ["identifier", "("]
+                \\
+                \\[[patterns.extent]]
+                \\field = "body"
+                \\open = "{"
+                \\close = "}"
+            ;
+            const grammar = try loader.parseGrammar(grammar_source, alloc);
+            const automaton = try compiler.compile(grammar.patterns, alloc);
+            const tokens = try tokenizer.tokenize(src, grammar.keyword_table, grammar.comments, alloc);
+            const r1 = try parse(automaton, tokens, src, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, false, false, alloc);
+            const r2 = try parse(automaton, tokens, src, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, false, false, alloc);
+            try testing.expectEqual(r1.len, r2.len);
+            for (r1, r2) |a, b| {
+                try testing.expectEqual(a.start, b.start);
+                try testing.expectEqual(a.end, b.end);
+                try testing.expectEqual(a.int_fields.len, b.int_fields.len);
+                for (a.int_fields, b.int_fields) |fa, fb| {
+                    try testing.expectEqualStrings(fa.field_name, fb.field_name);
+                    try testing.expectEqual(fa.value, fb.value);
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
 }

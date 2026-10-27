@@ -250,6 +250,15 @@ fn run(
                         error.UnknownCaptureField => "error: [[patterns.capture]] field is not a declared capture",
                         error.DuplicateCaptureField => "error: [[patterns.capture]] duplicate table for the same field",
                         error.ParenthesizedCaptureParam => "error: parenthesized capture parameters are removed; use [[patterns.capture]] tables",
+                        error.ExtentModeConflict => "error: [[patterns.extent]] cannot combine terminator with open/close",
+                        error.ExtentNoMode => "error: [[patterns.extent]] must declare balanced open/close or a terminator",
+                        error.ExtentIncompleteBalanced => "error: [[patterns.extent]] balanced mode requires both open and close",
+                        error.InvalidExtentField => "error: [[patterns.extent]] field must be 1-64 bytes",
+                        error.InvalidExtentDelimiter => "error: [[patterns.extent]] open/close/terminator must be 1-8 bytes",
+                        error.DuplicateExtentField => "error: [[patterns.extent]] field duplicates a capture or count field",
+                        error.ExtentAtColumnWithoutTerminator => "error: [[patterns.extent]] at_column requires terminator mode",
+                        error.InvalidExtentAtColumn => "error: [[patterns.extent]] at_column must be an integer in 0..65535",
+                        error.TooManyExtentTables => "error: at most one [[patterns.extent]] table per pattern",
                         error.OutOfMemory => "out of memory",
                         else => "unknown grammar error",
                     };
@@ -445,6 +454,178 @@ test "integration: query on count field + names-only renders count first" {
         rest = rest[nl + 1 ..];
     }
     try std.testing.expectEqual(@as(usize, 2), count_lines);
+}
+
+// Feature: region-extent, Integration
+// **Validates: Requirements 4.1, 4.2, 4.3, 5.3, 9.4**
+
+test "integration: brace extent emits bare-integer body field" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/extent_brace_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/extent_brace.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), events_arr.len);
+
+    const src = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "tests/fixtures/extent_brace_sample.txt", allocator, .limited(1 << 20));
+    defer allocator.free(src);
+    // Independent nested scan: foo's outer close is the '}' that balances the
+    {
+        var depth: u32 = 1;
+        var i: usize = 17;
+        while (i < src.len) : (i += 1) {
+            if (src[i] == '{') {
+                depth += 1;
+            } else if (src[i] == '}') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        const first_close = i + 1;
+        const body0 = events_arr[0].object.get("body").?;
+        try std.testing.expect(body0 == .integer);
+        try std.testing.expectEqual(@as(i64, @intCast(first_close)), body0.integer);
+    }
+
+    const second_close = std.mem.lastIndexOfScalar(u8, src, '}').? + 1; // bar's brace end
+    const body1 = events_arr[1].object.get("body").?;
+    try std.testing.expectEqual(@as(i64, @intCast(second_close)), body1.integer);
+}
+
+test "integration: terminator extent with at_column=0" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/extent_terminator_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/extent_terminator.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), events_arr.len);
+
+    const src = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "tests/fixtures/extent_terminator_sample.txt", allocator, .limited(1 << 20));
+    defer allocator.free(src);
+    const dot_end = std.mem.indexOf(u8, src, ".\n").? + 1;
+    const region0 = events_arr[0].object.get("region").?;
+    try std.testing.expect(region0 == .integer);
+    try std.testing.expectEqual(@as(i64, @intCast(dot_end)), region0.integer);
+}
+
+test "integration: numeric query on extent field" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "query",
+        "function[body>50]",
+        "tests/fixtures/extent_brace_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/extent_brace.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), events_arr.len);
+    try std.testing.expectEqualStrings("function", events_arr[0].object.get("type").?.string);
+}
+
+test "integration: no extent table ⇒ no extent field (P9 at CLI level)" {
+    const allocator = std.testing.allocator;
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/extent_brace_sample.txt",
+        "--grammar",
+        "tests/fixtures/grammars/extent_brace.toml",
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"body\"") != null);
+
+    // Same grammar without the extent table → no body field anywhere.
+    const tmp_path = "test_extent_noextent.toml";
+    const io = std.testing.io;
+    const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+    var wbuf: [4096]u8 = undefined;
+    var writer = file.writer(io, &wbuf);
+    try writer.interface.writeAll("[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"$n:IDENTIFIER\", \"(\"]\n");
+    try writer.interface.flush();
+    file.close(io);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    const plain = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/extent_brace_sample.txt",
+        "--grammar",
+        tmp_path,
+    });
+    defer {
+        allocator.free(plain.stdout);
+        allocator.free(plain.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, plain.term);
+    try std.testing.expect(std.mem.indexOf(u8, plain.stdout, "\"body\"") == null);
+}
+
+// Feature: region-extent, Property 13: grammar-variation half
+test "integration: differing extent delimiters yield differing Region_Extent" {
+    const allocator = std.testing.allocator;
+    // Bracket-bounded variant: same source, a delimiter pair that does not occur
+    // in the body (so both events report EOF = source length).
+    const tmp_path = "test_extent_variant.toml";
+    const io = std.testing.io;
+    const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+    var wbuf: [4096]u8 = undefined;
+    var writer = file.writer(io, &wbuf);
+    try writer.interface.writeAll("[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"$n:IDENTIFIER\", \"(\"]\n\n[[patterns.extent]]\nfield = \"body\"\nopen = \"[\"\nclose = \"]\"\n");
+    try writer.interface.flush();
+    file.close(io);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    const result = try runLasp(allocator, &.{
+        "parse",
+        "tests/fixtures/extent_brace_sample.txt",
+        "--grammar",
+        tmp_path,
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const events_arr = parsed.value.object.get("events").?.array.items;
+    const src = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "tests/fixtures/extent_brace_sample.txt", allocator, .limited(1 << 20));
+    defer allocator.free(src);
+    const body0 = events_arr[0].object.get("body").?.integer;
+    // No bracket in the source → EOF (source length), which differs from the
+    // brace grammar's body value (37) for the same event.
+    try std.testing.expectEqual(@as(i64, @intCast(src.len)), body0);
 }
 
 // --- Integration Tests ---

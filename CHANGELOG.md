@@ -5,8 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.1] - 2026-10-26
+## [Unreleased]
 
+### Added
+
+- Region extent (`[[patterns.extent]]`): a grammar can declare where a matched construct's region ends — balanced `open`/`close` (depth-balanced scan to the matching close; unclosed/missing open ⇒ EOF; `open == close` ⇒ no nesting) or `terminator` with optional `at_column` (first qualifying token's end, else EOF). The byte offset is emitted as an author-named integer field after count fields (bare JSON number, numeric-queryable, `--names-only`-rendered). Load-time validation adds nine errors (`ExtentModeConflict`, `ExtentNoMode`, `ExtentIncompleteBalanced`, `InvalidExtentField`, `InvalidExtentDelimiter`, `DuplicateExtentField`, `ExtentAtColumnWithoutTerminator`, `InvalidExtentAtColumn`, `TooManyExtentTables`). `countRegionScan` now delegates to a shared `balancedScan` (count output byte-identical); scans are forward-only and never touch the main index; `block_end` stays `null`; no extent table ⇒ byte-identical output. (Spec: region-extent)
+
+## [0.4.1] - 2026-10-26
 ### Fixed
 
 - Nix released-build reporting: a Nix build can now report a plain released semver. `flake.nix` gains a dedicated `packages.released` output (`mkLasp { gitTagged = true; }`) that supplies `-Dgit_tagged=true` to `zig build`; the default `packages.default` / `packages.lasp` stays `gitTagged = false` (dev). Building the tagged, clean release commit via `nix build .#released` now reports `X.Y.Z` instead of `X.Y.Z-dev+<commit>`. Hermetic (no `git` in the sandbox, no network); the clean-tree and changelog-match conditions in `build.zig` still apply, so a dirty or mismatched `nix build .#released` still reports dev. `build.zig` is unchanged — the `-Dgit_tagged` option (default `false`) already existed. (Spec: nix-release-version)

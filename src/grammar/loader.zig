@@ -57,6 +57,7 @@ pub const Pattern = struct {
     constraints: []const Constraint = &.{},
     prior: f32 = 1.0,
     count_specs: []const CountSpec = &.{},
+    extent: ?ExtentSpec = null,
 };
 
 /// Kind axis: a resolved reference, not a per-kind variant. The fixed default Kind_Table
@@ -94,6 +95,26 @@ pub const CountSpec = struct {
     open: []const u8,
     close: []const u8,
     separator: []const u8,
+};
+
+/// A [[patterns.extent]] table mode: balanced `open`/`close` pair scanning or a
+/// `terminator` token (optionally constrained to a column).
+pub const ExtentMode = union(enum) {
+    balanced: struct {
+        open: []const u8,
+        close: []const u8,
+    },
+    terminator: struct {
+        terminator: []const u8,
+        at_column: ?u16 = null,
+    },
+};
+
+/// Where a matched construct's region ends, emitted as an author-named
+/// integer field on the event.
+pub const ExtentSpec = struct {
+    field: []const u8,
+    mode: ExtentMode,
 };
 
 pub const BlockConfig = struct {
@@ -152,6 +173,15 @@ pub const GrammarError = error{
     UnknownCaptureField,
     DuplicateCaptureField,
     ParenthesizedCaptureParam,
+    ExtentModeConflict,
+    ExtentNoMode,
+    ExtentIncompleteBalanced,
+    InvalidExtentField,
+    InvalidExtentDelimiter,
+    DuplicateExtentField,
+    ExtentAtColumnWithoutTerminator,
+    InvalidExtentAtColumn,
+    TooManyExtentTables,
 };
 
 const delimiter_chars = "(){}[]";
@@ -251,6 +281,68 @@ fn parseCaptureTail(tail: []const u8, allocator: std.mem.Allocator, vocab: ?toke
     if (std.mem.indexOfScalar(u8, tail, '(') != null) return error.ParenthesizedCaptureParam;
     const kind = vocabKindRef(tail, vocab) orelse return error.InvalidKindName;
     return .{ .kind = kind, .span = .{ .separator = null, .suffix_set = null } };
+}
+
+/// Parses and validates the optional `[[patterns.extent]]` table on a pattern.
+/// Absent/invalid-length-0 ⇒ null (byte-identical path). Runs after captures
+/// and count specs exist so field-collision checks see both lists.
+fn parseExtentSpec(
+    pattern_table: anytype,
+    captures: []const Capture,
+    count_specs: []const CountSpec,
+    allocator: std.mem.Allocator,
+) GrammarError!?ExtentSpec {
+    const extent_val = pattern_table.get("extent") orelse return null;
+    if (extent_val.array.items.items.len > 1) return error.TooManyExtentTables;
+    if (extent_val.array.items.items.len == 0) return null;
+    const et = extent_val.array.items.items[0];
+
+    const field_val = et.get("field") orelse return error.InvalidExtentField;
+    if (field_val.* != .string or field_val.string.len == 0 or field_val.string.len > 64) return error.InvalidExtentField;
+    const field = try allocator.dupe(u8, field_val.string);
+
+    const has_open = et.get("open") != null;
+    const has_close = et.get("close") != null;
+    const has_terminator = et.get("terminator") != null;
+    const has_at_column = et.get("at_column") != null;
+
+    if (has_terminator and (has_open or has_close)) return error.ExtentModeConflict;
+    if (!has_open and !has_close and !has_terminator) return error.ExtentNoMode;
+    if (has_open != has_close and !has_terminator) return error.ExtentIncompleteBalanced;
+    if (has_at_column and !has_terminator) return error.ExtentAtColumnWithoutTerminator;
+
+    const mode: ExtentMode = if (has_terminator) blk: {
+        const term_val = et.get("terminator").?;
+        if (term_val.* != .string or term_val.string.len == 0 or term_val.string.len > 8) return error.InvalidExtentDelimiter;
+        var at_column: ?u16 = null;
+        if (has_at_column) {
+            const col_val = et.get("at_column").?;
+            if (col_val.* != .integer or col_val.integer < 0 or col_val.integer > 65535) return error.InvalidExtentAtColumn;
+            at_column = @intCast(col_val.integer);
+        }
+        break :blk .{ .terminator = .{
+            .terminator = try allocator.dupe(u8, term_val.string),
+            .at_column = at_column,
+        } };
+    } else blk: {
+        const open_val = et.get("open").?;
+        const close_val = et.get("close").?;
+        if (open_val.* != .string or open_val.string.len == 0 or open_val.string.len > 8) return error.InvalidExtentDelimiter;
+        if (close_val.* != .string or close_val.string.len == 0 or close_val.string.len > 8) return error.InvalidExtentDelimiter;
+        break :blk .{ .balanced = .{
+            .open = try allocator.dupe(u8, open_val.string),
+            .close = try allocator.dupe(u8, close_val.string),
+        } };
+    };
+
+    for (captures) |cap| {
+        if (std.mem.eql(u8, cap.field_name, field)) return error.DuplicateExtentField;
+    }
+    for (count_specs) |spec| {
+        if (std.mem.eql(u8, spec.field, field)) return error.DuplicateExtentField;
+    }
+
+    return .{ .field = field, .mode = mode };
 }
 
 const SequenceElementResult = struct {
@@ -539,11 +631,17 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
                 });
             }
         }
+
+        // Phase D: [[patterns.extent]] tables (validated after captures and
+        // count specs exist so field collisions are caught deterministically).
+        const extent_spec = try parseExtentSpec(pattern_table, captures.items, count_specs.items, allocator);
+
         try patterns.append(allocator, .{
             .type_name = type_name,
             .sequence = try matchers.toOwnedSlice(allocator),
             .captures = try captures.toOwnedSlice(allocator),
             .count_specs = try count_specs.toOwnedSlice(allocator),
+            .extent = extent_spec,
             .position = blk: {
                 if (pattern_table.get("position")) |pos_val| {
                     if (std.mem.eql(u8, pos_val.string, "start")) {
@@ -899,6 +997,32 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
             try w.writeAll("separator = \"");
             try writeEscaped(w, spec.separator);
             try w.writeAll("\"\n");
+        }
+
+        // Extent table ([[patterns.extent]]).
+        if (pattern.extent) |ext| {
+            try w.writeAll("\n[[patterns.extent]]\n");
+            try w.writeAll("field = \"");
+            try w.writeAll(ext.field);
+            try w.writeAll("\"\n");
+            switch (ext.mode) {
+                .balanced => |b| {
+                    try w.writeAll("open = \"");
+                    try writeEscaped(w, b.open);
+                    try w.writeAll("\"\n");
+                    try w.writeAll("close = \"");
+                    try writeEscaped(w, b.close);
+                    try w.writeAll("\"\n");
+                },
+                .terminator => |t| {
+                    try w.writeAll("terminator = \"");
+                    try writeEscaped(w, t.terminator);
+                    try w.writeAll("\"\n");
+                    if (t.at_column) |c| {
+                        try w.print("at_column = {d}\n", .{c});
+                    }
+                },
+            }
         }
         try w.writeAll("\n");
     }
@@ -4457,6 +4581,293 @@ test "property: [tokens] round-trip preserves vocabulary" {
             for (grammar.patterns[0].sequence, re.patterns[0].sequence) |a, b| {
                 try testing.expectEqual(@as(u8, matcherTag(a.matcher)), @as(u8, matcherTag(b.matcher)));
             }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Unit: loader data model + validation
+// **Validates: Requirements 1.1-1.6, 6.1-6.9**
+
+test "parseGrammar: balanced extent table parses and leaves sequence untouched" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\[[patterns]]
+        \\type = "fn"
+        \\sequence = ["identifier", "$n:IDENTIFIER"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "body"
+        \\open = "{"
+        \\close = "}"
+    ;
+    const grammar = try parseGrammar(source, alloc);
+    const ext = grammar.patterns[0].extent.?;
+    try testing.expectEqualStrings("body", ext.field);
+    try testing.expect(ext.mode == .balanced);
+    try testing.expectEqualStrings("{", ext.mode.balanced.open);
+    try testing.expectEqualStrings("}", ext.mode.balanced.close);
+    try testing.expectEqual(@as(usize, 2), grammar.patterns[0].sequence.len);
+}
+
+test "parseGrammar: terminator extent with and without at_column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const with_col =
+        \\[[patterns]]
+        \\type = "clause"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "region"
+        \\terminator = "."
+        \\at_column = 0
+    ;
+    const g1 = try parseGrammar(with_col, alloc);
+    const t1 = g1.patterns[0].extent.?.mode.terminator;
+    try testing.expectEqualStrings(".", t1.terminator);
+    try testing.expectEqual(@as(?u16, 0), t1.at_column);
+
+    const no_col =
+        \\[[patterns]]
+        \\type = "clause"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "region"
+        \\terminator = "."
+    ;
+    const g2 = try parseGrammar(no_col, alloc);
+    const t2 = g2.patterns[0].extent.?.mode.terminator;
+    try testing.expectEqual(@as(?u16, null), t2.at_column);
+}
+
+test "formatGrammar: emits both extent modes; round-trips" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\[[patterns]]
+        \\type = "fn"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "body"
+        \\open = "{"
+        \\close = "}"
+        \\
+        \\[[patterns]]
+        \\type = "clause"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "region"
+        \\terminator = "."
+        \\at_column = 0
+    ;
+    const grammar = try parseGrammar(source, alloc);
+    const formatted = try formatGrammar(grammar, alloc);
+    try testing.expect(std.mem.indexOf(u8, formatted, "[[patterns.extent]]") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "open = \"{\"") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "terminator = \".\"") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "at_column = 0") != null);
+
+    const re = try parseGrammar(formatted, alloc);
+    const e1 = re.patterns[0].extent.?;
+    try testing.expectEqualStrings("body", e1.field);
+    try testing.expect(e1.mode == .balanced);
+    const e2 = re.patterns[1].extent.?;
+    try testing.expectEqualStrings("region", e2.field);
+    try testing.expect(e2.mode == .terminator);
+    try testing.expectEqual(@as(?u16, 0), e2.mode.terminator.at_column);
+}
+
+test "parseGrammar: extent validation errors" {
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "x"
+        \\open = "{"
+        \\close = "}"
+        \\terminator = "."
+    , error.ExtentModeConflict);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "x"
+    , error.ExtentNoMode);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "x"
+        \\open = "{"
+    , error.ExtentIncompleteBalanced);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = ""
+        \\open = "{"
+        \\close = "}"
+    , error.InvalidExtentField);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "x"
+        \\terminator = ""
+    , error.InvalidExtentDelimiter);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "x"
+        \\open = "{"
+        \\close = "}"
+        \\at_column = 0
+    , error.ExtentAtColumnWithoutTerminator);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "x"
+        \\terminator = "."
+        \\at_column = 70000
+    , error.InvalidExtentAtColumn);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["$n:IDENTIFIER"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "n"
+        \\open = "{"
+        \\close = "}"
+    , error.DuplicateExtentField);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.count]]
+        \\field = "args"
+        \\open = "("
+        \\close = ")"
+        \\separator = ","
+        \\
+        \\[[patterns.extent]]
+        \\field = "args"
+        \\open = "{"
+        \\close = "}"
+    , error.DuplicateExtentField);
+
+    try expectGrammarError(
+        \\[[patterns]]
+        \\type = "t"
+        \\sequence = ["identifier"]
+        \\
+        \\[[patterns.extent]]
+        \\field = "a"
+        \\open = "{"
+        \\close = "}"
+        \\
+        \\[[patterns.extent]]
+        \\field = "b"
+        \\terminator = "."
+    , error.TooManyExtentTables);
+}
+
+// Feature: region-extent, Property 12: Malformed extent tables are rejected at
+// load time
+test "property: malformed extent tables are rejected at load time" {
+    const bad_tables = [_][]const u8{
+        "open = \"{\"\nclose = \"}\"\nterminator = \".\"",
+        "field = \"x\"",
+        "field = \"x\"\nopen = \"{\"",
+        "field = \"\"\nopen = \"{\"\nclose = \"}\"",
+        "field = \"x\"\nterminator = \"\"",
+        "field = \"x\"\nopen = \"{\"\nclose = \"}\"\nat_column = 0",
+        "field = \"x\"\nterminator = \".\"\nat_column = 70000",
+        "field = \"x\"\nterminator = \".\"\nat_column = -1",
+    };
+    const idx_gen = gen.intRange(u8, 0, bad_tables.len - 1);
+
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idx: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n\n[[patterns.extent]]\n{s}\n", .{bad_tables[idx]});
+            const result = parseGrammar(source, alloc);
+            if (result) |g| {
+                try testing.expect(g.patterns[0].extent == null);
+            } else |e| {
+                switch (e) {
+                    error.ExtentModeConflict,
+                    error.ExtentNoMode,
+                    error.ExtentIncompleteBalanced,
+                    error.InvalidExtentField,
+                    error.InvalidExtentDelimiter,
+                    error.ExtentAtColumnWithoutTerminator,
+                    error.InvalidExtentAtColumn,
+                    error.DuplicateExtentField,
+                    => {},
+                    else => return e,
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: region-extent, Property 13: Extent values are grammar-driven (round-
+// trip half)
+test "property: extent tables round-trip unchanged" {
+    const text_gen = gen.string(.{ .min_len = 1, .max_len = 4, .charset = .alphanumeric });
+    try minish.check(testing.allocator, text_gen, struct {
+        fn prop(tok: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try std.fmt.allocPrint(alloc, "[[patterns]]\ntype = \"t\"\nsequence = [\"identifier\"]\n\n[[patterns.extent]]\nfield = \"n\"\nopen = \"{s}\"\nclose = \"{s}\"\n", .{ tok, tok });
+            const grammar = try parseGrammar(source, alloc);
+            const formatted = try formatGrammar(grammar, alloc);
+            const re = try parseGrammar(formatted, alloc);
+            const a = grammar.patterns[0].extent.?;
+            const b = re.patterns[0].extent.?;
+            try testing.expectEqualStrings(a.field, b.field);
+            try testing.expect(a.mode == .balanced and b.mode == .balanced);
+            try testing.expectEqualStrings(a.mode.balanced.open, b.mode.balanced.open);
+            try testing.expectEqualStrings(a.mode.balanced.close, b.mode.balanced.close);
         }
     }.prop, .{ .num_runs = 100 });
 }

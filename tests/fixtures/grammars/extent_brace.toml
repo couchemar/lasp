@@ -1,0 +1,8 @@
+[[patterns]]
+type = "function"
+sequence = ["identifier", "$n:IDENTIFIER", "("]
+
+[[patterns.extent]]
+field = "body"
+open = "{"
+close = "}"

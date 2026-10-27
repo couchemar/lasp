@@ -1,0 +1,4 @@
+function foo(a) {
+  if (x) { y(); }
+}
+function bar() {}

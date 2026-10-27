@@ -481,7 +481,24 @@ close = ")"
 separator = ","
 ```
 
-Counts depth-1 `separator` tokens inside the first balanced `open`…`close` pair after the match and emits `field` as an **integer** (JSON bare number, queryable with numeric conditions like `[args>1]`, and rendered first by `--names-only`). Validation: four required non-empty 1–8-byte strings, ≤16 tables, no field collisions with captures/earlier counts.
+
+### Region extent (`[[patterns.extent]]`)
+Declares where a matched construct's region ends; the engine emits that byte offset as an author-named integer field:
+```toml
+[[patterns]]
+type = "function"
+sequence = ["identifier", "$n:IDENTIFIER", "("]
+
+[[patterns.extent]]
+field = "body"
+open = "{"
+close = "}"
+```
+- **Balanced mode** (`open` + `close`): depth-balanced forward scan to the matching close delimiter; extent = that close token's end. Unclosed, or no `open` at/after the match, ⇒ EOF. `open == close` ⇒ no nesting (first occurrence opens, next closes).
+- **Terminator mode** (`terminator`, optional `at_column`): extent = end of the first token byte-equal to `terminator`, restricted to 0-based `at_column` when supplied; none found ⇒ EOF.
+- Output: bare JSON integer (never quoted), queryable with numeric conditions (`[body>100]`), rendered first by `--names-only` when no capture precedes it; `block_end` stays `null` (extent is the single region-end answer).
+- Validation: mode conflict / missing mode / half-balanced / `field` empty or >64 bytes / delimiter empty or >8 bytes / `at_column` without terminator or outside 0–65535 / field collision with captures·counts / >1 table per pattern — each a load-time grammar error.
+- No extent table ⇒ byte-identical output.
 
 ### Prior (per-pattern confidence multiplier)
 

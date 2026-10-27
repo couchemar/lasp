@@ -333,6 +333,23 @@ sequence = ["Config:IDENTIFIER", ".", "$method:IDENTIFIER", "("]
 ```
 This matches only when the identifier text is exactly `"Config"`. Unlike keyword literals, this matches `.identifier` tokens — useful for names that aren't language keywords.
 
+### Region extent (`[[patterns.extent]]`)
+Declares where a matched construct's region ends; the engine emits that byte offset as an author-named integer field:
+```toml
+[[patterns]]
+type = "function"
+sequence = ["identifier", "$n:IDENTIFIER", "("]
+
+[[patterns.extent]]
+field = "body"
+open = "{"
+close = "}"
+```
+- **Balanced mode** (`open` + `close`): depth-balanced forward scan to the matching close delimiter; extent = that close token's end. Unclosed or missing open ⇒ EOF (source length). `open == close` recognizes no nesting (first occurrence opens, next closes).
+- **Terminator mode** (`terminator`, optional `at_column`): extent = end of the first token byte-equal to `terminator` (at `at_column`, a 0-based column, when supplied); none found ⇒ EOF.
+- Validated at load time (extent can't combine modes; `field` 1–64 bytes; delimiters 1–8 bytes; `at_column` integer 0–65535 and terminator-only; field must not collide with captures/count fields; at most one table per pattern).
+- The extent renders as a bare JSON number and answers numeric queries (`[body>100]`); `block_end` is intentionally left `null` — the extent field is the single "where does this construct end" answer. No extent table ⇒ byte-identical output.
+
 ### Prior (per-pattern confidence multiplier)
 An optional `prior` key on a `[[patterns]]` entry scales that pattern's evidence confidence: `final = clamp(evidence × prior, 0, 1)`, applied before the 0.3 filter and before competing-candidate selection. Range `(0.0, 2.0]`, default `1.0` (exact no-op). Below 1.0 demotes an interpretation (mild demotion keeps it visible at reduced confidence; strong demotion can drop it below the 0.3 filter); above 1.0 boosts toward — never past — 1.0. Use it to disambiguate identical-sequence interpretations (e.g. a column-0 `function` at `prior = 0.9` vs `call` at `0.5`) without hard blacklists.
 
