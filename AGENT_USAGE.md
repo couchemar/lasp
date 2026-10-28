@@ -47,6 +47,14 @@ When `"-"` is the target path, LASP reads all bytes from stdin until EOF and pro
 .bin/lasp parse <file> -g <grammar.toml>
 ```
 
+When `-g` is omitted, grammars load from `.lasp/grammars` in the current
+directory (the default grammar source): every grammar whose
+`[language] extensions` suffix-match the target basename runs — one match
+behaves exactly like explicit `-g`; several matches emit one
+`{ "file", "grammar", "events" }` entry per matching grammar (sorted by grammar
+filename); zero matches fall back to raw-token output. `--names-only` with
+several matches is an error. Stdin (`-`) never uses the default.
+
 Returns structural events with captures, confidence scores, and position info:
 
 ```json
@@ -76,8 +84,9 @@ Behavior:
   `.bin/lasp parse <file> -g <grammar>` emits for that file.
 - `--node <type>` filters each entry's `events` (empty array when nothing
   matches). `--names-only` is not wired in dir mode (deferred).
-- No `--grammar-dir` ⇒ no grammars ⇒ every file matches nothing ⇒ `[]` with
-  exit zero.
+- No `--grammar-dir` ⇒ the default `.lasp/grammars` is used when present (same
+  loader, order, and behavior); with no default dir either, every file matches
+  nothing ⇒ `[]` with exit zero.
 - Grammars are loaded in sorted filename order; a malformed grammar aborts with
   the usual grammar error message, naming the offending grammar path.
 
@@ -208,7 +217,11 @@ Help takes precedence over other flags: `.bin/lasp --help --version` shows help,
 
 ## Structural Query (`lasp query`)
 
-Query events using CSS-selector-inspired syntax. Requires a grammar (`-g`).
+Query events using CSS-selector-inspired syntax. Requires a grammar (`-g`), or a
+default in `.lasp/grammars` whose `[language] extensions` suffix-match the file
+(one match behaves exactly like explicit `-g`; several matches emit one
+`{ "file", "grammar", "events" }` entry per matching grammar; zero matches or an
+absent default dir keep the `requires --grammar/-g` error).
 
 ### Syntax
 

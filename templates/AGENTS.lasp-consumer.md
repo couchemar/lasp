@@ -31,7 +31,7 @@ Store everything LASP-related under a `.lasp/` directory at the **project root**
  └─ ...
 ```
 
-- **Grammars**: `.lasp/grammars/<language>.toml`. Author or refine these as you encounter new languages or DSLs in the project.
+- **Grammars**: `.lasp/grammars/<language>.toml`. Author or refine these as you encounter new languages or DSLs in the project. Because this directory is the default grammar source, `-g`/`--grammar-dir` may be omitted: `lasp parse <file>` runs every grammar whose `[language] extensions` suffix-match the file (several matches → one `{file, grammar, events}` entry each; none → raw tokens), and `lasp parse-dir <dir>` behaves as if `--grammar-dir .lasp/grammars` were passed.
 - **Feedback**: `.lasp/feedbacks/<YYYY-MM-DD>.md`. Record false positives, false negatives, wrong token kinds, or missing features so the grammar (or LASP itself) can be improved.
 
 Create the directories if they do not exist:
