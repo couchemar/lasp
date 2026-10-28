@@ -131,6 +131,15 @@ lasp parse-dir <directory> --grammar-dir .lasp/grammars/
 ```
 Parses all files in a directory using grammars from the specified directory. Useful for batch analysis of an entire codebase.
 
+A grammar's `[language] extensions` list decides which files it matches
+(suffix match on the basename): `extensions = [".erl"]` matches `foo.erl`,
+`sub/bar.erl`, not `foo.py`. Matching is recursive over subdirectories. Each
+matching `(file, grammar)` pair emits one `{ "file", "grammar", "events" }`
+object in a single JSON array; files matched by several grammars appear once
+per grammar, unmatched files are skipped silently, and `--node <type>` filters
+each entry's events. Without `--grammar-dir` the output is `[]` with exit
+zero — dir mode never reads its target as a single file.
+
 ### Help
 ```bash
 lasp help          # General usage help
@@ -151,6 +160,16 @@ lasp --version   # also: lasp -V  or  lasp version
 ## Writing a grammar
 
 Grammars are TOML files in `.lasp/grammars/`. No recompilation is needed — edit and re-run.
+
+Add `extensions` to `[language]` so `parse-dir` matches your files:
+
+```toml
+[language]
+name = "python"
+extensions = [".py"]
+```
+
+Then list patterns later:
 
 ```toml
 [language]

@@ -1,0 +1,7 @@
+[language]
+name = "python"
+extensions = [".py"]
+
+[[patterns]]
+type = "function"
+sequence = ["identifier", "(", ")"]

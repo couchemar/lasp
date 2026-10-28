@@ -1,0 +1,7 @@
+[language]
+name = "erlang"
+extensions = [".erl"]
+
+[[patterns]]
+type = "function"
+sequence = ["identifier", "("]

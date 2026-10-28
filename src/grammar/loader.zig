@@ -22,6 +22,10 @@ pub const Grammar = struct {
     weights: EvidenceWeights = .{},
     comments: CommentConfig = .{},
     tokens: ?tokenizer.KindVocabulary = null,
+    /// File extensions this grammar applies to in `parse-dir` mode. Empty
+    /// means the grammar matches no files (absent `[language]` / absent
+    /// `extensions` / `extensions = []` all yield the empty slice).
+    extensions: []const []const u8 = &.{},
 };
 
 pub const KeywordCategory = struct {
@@ -182,6 +186,7 @@ pub const GrammarError = error{
     ExtentAtColumnWithoutTerminator,
     InvalidExtentAtColumn,
     TooManyExtentTables,
+    InvalidExtensionsList,
 };
 
 const delimiter_chars = "(){}[]";
@@ -507,13 +512,29 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
     const root = doc.root;
 
     // --- [language] (optional) ---
-    const language_name: ?[]const u8 = if (root.get("language")) |lang_table| blk: {
-        if (lang_table.get("name")) |name_val| {
+    const lang_table = root.get("language");
+    const language_name: ?[]const u8 = if (lang_table) |lt| blk: {
+        if (lt.get("name")) |name_val| {
             break :blk try allocator.dupe(u8, name_val.string);
         }
         break :blk null;
     } else null;
 
+    const extensions = blk: {
+        if (lang_table) |lt| {
+            if (lt.get("extensions")) |ext_val| {
+                if (ext_val.* != .array) return error.InvalidExtensionsList;
+                var exts: std.ArrayList([]const u8) = .empty;
+                for (ext_val.array.items.items) |item| {
+                    if (item != .string) return error.InvalidExtensionsList;
+                    if (item.string.len == 0) return error.InvalidExtensionsList;
+                    try exts.append(allocator, try allocator.dupe(u8, item.string));
+                }
+                break :blk try exts.toOwnedSlice(allocator);
+            }
+        }
+        break :blk &.{};
+    };
     // --- [keywords] (optional) ---
     var categories: std.ArrayList(KeywordCategory) = .empty;
     var all_keywords: std.ArrayList([]const u8) = .empty;
@@ -825,6 +846,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         },
         .comments = comments,
         .tokens = tokens_vocab,
+        .extensions = extensions,
     };
 }
 
@@ -838,7 +860,18 @@ pub fn formatGrammar(grammar: Grammar, allocator: std.mem.Allocator) ![]const u8
     if (grammar.language_name) |name| {
         try w.writeAll("[language]\nname = \"");
         try w.writeAll(name);
-        try w.writeAll("\"\n\n");
+        try w.writeAll("\"\n");
+        if (grammar.extensions.len > 0) {
+            try w.writeAll("extensions = [");
+            for (grammar.extensions, 0..) |ext, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll("\"");
+                try w.writeAll(ext);
+                try w.writeAll("\"");
+            }
+            try w.writeAll("]\n");
+        }
+        try w.writeAll("\n");
     }
 
     // [keywords]
@@ -3258,6 +3291,128 @@ test "parseGrammar: invalid line type returns InvalidCommentLineType" {
     defer arena.deinit();
     const result = parseGrammar(source, arena.allocator());
     try testing.expectError(error.InvalidCommentLineType, result);
+}
+test "parseGrammar: [language] extensions parses into Grammar.extensions" {
+    const source =
+        \\[language]
+        \\name = "erlang"
+        \\extensions = [".erl", ".escript"]
+        \\
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), grammar.extensions.len);
+    try testing.expectEqualStrings(".erl", grammar.extensions[0]);
+    try testing.expectEqualStrings(".escript", grammar.extensions[1]);
+}
+
+test "parseGrammar: absent or empty extensions yield empty slice" {
+    // No [language] table at all.
+    const no_language =
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+    // [language] present, extensions key absent.
+    const no_key =
+        \\[language]
+        \\name = "x"
+        \\
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+    // Explicit empty array.
+    const empty_array =
+        \\[language]
+        \\name = "x"
+        \\extensions = []
+        \\
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const g1 = try parseGrammar(no_language, arena.allocator());
+    const g2 = try parseGrammar(no_key, arena.allocator());
+    const g3 = try parseGrammar(empty_array, arena.allocator());
+    try testing.expectEqual(@as(usize, 0), g1.extensions.len);
+    try testing.expectEqual(@as(usize, 0), g2.extensions.len);
+    try testing.expectEqual(@as(usize, 0), g3.extensions.len);
+}
+
+test "parseGrammar: invalid extensions return InvalidExtensionsList" {
+    const non_array =
+        \\[language]
+        \\name = "x"
+        \\extensions = ".erl"
+        \\
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+    const non_string =
+        \\[language]
+        \\name = "x"
+        \\extensions = [123]
+        \\
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+    const empty_string =
+        \\[language]
+        \\name = "x"
+        \\extensions = [""]
+        \\
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.InvalidExtensionsList, parseGrammar(non_array, arena.allocator()));
+    try testing.expectError(error.InvalidExtensionsList, parseGrammar(non_string, arena.allocator()));
+    try testing.expectError(error.InvalidExtensionsList, parseGrammar(empty_string, arena.allocator()));
+}
+
+test "formatGrammar: emits extensions under [language] and round-trips" {
+    const source =
+        \\[language]
+        \\name = "erlang"
+        \\extensions = [".erl", ".escript"]
+        \\
+        \\[[patterns]]
+        \\type = "function"
+        \\sequence = ["fn", "$name:IDENTIFIER", "("]
+        \\
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const grammar = try parseGrammar(source, arena.allocator());
+    const formatted = try formatGrammar(grammar, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, formatted, "extensions = [\".erl\", \".escript\"]") != null);
+    const reparsed = try parseGrammar(formatted, arena.allocator());
+    try testing.expectEqual(@as(usize, 2), reparsed.extensions.len);
+    try testing.expectEqualStrings(".erl", reparsed.extensions[0]);
+    try testing.expectEqualStrings(".escript", reparsed.extensions[1]);
 }
 
 test "parseGrammar: invalid block type returns InvalidCommentBlockType" {

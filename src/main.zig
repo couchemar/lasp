@@ -115,104 +115,170 @@ fn run(
         return;
     }
 
-    // 6. Read source file or stdin
-    const source = blk: {
-        if (std.mem.eql(u8, parsed.target_path, "-")) {
-            var stdin_buffer: [4096]u8 = undefined;
-            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
-            break :blk try stdin_reader.interface.allocRemaining(allocator, .unlimited);
-        } else {
-            break :blk readSourceFile(io, allocator, parsed.target_path) catch {
-                std.process.fatal("failed to read file: {s}", .{parsed.target_path});
-            };
-        }
-    };
-
-    // 7. Dispatch based on command
+    // 7. Dispatch based on command (source reads live inside the arms that
+    // need them: query and single-file parse; parse-dir never reads its target
+    // path as a file).
     switch (parsed.command) {
         .query => {
-            // Query command always requires grammar
-            const gp = parsed.grammar_path orelse {
-                std.process.fatal("error: query command requires --grammar/-g flag", .{});
-            };
-
-            // Parse grammar, compile automaton, tokenize, run engine
-            const grammar_source = readSourceFile(io, allocator, gp) catch {
-                std.process.fatal("failed to read grammar file: {s}", .{gp});
-            };
-            const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
-                const msg: []const u8 = switch (err) {
-                    error.InvalidToml => "invalid TOML syntax in grammar file",
-                    error.MissingPatterns => "grammar file missing required [[patterns]] section",
-                    error.EmptyPatternSequence => "pattern has empty sequence",
-                    error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
-                    error.InvalidPositionValue => "invalid position value, expected 'start'",
-                    error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
-                    error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
-                    error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
-                    error.InvalidConstraintType => "invalid constraint type",
-                    error.InvalidConstraintDepth => "invalid constraint depth",
-                    error.InvalidConstraintField => "invalid constraint field",
-                    error.InvalidConstraintValues => "invalid constraint values",
-                    error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
-                    error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
-                    error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
-                    error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
-                    error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
-                    error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
-                    error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
-                    error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
-                    error.DuplicateKindName => "error: [tokens] duplicate kind name",
-                    error.EmptyKindName => "error: [tokens] kind name must not be empty",
-                    error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
-                    error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
-                    error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
-                    error.OutOfMemory => "out of memory",
-                    else => "unknown grammar error",
-                };
-                std.process.fatal("error: {s}: {s}", .{ msg, gp });
-            };
-            const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-            const tokens = if (grammar.tokens) |vocab|
-                try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
+            const resolved_default = if (parsed.grammar_path == null)
+                try resolveDefaultGrammars(io, allocator, parsed.target_path)
             else
-                try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
-            const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, parsed.resemble, false, allocator);
+                null;
 
-            // Parse selector string into QueryFilter
-            const selector = parsed.query_selector orelse {
-                std.process.fatal("error: query command requires a selector string", .{});
-            };
-            const filter = query_parser.parse(selector, allocator) catch |err| {
-                const msg: []const u8 = switch (err) {
-                    error.EmptySelector => "error: empty selector string",
-                    error.UnclosedBracket => "error: unclosed bracket in selector",
-                    error.MissingFieldName => "error: missing field name in attribute condition",
-                    error.MissingOperator => "error: missing or invalid operator in attribute condition",
-                    error.MissingValue => "error: missing value in attribute condition",
-                    error.UnclosedQuote => "error: unclosed quote in attribute value",
-                    error.InvalidOperator => "error: invalid operator, expected '=', '!=', or '>'",
-                    error.InvalidNumericValue => "error: invalid numeric value for '>' operator",
-                    error.UnexpectedCharacter => "error: unexpected character in selector",
-                    error.OutOfMemory => "error: out of memory",
+            if (parsed.grammar_path) |gp| {
+                // Source read (moved from the shared step-6): stdin or file.
+                const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
+                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
                 };
-                std.process.fatal("{s}", .{msg});
-            };
 
-            // Evaluate filter against structural events
-            const filtered = try query_evaluator.evaluate(structural_events, filter, allocator);
+                // Parse grammar, compile automaton, tokenize, run engine
+                const grammar_source = readSourceFile(io, allocator, gp) catch {
+                    std.process.fatal("failed to read grammar file: {s}", .{gp});
+                };
+                const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
+                    const msg: []const u8 = switch (err) {
+                        error.InvalidToml => "invalid TOML syntax in grammar file",
+                        error.MissingPatterns => "grammar file missing required [[patterns]] section",
+                        error.EmptyPatternSequence => "pattern has empty sequence",
+                        error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
+                        error.InvalidPositionValue => "invalid position value, expected 'start'",
+                        error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+                        error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
+                        error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
+                        error.InvalidConstraintType => "invalid constraint type",
+                        error.InvalidConstraintDepth => "invalid constraint depth",
+                        error.InvalidConstraintField => "invalid constraint field",
+                        error.InvalidConstraintValues => "invalid constraint values",
+                        error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
+                        error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
+                        error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
+                        error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
+                        error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
+                        error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
+                        error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
+                        error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
+                        error.DuplicateKindName => "error: [tokens] duplicate kind name",
+                        error.EmptyKindName => "error: [tokens] kind name must not be empty",
+                        error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
+                        error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
+                        error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
+                        error.OutOfMemory => "out of memory",
+                        else => "unknown grammar error",
+                    };
+                    std.process.fatal("error: {s}: {s}", .{ msg, gp });
+                };
+                const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
+                const tokens = if (grammar.tokens) |vocab|
+                    try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
+                else
+                    try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
+                const structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, parsed.resemble, false, allocator);
 
-            // Output: names-only or JSON
-            if (parsed.names_only) {
-                for (filtered) |event| {
-                    try writeNamesOnlyLine(stdout, event);
+                // Parse selector string into QueryFilter
+                const selector = parsed.query_selector orelse {
+                    std.process.fatal("error: query command requires a selector string", .{});
+                };
+                const filter = query_parser.parse(selector, allocator) catch |err| {
+                    const msg: []const u8 = switch (err) {
+                        error.EmptySelector => "error: empty selector string",
+                        error.UnclosedBracket => "error: unclosed bracket in selector",
+                        error.MissingFieldName => "error: missing field name in attribute condition",
+                        error.MissingOperator => "error: missing or invalid operator in attribute condition",
+                        error.MissingValue => "error: missing value in attribute condition",
+                        error.UnclosedQuote => "error: unclosed quote in attribute value",
+                        error.InvalidOperator => "error: invalid operator, expected '=', '!=', or '>'",
+                        error.InvalidNumericValue => "error: invalid numeric value for '>' operator",
+                        error.UnexpectedCharacter => "error: unexpected character in selector",
+                        error.OutOfMemory => "error: out of memory",
+                    };
+                    std.process.fatal("{s}", .{msg});
+                };
+
+                // Evaluate filter against structural events
+                const filtered = try query_evaluator.evaluate(structural_events, filter, allocator);
+
+                // Output: names-only or JSON
+                if (parsed.names_only) {
+                    for (filtered) |event| {
+                        try writeNamesOnlyLine(stdout, event);
+                    }
+                } else {
+                    try json.serializeEvents(filtered, stdout);
                 }
             } else {
-                try json.serializeEvents(filtered, stdout);
+                // Default grammar resolution (nullable: absent dir or stdin).
+                const resolved = resolved_default orelse {
+                    std.process.fatal("error: query command requires --grammar/-g flag", .{});
+                };
+                if (resolved.len == 0) {
+                    std.process.fatal("error: query command requires --grammar/-g flag", .{});
+                }
+
+                const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
+                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                };
+
+                const selector = parsed.query_selector orelse {
+                    std.process.fatal("error: query command requires a selector string", .{});
+                };
+                const filter = query_parser.parse(selector, allocator) catch |err| {
+                    const msg: []const u8 = switch (err) {
+                        error.EmptySelector => "error: empty selector string",
+                        error.UnclosedBracket => "error: unclosed bracket in selector",
+                        error.MissingFieldName => "error: missing field name in attribute condition",
+                        error.MissingOperator => "error: missing or invalid operator in attribute condition",
+                        error.MissingValue => "error: missing value in attribute condition",
+                        error.UnclosedQuote => "error: unclosed quote in attribute value",
+                        error.InvalidOperator => "error: invalid operator, expected '=', '!=', or '>'",
+                        error.InvalidNumericValue => "error: invalid numeric value for '>' operator",
+                        error.UnexpectedCharacter => "error: unexpected character in selector",
+                        error.OutOfMemory => "error: out of memory",
+                    };
+                    std.process.fatal("{s}", .{msg});
+                };
+
+                if (resolved.len == 1) {
+                    // Single match: byte-identical to explicit -g.
+                    const lg = resolved[0];
+                    const structural_events = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, null, false, false);
+                    const filtered = try query_evaluator.evaluate(structural_events, filter, allocator);
+                    if (parsed.names_only) {
+                        for (filtered) |event| {
+                            try writeNamesOnlyLine(stdout, event);
+                        }
+                    } else {
+                        try json.serializeEvents(filtered, stdout);
+                    }
+                } else {
+                    // Multi-grammar default: one array entry per matching grammar.
+                    if (parsed.names_only) {
+                        std.process.fatal("error: --names-only requires a single grammar (pass -g/--grammar)", .{});
+                    }
+                    var entries: std.ArrayList(json.DirResult) = .empty;
+                    for (resolved) |lg| {
+                        const structural_events = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, null, false, false);
+                        const filtered = try query_evaluator.evaluate(structural_events, filter, allocator);
+                        try entries.append(allocator, .{
+                            .file = parsed.target_path,
+                            .grammar = lg.name,
+                            .events = filtered,
+                        });
+                    }
+                    try json.serializeDirResults(entries.items, false, stdout);
+                }
             }
         },
-        .parse, .parse_dir => {
+        .parse => {
+            const resolved_default = if (parsed.grammar_path == null)
+                try resolveDefaultGrammars(io, allocator, parsed.target_path)
+            else
+                null;
+
             if (parsed.grammar_path) |gp| {
+                // Source read (moved from the shared step-6): stdin or file.
+                const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
+                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                };
                 // Phase 2: TOML grammar → structural events
                 const grammar_source = readSourceFile(io, allocator, gp) catch {
                     std.process.fatal("failed to read grammar file: {s}", .{gp});
@@ -259,32 +325,14 @@ fn run(
                         error.ExtentAtColumnWithoutTerminator => "error: [[patterns.extent]] at_column requires terminator mode",
                         error.InvalidExtentAtColumn => "error: [[patterns.extent]] at_column must be an integer in 0..65535",
                         error.TooManyExtentTables => "error: at most one [[patterns.extent]] table per pattern",
+                        error.InvalidExtensionsList => "error: [language] extensions must be an array of non-empty strings",
                         error.OutOfMemory => "out of memory",
                         else => "unknown grammar error",
                     };
                     std.process.fatal("error: {s}: {s}", .{ msg, gp });
                 };
-                const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-                const tokens = if (grammar.tokens) |vocab|
-                    try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
-                else
-                    try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
-                // --resemble implies collecting alternatives so resemblance
-                // candidates are surfaced through the alternatives path.
                 const collect_alternatives = parsed.alternatives or parsed.resemble;
-                var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, parsed.resemble, collect_alternatives, allocator);
-
-                // Apply node filter if specified
-                if (parsed.node_filter) |filter| {
-                    var filtered_events: std.ArrayList(events.StructuralEvent) = .empty;
-                    defer filtered_events.deinit(allocator);
-                    for (structural_events) |event| {
-                        if (std.ascii.eqlIgnoreCase(event.type_name, filter)) {
-                            try filtered_events.append(allocator, event);
-                        }
-                    }
-                    structural_events = try filtered_events.toOwnedSlice(allocator);
-                }
+                const structural_events = try parseOneFile(io, allocator, grammar, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
 
                 // Output dispatch: names-only or JSON
                 if (parsed.names_only) {
@@ -294,11 +342,114 @@ fn run(
                 } else {
                     try json.serializeEventsWithAlternatives(structural_events, collect_alternatives, stdout);
                 }
+            } else if (resolved_default) |resolved| {
+                const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
+                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                };
+                if (resolved.len == 0) {
+                    // Default dir present but no grammar matches: raw token output.
+                    const tokens = try tokenizer.tokenize(source, null, .{}, allocator);
+                    try json.serializeTokens(tokens, stdout);
+                } else if (resolved.len == 1) {
+                    // Single match: byte-identical to explicit -g.
+                    const lg = resolved[0];
+                    const structural_events = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
+                    if (parsed.names_only) {
+                        for (structural_events) |event| {
+                            try writeNamesOnlyLine(stdout, event);
+                        }
+                    } else {
+                        try json.serializeEventsWithAlternatives(structural_events, parsed.alternatives or parsed.resemble, stdout);
+                    }
+                } else {
+                    // Multi-grammar default: one array entry per matching grammar
+                    // (user choice), reusing the existing DirResult schema.
+                    if (parsed.names_only) {
+                        std.process.fatal("error: --names-only requires a single grammar (pass -g/--grammar)", .{});
+                    }
+                    const collect_alternatives = parsed.alternatives or parsed.resemble;
+                    var entries: std.ArrayList(json.DirResult) = .empty;
+                    for (resolved) |lg| {
+                        const events_list = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
+                        try entries.append(allocator, .{
+                            .file = parsed.target_path,
+                            .grammar = lg.name,
+                            .events = events_list,
+                        });
+                    }
+                    try json.serializeDirResults(entries.items, collect_alternatives, stdout);
+                }
             } else {
                 // No grammar: raw token output
+                const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
+                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                };
                 const tokens = try tokenizer.tokenize(source, null, .{}, allocator);
                 try json.serializeTokens(tokens, stdout);
             }
+        },
+        .parse_dir => {
+            // A grammar loaded from --grammar-dir, compiled once and reused for
+            // every file it matches.
+            var loaded: []LoadedGrammar = &.{};
+            if (parsed.grammar_dir) |gdir| {
+                loaded = loadGrammarsFromDir(io, allocator, gdir) catch {
+                    std.process.fatal("grammar directory not found: {s}", .{gdir});
+                };
+            } else {
+                // Default grammar dir: absent is silent (empty → [] output).
+                loaded = loadGrammarsFromDir(io, allocator, default_grammar_dir) catch |e| switch (e) {
+                    error.GrammarDirNotFound => &.{},
+                    else => return e,
+                };
+            }
+
+            // Open the target directory for walking. A non-directory or missing
+            // target is an error (Req 2.8).
+            var root = std.Io.Dir.cwd().openDir(io, parsed.target_path, .{ .iterate = true }) catch {
+                std.process.fatal("directory not found: {s}", .{parsed.target_path});
+            };
+            defer root.close(io);
+
+            const collect_alternatives = parsed.alternatives or parsed.resemble;
+            var entries: std.ArrayList(json.DirResult) = .empty;
+
+            var walker = root.walk(allocator) catch {
+                std.process.fatal("directory not found: {s}", .{parsed.target_path});
+            };
+            defer walker.deinit();
+            while (walker.next(io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                for (loaded) |lg| {
+                    if (lg.grammar.extensions.len == 0) continue;
+                    var matches = false;
+                    for (lg.grammar.extensions) |ext| {
+                        if (basenameMatchesExtension(entry.basename, ext)) {
+                            matches = true;
+                            break;
+                        }
+                    }
+                    if (!matches) continue;
+                    // Walker paths are relative to the walked root; read through
+                    // the target path so cwd-relative and absolute targets both
+                    // work (same readSourceFile as single-file mode).
+                    const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parsed.target_path, entry.path });
+                    const source = readSourceFile(io, allocator, full_path) catch {
+                        std.process.fatal("failed to read file: {s}", .{full_path});
+                    };
+                    const events_list = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
+                    // The walker reuses its path buffers on the next `next()`
+                    // call, so entries must own their strings.
+                    const file_copy = try allocator.dupe(u8, entry.path);
+                    try entries.append(allocator, .{
+                        .file = file_copy,
+                        .grammar = lg.name,
+                        .events = events_list,
+                    });
+                }
+            }
+
+            try json.serializeDirResults(entries.items, collect_alternatives, stdout);
         },
         .version => unreachable,
         .help => unreachable,
@@ -321,6 +472,71 @@ fn writeNamesOnlyLine(stdout: *std.Io.Writer, event: events.StructuralEvent) !vo
         try stdout.writeAll("\n");
     }
 }
+/// Shared "source + grammar → structural events" pipeline used by single-file
+/// `parse` and by `parse-dir` per matched (file, grammar) pair. Verbatim
+/// semantics of the former inline `.parse` grammar branch: compile, tokenize
+/// (vocab when the grammar declares `[tokens]`), `engine.parse`, then the
+/// `--node` filter loop.
+fn parseOneFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    grammar: grammar_loader.Grammar,
+    source: []const u8,
+    node_filter: ?[]const u8,
+    alternatives: bool,
+    resemble: bool,
+) ![]events.StructuralEvent {
+    const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
+    return parseWithAutomaton(io, allocator, grammar, automaton, source, node_filter, alternatives, resemble);
+}
+
+/// The `parseOneFile` body after automaton compilation; parse-dir reuses one
+/// compiled automaton across every file a grammar matches.
+fn parseWithAutomaton(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    grammar: grammar_loader.Grammar,
+    automaton: grammar_compiler.Automaton,
+    source: []const u8,
+    node_filter: ?[]const u8,
+    alternatives: bool,
+    resemble: bool,
+) ![]events.StructuralEvent {
+    _ = io;
+    const tokens = if (grammar.tokens) |vocab|
+        try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
+    else
+        try tokenizer.tokenize(source, grammar.keyword_table, grammar.comments, allocator);
+    // --resemble implies collecting alternatives so resemblance candidates are
+    // surfaced through the alternatives path.
+    const collect_alternatives = alternatives or resemble;
+    var structural_events = try engine.parse(automaton, tokens, source, grammar.patterns, grammar.tokens, grammar.blocks, grammar.weights, resemble, collect_alternatives, allocator);
+
+    // Apply node filter if specified
+    if (node_filter) |filter| {
+        var filtered_events: std.ArrayList(events.StructuralEvent) = .empty;
+        defer filtered_events.deinit(allocator);
+        for (structural_events) |event| {
+            if (std.ascii.eqlIgnoreCase(event.type_name, filter)) {
+                try filtered_events.append(allocator, event);
+            }
+        }
+        structural_events = try filtered_events.toOwnedSlice(allocator);
+    }
+    return structural_events;
+}
+/// Reads the target source: stdin when the path is `-`, else the file. Kept
+/// as a helper because the read moved out of the shared pre-dispatch step into
+/// the query and single-file parse arms (parse-dir never reads its target).
+fn readSourceOrStdin(io: std.Io, allocator: std.mem.Allocator, target_path: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, target_path, "-")) {
+        var stdin_buffer: [4096]u8 = undefined;
+        var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+        return try stdin_reader.interface.allocRemaining(allocator, .unlimited);
+    }
+    return readSourceFile(io, allocator, target_path);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
@@ -638,6 +854,809 @@ fn runLasp(allocator: std.mem.Allocator, args: []const []const u8) !struct { std
 
     const result = try std.process.run(allocator, std.testing.io, .{ .argv = argv.items });
     return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+}
+
+// --- parse-dir directory-walk tests (spec: parse-dir-directory-walk) ---
+// Task 1 (exploration) + Task 2 (preservation) land BEFORE the fix: Property 1
+// MUST fail on the unfixed binary (the directory-read abort), Property 2 MUST
+// pass (single-file baseline captured).
+
+fn writeFixtureFile(io: std.Io, path: []const u8, content: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.writeAll(content);
+    try w.interface.flush();
+    file.close(io);
+}
+
+/// Best-effort removal of a fixture directory tree (two passes: files, then
+/// directories — walk order is undefined).
+fn removeDirTree(allocator: std.mem.Allocator, io: std.Io, path: []const u8) void {
+    var root = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    defer root.close(io);
+
+    var walker = root.walk(allocator) catch return;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind == .file) root.deleteFile(io, entry.path) catch {};
+    }
+    var walker2 = root.walk(allocator) catch return;
+    defer walker2.deinit();
+    while (walker2.next(io) catch null) |entry| {
+        if (entry.kind == .directory) root.deleteDir(io, entry.path) catch {};
+    }
+    std.Io.Dir.cwd().deleteDir(io, path) catch {};
+}
+/// Suffix match test in `--grammar-dir` extension matching. The dot-less form
+/// (e.g. `erl`) is the broader documented suffix.
+fn basenameMatchesExtension(basename: []const u8, ext: []const u8) bool {
+    return std.mem.endsWith(u8, basename, ext);
+}
+
+const default_grammar_dir = ".lasp/grammars";
+
+const LoadedGrammar = struct {
+    name: []const u8,
+    grammar: grammar_loader.Grammar,
+    automaton: grammar_compiler.Automaton,
+};
+
+/// Loads every *.toml from gdir (sorted by filename), compiling each automaton
+/// once. Fatal (existing messages, naming the offending path) on read/parse
+/// failure; only a missing/not-a-directory gdir yields error.GrammarDirNotFound.
+fn loadGrammarsFromDir(io: std.Io, allocator: std.mem.Allocator, gdir: []const u8) ![]LoadedGrammar {
+    var handle = std.Io.Dir.cwd().openDir(io, gdir, .{ .iterate = true }) catch return error.GrammarDirNotFound;
+    defer handle.close(io);
+
+    // Deterministic order: sort the *.toml basenames.
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = handle.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".toml")) continue;
+        try names.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    var loaded: std.ArrayList(LoadedGrammar) = .empty;
+    for (names.items) |name| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ gdir, name });
+        const grammar_source = readSourceFile(io, allocator, path) catch {
+            std.process.fatal("failed to read grammar file: {s}", .{path});
+        };
+        const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
+            const msg: []const u8 = switch (err) {
+                error.InvalidToml => "invalid TOML syntax in grammar file",
+                error.MissingPatterns => "grammar file missing required [[patterns]] section",
+                error.EmptyPatternSequence => "pattern has empty sequence",
+                error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
+                error.InvalidPositionValue => "invalid position value, expected 'start'",
+                error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+                error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
+                error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
+                error.InvalidConstraintType => "invalid constraint type",
+                error.InvalidConstraintDepth => "invalid constraint depth",
+                error.InvalidConstraintField => "invalid constraint field",
+                error.InvalidConstraintValues => "invalid constraint values",
+                error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
+                error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
+                error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
+                error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
+                error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
+                error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
+                error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
+                error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
+                error.DuplicateKindName => "error: [tokens] duplicate kind name",
+                error.EmptyKindName => "error: [tokens] kind name must not be empty",
+                error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
+                error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
+                error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
+                error.InvalidCountTable => "error: [[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)",
+                error.TooManyCountTables => "error: too many [[patterns.count]] tables (max 16)",
+                error.DuplicateCountField => "error: [[patterns.count]] field duplicates a capture or earlier count field",
+                error.InvalidCaptureTable => "error: [[patterns.capture]] must declare a non-empty field and at least one of separator/suffix (1-8 bytes)",
+                error.UnknownCaptureField => "error: [[patterns.capture]] field is not a declared capture",
+                error.DuplicateCaptureField => "error: [[patterns.capture]] duplicate table for the same field",
+                error.ParenthesizedCaptureParam => "error: parenthesized capture parameters are removed; use [[patterns.capture]] tables",
+                error.ExtentModeConflict => "error: [[patterns.extent]] cannot combine terminator with open/close",
+                error.ExtentNoMode => "error: [[patterns.extent]] must declare balanced open/close or a terminator",
+                error.ExtentIncompleteBalanced => "error: [[patterns.extent]] balanced mode requires both open and close",
+                error.InvalidExtentField => "error: [[patterns.extent]] field must be 1-64 bytes",
+                error.InvalidExtentDelimiter => "error: [[patterns.extent]] open/close/terminator must be 1-8 bytes",
+                error.DuplicateExtentField => "error: [[patterns.extent]] field duplicates a capture or count field",
+                error.ExtentAtColumnWithoutTerminator => "error: [[patterns.extent]] at_column requires terminator mode",
+                error.InvalidExtentAtColumn => "error: [[patterns.extent]] at_column must be an integer in 0..65535",
+                error.TooManyExtentTables => "error: at most one [[patterns.extent]] table per pattern",
+                error.InvalidExtensionsList => "error: [language] extensions must be an array of non-empty strings",
+                error.OutOfMemory => "out of memory",
+                else => "unknown grammar error",
+            };
+            std.process.fatal("error: {s}: {s}", .{ msg, path });
+        };
+        try loaded.append(allocator, .{
+            .name = name,
+            .grammar = grammar,
+            .automaton = try grammar_compiler.compile(grammar.patterns, allocator),
+        });
+    }
+    return try loaded.toOwnedSlice(allocator);
+}
+
+/// Last path segment; posix separator only (targets are CLI paths).
+fn fileBasename(path: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+}
+
+/// Default grammar set for a single target file: all grammars from
+/// .lasp/grammars whose extensions suffix-match the target's basename.
+/// null when target is "-" (stdin, no basename) or the default dir is absent.
+fn resolveDefaultGrammars(io: std.Io, allocator: std.mem.Allocator, target_path: []const u8) !?[]LoadedGrammar {
+    if (std.mem.eql(u8, target_path, "-")) return null;
+    const loaded = loadGrammarsFromDir(io, allocator, default_grammar_dir) catch |e| switch (e) {
+        error.GrammarDirNotFound => return null,
+        else => return e,
+    };
+    var matches: std.ArrayList(LoadedGrammar) = .empty;
+    for (loaded) |lg| {
+        if (lg.grammar.extensions.len == 0) continue;
+        const base = fileBasename(target_path);
+        for (lg.grammar.extensions) |ext| {
+            if (basenameMatchesExtension(base, ext)) {
+                try matches.append(allocator, lg);
+                break;
+            }
+        }
+    }
+    return try matches.toOwnedSlice(allocator);
+}
+
+/// Creates a temp dir tree with a `.erl`, a `.py`, an unmatched `.txt`, a
+/// recursive `.erl` in a subdirectory, and a grammar dir where the Erlang
+/// grammar declares `.erl` and the Python grammar `.py`.
+const ParseDirFixture = struct {
+    tree: []const u8,
+    grammars: []const u8,
+};
+
+fn makeParseDirFixture(allocator: std.mem.Allocator) !ParseDirFixture {
+    const io = std.testing.io;
+    const tree = "test_parsedir_tree";
+    const grammars = "test_parsedir_grammars";
+    removeDirTree(allocator, io, tree);
+    removeDirTree(allocator, io, grammars);
+
+    try std.Io.Dir.cwd().createDir(io, tree, .default_dir);
+    try std.Io.Dir.cwd().createDir(io, tree ++ "/sub", .default_dir);
+    try std.Io.Dir.cwd().createDir(io, grammars, .default_dir);
+
+    try writeFixtureFile(io, tree ++ "/a.erl", "foo() -> 1.\n");
+    try writeFixtureFile(io, tree ++ "/b.py", "bar()\n");
+    try writeFixtureFile(io, tree ++ "/notes.txt", "irrelevant\n");
+    try writeFixtureFile(io, tree ++ "/sub/c.erl", "baz() -> 2.\n");
+
+    const erlang = try std.fmt.allocPrint(allocator, "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n", .{});
+    const python = try std.fmt.allocPrint(allocator, "[language]\nname = \"python\"\nextensions = [\".py\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\", \")\"]\n", .{});
+    try writeFixtureFile(io, grammars ++ "/erlang.toml", erlang);
+    try writeFixtureFile(io, grammars ++ "/python.toml", python);
+    allocator.free(erlang);
+    allocator.free(python);
+
+    return .{ .tree = tree, .grammars = grammars };
+}
+
+/// Asserts the EXPECTED post-fix behavior for one parse-dir form:
+/// exit zero, valid JSON array, every entry's `file` is `.erl`/`.py`, the
+/// `.txt` appears in no entry, and no `failed to read file` on stderr.
+fn expectParseDirOk(result: anytype, allocator: std.mem.Allocator) !void {
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "failed to read file") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "notes.txt") == null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    for (parsed.value.array.items) |entry| {
+        const f = entry.object.get("file").?.string;
+        try std.testing.expect(
+            std.mem.endsWith(u8, f, ".erl") or std.mem.endsWith(u8, f, ".py"),
+        );
+        try std.testing.expect(entry.object.get("grammar").? == .string);
+        try std.testing.expect(entry.object.get("events").? == .array);
+        try std.testing.expect(std.mem.indexOf(u8, f, "notes.txt") == null);
+    }
+}
+
+// Feature: parse-dir-directory-walk, Property 1: parse-dir walks the tree and
+// parses matching files (bug condition). MUST FAIL on the unfixed code.
+test "parse-dir: walks tree, parses matching files, skips unmatched (P1)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeParseDirFixture(allocator);
+    defer {
+        removeDirTree(allocator, std.testing.io, fixture.tree);
+        removeDirTree(allocator, std.testing.io, fixture.grammars);
+    }
+    // The no-grammar-dir form below expects [] (Req 2.12); that only holds
+    // when no default .lasp/grammars exists (a LASP-owned convention dir).
+    removeDirTree(allocator, std.testing.io, ".lasp");
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_ptr = std.posix.system.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
+    const cwd = std.mem.sliceTo(cwd_ptr, 0);
+    const abs_tree = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, fixture.tree });
+    defer allocator.free(abs_tree);
+    const slash_tree = try std.fmt.allocPrint(allocator, "{s}/", .{fixture.tree});
+    defer allocator.free(slash_tree);
+
+    const forms = [_]struct { args: []const []const u8 }{
+        .{ .args = &.{ "parse-dir", fixture.tree, "--grammar-dir", fixture.grammars } },
+        .{ .args = &.{ "parse-dir", slash_tree, "--grammar-dir", fixture.grammars } },
+        .{ .args = &.{ "parse-dir", abs_tree, "--grammar-dir", fixture.grammars } },
+        .{ .args = &.{ "parse-dir", fixture.tree } },
+    };
+
+    for (forms, 0..) |form, i| {
+        const result = try runLasp(allocator, form.args);
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+        if (i == 3) {
+            // No --grammar-dir ⇒ no grammars ⇒ [] + exit zero (Req 2.12).
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value == .array);
+            try std.testing.expectEqual(@as(usize, 0), parsed.value.array.items.len);
+        } else {
+            try expectParseDirOk(result, allocator);
+        }
+    }
+}
+
+// Feature: parse-dir-directory-walk, Property 2: non-parse-dir behavior is
+// byte-identical (preservation baseline). Runs on the unfixed binary today and
+// must keep passing after the parseOneFile refactor and dispatch split.
+test "property: single-file parse/query is deterministic and well-formed (P2)" {
+    const tuple_gen = comptime gen.tuple2(
+        []const u8,
+        u8,
+        gen.string(.{ .min_len = 4, .max_len = 200, .charset = .custom, .custom_chars = "abcdefghijklmnopqrstuvwxyz0123456789(){}[];=+*/_ \n\t" }),
+        gen.intRange(u8, 0, 3),
+    );
+
+    try minish.check(std.testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, u8 }) !void {
+            const allocator = std.testing.allocator;
+            const src = vals[0];
+            const flag = vals[1];
+            const tmp_path = "test_parsedir_prop.tmp";
+            const io = std.testing.io;
+            const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+            var wbuf: [4096]u8 = undefined;
+            var writer = file.writer(io, &wbuf);
+            try writer.interface.writeAll(src);
+            try writer.interface.flush();
+            const args: []const []const u8 = switch (flag) {
+                0 => &.{ "parse", tmp_path },
+                1 => &.{ "parse", tmp_path, "-g", "examples/grammars/zig.toml" },
+                2 => &.{ "parse", tmp_path, "-g", "examples/grammars/zig.toml", "--node", "function", "--names-only" },
+                else => &.{ "query", "*", tmp_path, "-g", "examples/grammars/zig.toml" },
+            };
+
+            const r1 = try runLasp(allocator, args);
+            const r2 = try runLasp(allocator, args);
+            defer {
+                allocator.free(r1.stdout);
+                allocator.free(r1.stderr);
+            }
+
+            defer {
+                allocator.free(r2.stdout);
+                allocator.free(r2.stderr);
+            }
+
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r1.term);
+            // Determinism: repeated runs are byte-identical.
+            try std.testing.expectEqualStrings(r1.stdout, r2.stdout);
+            try std.testing.expectEqualStrings(r1.stderr, r2.stderr);
+            // Raw tokens and unfiltered JSON always emit; a filtered query may
+            // legitimately emit nothing when no node matches.
+            if (flag == 0 or flag == 1) try std.testing.expect(r1.stdout.len > 0);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+/// Recursive structural JSON equality used by the parse-dir union property.
+fn expectJsonValueEqual(a: std.json.Value, b: std.json.Value) !void {
+    switch (a) {
+        .null, .bool, .integer, .float => try std.testing.expectEqual(a, b),
+        .number_string => try std.testing.expectEqualStrings(a.number_string, b.number_string),
+        .string => try std.testing.expectEqualStrings(a.string, b.string),
+        .array => |aa| {
+            try std.testing.expect(b == .array);
+            try std.testing.expectEqual(aa.items.len, b.array.items.len);
+            for (aa.items, b.array.items) |x, y| try expectJsonValueEqual(x, y);
+        },
+        .object => |ao| {
+            try std.testing.expect(b == .object);
+            var it = ao.iterator();
+            while (it.next()) |e| {
+                const child = b.object.get(e.key_ptr.*) orelse return error.MissingJsonField;
+                try expectJsonValueEqual(e.value_ptr.*, child);
+            }
+            try std.testing.expectEqual(ao.count(), b.object.count());
+        },
+    }
+}
+
+// Feature: parse-dir-directory-walk, Property 3: parse-dir equals the
+// single-file per-grammar union — one entry per (file, grammar) pair for every
+// grammar whose declared extensions match, no entry for unmatched files.
+test "property: parse-dir equals single-file per-grammar union (P3)" {
+    const FilePool = enum { a_erl, b_py, notes_txt, sub_c_erl };
+    const list_gen = comptime gen.list(FilePool, gen.enumValue(FilePool), 1, 5);
+    try minish.check(std.testing.allocator, list_gen, struct {
+        fn prop(selected: []const FilePool) !void {
+            const allocator = std.testing.allocator;
+            const io = std.testing.io;
+            const tree = "test_parsedir_prop3_tree";
+            const grammars = "test_parsedir_prop3_grammars";
+            removeDirTree(allocator, io, tree);
+            removeDirTree(allocator, io, grammars);
+            defer {
+                removeDirTree(allocator, io, tree);
+                removeDirTree(allocator, io, grammars);
+            }
+            try std.Io.Dir.cwd().createDir(io, tree, .default_dir);
+            try std.Io.Dir.cwd().createDir(io, tree ++ "/sub", .default_dir);
+            try std.Io.Dir.cwd().createDir(io, grammars, .default_dir);
+
+            var seen = [_]bool{false} ** 4;
+            for (selected) |f| seen[@intFromEnum(f)] = true;
+            if (seen[@intFromEnum(FilePool.a_erl)])
+                try writeFixtureFile(io, tree ++ "/a.erl", "foo() -> 1.\n");
+            if (seen[@intFromEnum(FilePool.b_py)])
+                try writeFixtureFile(io, tree ++ "/b.py", "bar()\n");
+            if (seen[@intFromEnum(FilePool.notes_txt)])
+                try writeFixtureFile(io, tree ++ "/notes.txt", "irrelevant\n");
+            if (seen[@intFromEnum(FilePool.sub_c_erl)])
+                try writeFixtureFile(io, tree ++ "/sub/c.erl", "baz() -> 2.\n");
+
+            const erlang = "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n";
+            const erlang2 = "[language]\nname = \"erlang2\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n";
+            const python = "[language]\nname = \"python\"\nextensions = [\".py\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\", \")\"]\n";
+            try writeFixtureFile(io, grammars ++ "/erlang.toml", erlang);
+            try writeFixtureFile(io, grammars ++ "/erlang2.toml", erlang2);
+            try writeFixtureFile(io, grammars ++ "/python.toml", python);
+
+            const args = [_][]const u8{ "parse-dir", tree, "--grammar-dir", grammars };
+            const result = try runLasp(allocator, &args);
+            defer {
+                allocator.free(result.stdout);
+                allocator.free(result.stderr);
+            }
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+            defer parsed.deinit();
+            const arr = parsed.value.array;
+
+            var expected: usize = 0;
+            if (seen[@intFromEnum(FilePool.a_erl)]) expected += 2;
+            if (seen[@intFromEnum(FilePool.sub_c_erl)]) expected += 2;
+            if (seen[@intFromEnum(FilePool.b_py)]) expected += 1;
+            try std.testing.expectEqual(expected, arr.items.len);
+
+            for (arr.items) |entry| {
+                const file = entry.object.get("file").?.string;
+                const grammar = entry.object.get("grammar").?.string;
+                const gpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ grammars, grammar });
+                defer allocator.free(gpath);
+                const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tree, file });
+                defer allocator.free(fpath);
+                const sargs = [_][]const u8{ "parse", fpath, "-g", gpath };
+                const single = try runLasp(allocator, &sargs);
+                defer {
+                    allocator.free(single.stdout);
+                    allocator.free(single.stderr);
+                }
+                const single_parsed = try std.json.parseFromSlice(std.json.Value, allocator, single.stdout, .{});
+                defer single_parsed.deinit();
+                try expectJsonValueEqual(
+                    entry.object.get("events").?,
+                    single_parsed.value.object.get("events").?,
+                );
+            }
+        }
+    }.prop, .{ .num_runs = 50 });
+}
+
+// Feature: parse-dir-directory-walk, Property 4: directory and grammar errors
+// exit non-zero with descriptive stderr; the no-grammar-dir case exits zero
+// with `[]` and never touches the target as a file.
+test "property: directory and grammar errors exit non-zero (P4)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tree = "test_parsedir_prop4_tree";
+    const grammars = "test_parsedir_prop4_grammars";
+    const bad_grammars = "test_parsedir_prop4_bad_grammars";
+    removeDirTree(allocator, io, tree);
+    removeDirTree(allocator, io, grammars);
+    removeDirTree(allocator, io, bad_grammars);
+    defer {
+        removeDirTree(allocator, io, tree);
+        removeDirTree(allocator, io, grammars);
+        removeDirTree(allocator, io, bad_grammars);
+    }
+    // The no-grammar-dir case below (Req 2.12) expects [] — as with P1,
+    // only true without a default .lasp/grammars (a LASP-owned convention dir).
+    removeDirTree(allocator, io, ".lasp");
+    try std.Io.Dir.cwd().createDir(io, tree, .default_dir);
+    try std.Io.Dir.cwd().createDir(io, grammars, .default_dir);
+    try std.Io.Dir.cwd().createDir(io, bad_grammars, .default_dir);
+    try writeFixtureFile(io, tree ++ "/a.erl", "foo() -> 1.\n");
+    try writeFixtureFile(io, grammars ++ "/erlang.toml", "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n");
+    try writeFixtureFile(io, bad_grammars ++ "/broken.toml", "not valid toml [");
+
+    // Req 2.8: missing target directory → non-zero, descriptive stderr.
+    const r1 = try runLasp(allocator, &.{ "parse-dir", "test_parsedir_nope", "--grammar-dir", grammars });
+    defer {
+        allocator.free(r1.stdout);
+        allocator.free(r1.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(r1.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, r1.stderr, "directory not found") != null);
+
+    // Req 2.9: missing grammar dir → non-zero, descriptive stderr.
+    const r2 = try runLasp(allocator, &.{ "parse-dir", tree, "--grammar-dir", "test_parsedir_nope_grammars" });
+    defer {
+        allocator.free(r2.stdout);
+        allocator.free(r2.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(r2.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, r2.stderr, "grammar directory not found") != null);
+
+    // Req 2.10: malformed grammar names the offending path.
+    const r3 = try runLasp(allocator, &.{ "parse-dir", tree, "--grammar-dir", bad_grammars });
+    defer {
+        allocator.free(r3.stdout);
+        allocator.free(r3.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(r3.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, r3.stderr, "broken.toml") != null);
+
+    // Req 2.12: no --grammar-dir ⇒ [] + exit zero, never a file read.
+    const r4 = try runLasp(allocator, &.{ "parse-dir", tree });
+    defer {
+        allocator.free(r4.stdout);
+        allocator.free(r4.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r4.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r4.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.array.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, r4.stderr, "failed to read file") == null);
+}
+test "parse-dir: extension suffix match helper (P5)" {
+    try std.testing.expect(basenameMatchesExtension("foo.erl", ".erl"));
+    try std.testing.expect(!basenameMatchesExtension("foo.py", ".erl"));
+    // Dot-less form is the broader suffix.
+    try std.testing.expect(basenameMatchesExtension("file.cxx", "cxx"));
+    try std.testing.expect(!basenameMatchesExtension("file.cx", "cxx"));
+    // Whole-name suffix still matches.
+    try std.testing.expect(basenameMatchesExtension("notes", "notes"));
+    try std.testing.expect(!basenameMatchesExtension("notes.txt", "notes"));
+}
+// Feature: parse-dir-directory-walk, task 7.1: committed-fixture integration
+// against the freshly built binary.
+test "parse-dir (integration): committed fixtures, recursion, multi-grammar, --node, empty" {
+    const allocator = std.testing.allocator;
+    const dir = "tests/fixtures/dir_sample";
+    const io = std.testing.io;
+    const gdir = "tests/fixtures/grammars_dir";
+    const multi_gdir = "tests/fixtures/grammars_multi_dir";
+
+    // Happy path + recursion: a.erl, sub/c.erl, b.py matched; notes.txt skipped.
+    const happy = try runLasp(allocator, &.{ "parse-dir", dir, "--grammar-dir", gdir });
+    defer {
+        allocator.free(happy.stdout);
+        allocator.free(happy.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, happy.term);
+    const happy_parsed = try std.json.parseFromSlice(std.json.Value, allocator, happy.stdout, .{});
+    defer happy_parsed.deinit();
+    const happy_arr = happy_parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 3), happy_arr.items.len);
+    var count_erl: usize = 0;
+    var count_py: usize = 0;
+    for (happy_arr.items) |entry| {
+        const file = entry.object.get("file").?.string;
+        try std.testing.expect(std.mem.endsWith(u8, file, ".erl") or std.mem.endsWith(u8, file, ".py"));
+        if (std.mem.endsWith(u8, file, ".erl")) count_erl += 1;
+        if (std.mem.endsWith(u8, file, ".py")) count_py += 1;
+        try std.testing.expect(std.mem.indexOf(u8, happy.stderr, "failed to read file") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), count_erl);
+    try std.testing.expectEqual(@as(usize, 1), count_py);
+    try std.testing.expect(std.mem.indexOf(u8, happy.stdout, "notes.txt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, happy.stdout, "sub/c.erl") != null);
+
+    // Multi-grammar per extension: two grammars declare .erl ⇒ two entries
+    // per .erl file, each attributable via "grammar".
+    const multi = try runLasp(allocator, &.{ "parse-dir", dir, "--grammar-dir", multi_gdir });
+    defer {
+        allocator.free(multi.stdout);
+        allocator.free(multi.stderr);
+    }
+    const multi_parsed = try std.json.parseFromSlice(std.json.Value, allocator, multi.stdout, .{});
+    defer multi_parsed.deinit();
+    const multi_arr = multi_parsed.value.array;
+    var erl_entries: usize = 0;
+    for (multi_arr.items) |entry| {
+        const file = entry.object.get("file").?.string;
+        if (std.mem.endsWith(u8, file, ".erl")) erl_entries += 1;
+        const grammar = entry.object.get("grammar").?.string;
+        try std.testing.expect(std.mem.eql(u8, grammar, "erlang.toml") or std.mem.eql(u8, grammar, "erlang2.toml"));
+    }
+    try std.testing.expectEqual(@as(usize, 4), erl_entries); // a.erl + sub/c.erl × 2 grammars
+
+    // --node in dir mode: filtered events only.
+    const filtered = try runLasp(allocator, &.{ "parse-dir", dir, "--grammar-dir", gdir, "--node", "class" });
+    defer {
+        allocator.free(filtered.stdout);
+        allocator.free(filtered.stderr);
+    }
+    const filtered_parsed = try std.json.parseFromSlice(std.json.Value, allocator, filtered.stdout, .{});
+    defer filtered_parsed.deinit();
+    for (filtered_parsed.value.array.items) |entry| {
+        try std.testing.expectEqual(@as(usize, 0), entry.object.get("events").?.array.items.len);
+    }
+
+    // All-.txt dir ⇒ exit zero, [].
+    const txt_dir = "tests/fixtures/dir_txt_only";
+    removeDirTree(allocator, io, txt_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, txt_dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteDir(std.testing.io, txt_dir) catch {};
+    try writeFixtureFile(std.testing.io, txt_dir ++ "/notes.txt", "irrelevant\n");
+    const txt = try runLasp(allocator, &.{ "parse-dir", txt_dir, "--grammar-dir", gdir });
+    defer {
+        allocator.free(txt.stdout);
+        allocator.free(txt.stderr);
+    }
+    const txt_parsed = try std.json.parseFromSlice(std.json.Value, allocator, txt.stdout, .{});
+    defer txt_parsed.deinit();
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, txt.term);
+    try std.testing.expectEqual(@as(usize, 0), txt_parsed.value.array.items.len);
+}
+
+// --- Default grammar search tests (spec: default-grammar-search) ---
+// With no -g/--grammar-dir, `.lasp/grammars` in the cwd is the default grammar
+// source; several matching grammars all run (one DirResult entry each).
+
+const erlang_grammar_toml = "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n";
+const erlang2_grammar_toml = "[language]\nname = \"erlang2\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n";
+const python_grammar_toml = "[language]\nname = \"python\"\nextensions = [\".py\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\", \")\"]\n";
+
+const SeedGrammar = struct {
+    name: []const u8,
+    content: []const u8,
+};
+
+/// Recreates `.lasp/grammars` (removing any pre-existing `.lasp`) with the
+/// given grammar files; callers must removeDirTree(".lasp") in teardown.
+fn seedDefaultGrammars(allocator: std.mem.Allocator, seeds: []const SeedGrammar) !void {
+    const io = std.testing.io;
+    removeDirTree(allocator, io, ".lasp");
+    try std.Io.Dir.cwd().createDir(io, ".lasp", .default_dir);
+    try std.Io.Dir.cwd().createDir(io, ".lasp/grammars", .default_dir);
+    for (seeds) |s| {
+        const path = try std.fmt.allocPrint(allocator, ".lasp/grammars/{s}", .{s.name});
+        defer allocator.free(path);
+        try writeFixtureFile(io, path, s.content);
+    }
+}
+
+test "default grammar: parse single match is byte-identical to explicit -g" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{.{ .name = "erlang.toml", .content = erlang_grammar_toml }});
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+
+    const def = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl" });
+    defer {
+        allocator.free(def.stdout);
+        allocator.free(def.stderr);
+    }
+    const expl = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl", "-g", ".lasp/grammars/erlang.toml" });
+    defer {
+        allocator.free(expl.stdout);
+        allocator.free(expl.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, def.term);
+    try std.testing.expectEqualStrings(expl.stdout, def.stdout);
+}
+
+test "default grammar: parse multi-match returns one array entry per grammar, sorted" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
+    });
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+
+    const def = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl" });
+    defer {
+        allocator.free(def.stdout);
+        allocator.free(def.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, def.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, def.stdout, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+    try std.testing.expectEqualStrings("erlang.toml", arr.items[0].object.get("grammar").?.string);
+    try std.testing.expectEqualStrings("erlang2.toml", arr.items[1].object.get("grammar").?.string);
+
+    // Each entry's events match the corresponding explicit -g run.
+    const expl0 = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl", "-g", ".lasp/grammars/erlang.toml" });
+    defer {
+        allocator.free(expl0.stdout);
+        allocator.free(expl0.stderr);
+    }
+    const expl1 = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl", "-g", ".lasp/grammars/erlang2.toml" });
+    defer {
+        allocator.free(expl1.stdout);
+        allocator.free(expl1.stderr);
+    }
+    const p0 = try std.json.parseFromSlice(std.json.Value, allocator, expl0.stdout, .{});
+    defer p0.deinit();
+    const p1 = try std.json.parseFromSlice(std.json.Value, allocator, expl1.stdout, .{});
+    defer p1.deinit();
+    try expectJsonValueEqual(arr.items[0].object.get("events").?, p0.value.object.get("events").?);
+    try expectJsonValueEqual(arr.items[1].object.get("events").?, p1.value.object.get("events").?);
+
+    // notes.txt matches no extension → raw token fallback.
+    const notes = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/notes.txt" });
+    defer {
+        allocator.free(notes.stdout);
+        allocator.free(notes.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, notes.term);
+    const notes_parsed = try std.json.parseFromSlice(std.json.Value, allocator, notes.stdout, .{});
+    defer notes_parsed.deinit();
+    const note_events = notes_parsed.value.object.get("events").?.array.items;
+    try std.testing.expect(note_events.len > 0);
+    try std.testing.expect(note_events[0].object.get("col") != null); // token object, not structural event
+}
+
+test "default grammar: --names-only + multi-match is fatal" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
+    });
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+
+    const r = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl", "--names-only" });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(r.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "--names-only requires a single grammar") != null);
+}
+
+test "default grammar: query single match is byte-identical to explicit -g" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{.{ .name = "erlang.toml", .content = erlang_grammar_toml }});
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+
+    const def = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/dir_sample/a.erl" });
+    defer {
+        allocator.free(def.stdout);
+        allocator.free(def.stderr);
+    }
+    const expl = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/dir_sample/a.erl", "-g", ".lasp/grammars/erlang.toml" });
+    defer {
+        allocator.free(expl.stdout);
+        allocator.free(expl.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, def.term);
+    try std.testing.expectEqualStrings(expl.stdout, def.stdout);
+}
+
+test "default grammar: query multi-match returns filtered array entries" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
+    });
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+
+    const r = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/dir_sample/a.erl" });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+    try std.testing.expectEqualStrings("erlang.toml", arr.items[0].object.get("grammar").?.string);
+    try std.testing.expectEqualStrings("erlang2.toml", arr.items[1].object.get("grammar").?.string);
+    for (arr.items) |entry| {
+        try std.testing.expectEqual(@as(usize, 1), entry.object.get("events").?.array.items.len);
+    }
+}
+
+test "default grammar: parse-dir default == explicit --grammar-dir; absent default falls back" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "python.toml", .content = python_grammar_toml },
+    });
+
+    // With the default dir present, parse-dir == explicit --grammar-dir.
+    const def = try runLasp(allocator, &.{ "parse-dir", "tests/fixtures/dir_sample" });
+    defer {
+        allocator.free(def.stdout);
+        allocator.free(def.stderr);
+    }
+    const expl = try runLasp(allocator, &.{ "parse-dir", "tests/fixtures/dir_sample", "--grammar-dir", ".lasp/grammars" });
+    defer {
+        allocator.free(expl.stdout);
+        allocator.free(expl.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, def.term);
+    try std.testing.expectEqualStrings(expl.stdout, def.stdout);
+
+    // Absent default dir: parse-dir emits [], exit zero; query still requires
+    // -g; parse falls back to raw tokens (file and stdin).
+    removeDirTree(allocator, std.testing.io, ".lasp");
+    const empty = try runLasp(allocator, &.{ "parse-dir", "tests/fixtures/dir_sample" });
+    defer {
+        allocator.free(empty.stdout);
+        allocator.free(empty.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, empty.term);
+    const empty_parsed = try std.json.parseFromSlice(std.json.Value, allocator, empty.stdout, .{});
+    defer empty_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_parsed.value.array.items.len);
+
+    const q = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/dir_sample/a.erl" });
+    defer {
+        allocator.free(q.stdout);
+        allocator.free(q.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(q.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, q.stderr, "requires --grammar") != null);
+
+    const parse_fb = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl" });
+    defer {
+        allocator.free(parse_fb.stdout);
+        allocator.free(parse_fb.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, parse_fb.term);
+    const fb_parsed = try std.json.parseFromSlice(std.json.Value, allocator, parse_fb.stdout, .{});
+    defer fb_parsed.deinit();
+    const fb_events = fb_parsed.value.object.get("events").?.array.items;
+    try std.testing.expect(fb_events.len > 0);
+    try std.testing.expect(fb_events[0].object.get("col") != null);
+
+    const stdin_r = try runLaspWithStdin(allocator, &.{ "parse", "-" }, "fn f() {}");
+    defer {
+        allocator.free(stdin_r.stdout);
+        allocator.free(stdin_r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, stdin_r.term);
+    const stdin_parsed = try std.json.parseFromSlice(std.json.Value, allocator, stdin_r.stdout, .{});
+    defer stdin_parsed.deinit();
+    const stdin_events = stdin_parsed.value.object.get("events").?.array.items;
+    try std.testing.expect(stdin_events.len > 0);
+    try std.testing.expect(stdin_events[0].object.get("col") != null);
 }
 
 // --- Broken-pipe clean-exit tests (spec: broken-pipe-clean-exit) ---

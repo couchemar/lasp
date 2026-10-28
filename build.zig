@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     test_module.addImport("minish", minish_module);
     test_module.addImport("toml", toml_module);
@@ -148,6 +149,7 @@ pub fn build(b: *std.Build) void {
     const main_tests = b.addTest(.{
         .root_module = test_module,
     });
+
     const run_main_tests = b.addRunArtifact(main_tests);
 
     const test_step = b.step("test", "Run all unit and property tests");

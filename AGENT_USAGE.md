@@ -55,6 +55,39 @@ Returns structural events with captures, confidence scores, and position info:
 ] }
 ```
 
+### Directory walk (`parse-dir`)
+
+Parses every file in a directory tree whose extension is declared by a grammar
+in `--grammar-dir`, emitting one JSON array of per-file results:
+
+```bash
+.bin/lasp parse-dir <dir> --grammar-dir <grammar-dir>
+```
+
+Behavior:
+- Recursively walks `<dir>`; every regular file is checked against every loaded
+  grammar's `[language] extensions` list (`std`em.endsWith` suffix match on the
+  basename — `.erl` matches `foo.erl`; the dot-less form like `erl` is the
+  broader documented suffix).
+- A file is parsed once **per matching grammar** (multi-grammar-per-extension
+  yields one entry per grammar), and unmatched files are skipped silently.
+- Output is a JSON array; each entry is `{ "file", "grammar", "events" }`
+  where `events` is byte-identical to what single-file
+  `.bin/lasp parse <file> -g <grammar>` emits for that file.
+- `--node <type>` filters each entry's `events` (empty array when nothing
+  matches). `--names-only` is not wired in dir mode (deferred).
+- No `--grammar-dir` ⇒ no grammars ⇒ every file matches nothing ⇒ `[]` with
+  exit zero.
+- Grammars are loaded in sorted filename order; a malformed grammar aborts with
+  the usual grammar error message, naming the offending grammar path.
+
+```json
+[ { "file": "a.erl", "grammar": "erlang.toml", "events": [ { "type": "function", "start": 0, "end": 13, "line": 1, "confidence": 1.00, "col": 0 } ] },
+  { "file": "sub/c.erl", "grammar": "erlang.toml", "events": [ { "type": "function", "start": 0, "end": 13, "line": 1, "confidence": 1.00, "col": 0 } ] } ]
+```
+
+Target paths may be relative, absolute, or carry a trailing slash.
+
 ### Node type filtering (`--node` / `-n`)
 
 Emit only structural events matching a specific type name:
@@ -265,6 +298,21 @@ sequence = ["$callee:IDENTIFIER", "("]
 open = "{"
 close = "}"
 ```
+### Language metadata (`[language]`)
+
+`name` is optional display metadata. `extensions` is an array of file-extension
+strings that selects which files the grammar applies to under `parse-dir`:
+
+```toml
+[language]
+name = "erlang"
+extensions = [".erl", ".escript"]
+```
+
+Absent `[language]`, absent `extensions`, and `extensions = []` all mean the
+grammar matches no files in dir mode. Each entry must be a non-empty string;
+anything else is a grammar error. Extensions are inert outside `parse-dir`
+(single-file `parse` and `query` ignore them entirely).
 
 ### Same-type pattern union
 
@@ -587,3 +635,7 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | Malformed query selector | stderr message, non-zero exit |
 | No args | Usage message on stderr, non-zero exit (same as `--help`) |
 | Downstream reader closes the pipe early (e.g. `\| head`, `\| less` quit) | Broken pipe (EPIPE) is a clean exit: nothing on stderr, zero exit — like `grep`/`jq`. Other stdout write failures (disk full, I/O error) still error non-zero |
+| `parse-dir` target is missing or not a directory | `directory not found` on stderr, non-zero exit |
+| `--grammar-dir` is missing or not a directory | `grammar directory not found` on stderr, non-zero exit |
+| Malformed grammar inside `--grammar-dir` | grammar error message naming the offending `.toml` path, non-zero exit |
+| `[language] extensions` not an array of non-empty strings | stderr message, non-zero exit |

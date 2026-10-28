@@ -71,7 +71,14 @@ pub fn serializeEvents(events_list: []const StructuralEvent, writer: anytype) !v
 
 pub fn serializeEventsWithAlternatives(events_list: []const StructuralEvent, include_alternatives: bool, writer: anytype) !void {
     try writer.writeAll("{ \"events\": [");
+    try writeEventArray(events_list, include_alternatives, writer);
+    try writer.writeAll("] }");
+}
 
+/// Writes the `"events": [ ... ]` array body (without the wrapper object or
+/// the closing bracket). A trailing space is emitted after a non-empty array,
+/// matching the historical single-file byte stream exactly.
+fn writeEventArray(events_list: []const StructuralEvent, include_alternatives: bool, writer: anytype) !void {
     for (events_list, 0..) |event, i| {
         if (i > 0) try writer.writeAll(",");
         try writer.writeAll(" { \"type\": \"");
@@ -153,7 +160,32 @@ pub fn serializeEventsWithAlternatives(events_list: []const StructuralEvent, inc
     if (events_list.len > 0) {
         try writer.writeAll(" ");
     }
-    try writer.writeAll("] }");
+}
+
+/// One `parse-dir` output entry: the walked file path, the grammar (file name)
+/// that matched it, and that grammar's structural events for the file.
+pub const DirResult = struct {
+    file: []const u8,
+    grammar: []const u8,
+    events: []const StructuralEvent,
+};
+
+/// Serializes parse-dir results as a JSON array of `{file, grammar, events}`
+/// objects; `[]` when there are no entries.
+pub fn serializeDirResults(entries: []const DirResult, include_alternatives: bool, writer: anytype) !void {
+    try writer.writeAll("[");
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll(" { \"file\": \"");
+        try writeJsonEscaped(writer, entry.file);
+        try writer.writeAll("\", \"grammar\": \"");
+        try writeJsonEscaped(writer, entry.grammar);
+        try writer.writeAll("\", \"events\": [");
+        try writeEventArray(entry.events, include_alternatives, writer);
+        try writer.writeAll("] }");
+    }
+    if (entries.len > 0) try writer.writeAll(" ");
+    try writer.writeAll("]");
 }
 
 // --- Unit Tests ---
@@ -859,4 +891,67 @@ test "property: integer fields serialize as valid bare-integer JSON" {
             try testing.expectEqualStrings("f", name.string);
         }
     }.prop, .{ .num_runs = 100 });
+}
+// Feature: parse-dir-directory-walk, Requirement 2.6: serializeDirResults emits
+// a JSON array of {file, grammar, events}; event bytes match the single-file
+// serializer; empty list emits [].
+test "serializeDirResults: empty entry list emits []" {
+    const result = try serializeDirResultsToString(&.{}, false);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("[]", result);
+}
+
+test "serializeDirResults: entries carry file/grammar/events and escape strings" {
+    const ev = StructuralEvent{
+        .type_name = "function",
+        .captures = &.{.{ .field_name = "name", .value = "add" }},
+        .start = 0,
+        .end = 9,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+    };
+    const entries = [_]DirResult{
+        .{ .file = "a.erl", .grammar = "erlang.toml", .events = &.{ev} },
+        .{ .file = "sub/quote\"file.py", .grammar = "python.toml", .events = &.{} },
+    };
+    const result = try serializeDirResultsToString(&entries, false);
+    defer testing.allocator.free(result);
+
+    // Valid JSON array of two objects.
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try testing.expectEqual(@as(usize, 2), arr.items.len);
+    const first = arr.items[0].object;
+    try testing.expectEqualStrings("a.erl", first.get("file").?.string);
+    try testing.expectEqualStrings("erlang.toml", first.get("grammar").?.string);
+    try testing.expectEqual(@as(usize, 1), first.get("events").?.array.items.len);
+    const second = arr.items[1].object;
+    try testing.expectEqualStrings("sub/quote\"file.py", second.get("file").?.string);
+    try testing.expectEqual(@as(usize, 0), second.get("events").?.array.items.len);
+
+    // Event object bytes are identical to the single-file serializer's.
+    const single = try serializeEventsToStringWithAlternatives(&.{ev}, false);
+    defer testing.allocator.free(single);
+    const single_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, single, .{});
+    defer single_parsed.deinit();
+    const single_events = single_parsed.value.object.get("events").?;
+    const dir_events = first.get("events").?;
+    try testing.expectEqual(single_events.array.items.len, dir_events.array.items.len);
+    const a = single_events.array.items[0].object;
+    const b = dir_events.array.items[0].object;
+    try testing.expectEqualStrings("function", a.get("type").?.string);
+    try testing.expectEqualStrings("function", b.get("type").?.string);
+    try testing.expectEqual(@as(i64, 0), a.get("start").?.integer);
+    try testing.expectEqual(@as(i64, 0), b.get("start").?.integer);
+    try testing.expectEqualStrings("add", a.get("name").?.string);
+    try testing.expectEqualStrings("add", b.get("name").?.string);
+}
+
+fn serializeDirResultsToString(entries: []const DirResult, include: bool) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try serializeDirResults(entries, include, &aw.writer);
+    return aw.toOwnedSlice();
 }

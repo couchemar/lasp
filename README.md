@@ -238,9 +238,14 @@ std.Thread.spawn(...) // each worker thread indexes separate files.
 The system uses a simple YAML/TOML structured DSL for defining **structural elements** over robust language parsing logic.
 
 ### Grammar File Layout
-A grammar file consists of: `language`, `keywords`, `patterns`, `blocks`.
-
 The system supports a literal mapping pattern (TOML) or an explicit node capture mapping (YAML).
+
+The `[language]` table may declare `extensions` — an array of file-extension
+strings used by `lasp parse-dir <dir> --grammar-dir <gdir>` to pick which files
+each grammar applies to (`extensions = [".erl"]` matches `foo.erl`; absent or
+empty means the grammar matches no files in dir mode):
+
+
 
 **Example (TOML Literal Mapping - Python):**
 ```toml
@@ -470,6 +475,16 @@ lasp -h
 lasp parse --help
 lasp query --help
 ```
+### Directory walk (`parse-dir`)
+Recursively walks the target directory and parses every file whose extension is
+declared by a grammar in `--grammar-dir` (suffix match on the basename, e.g.
+`extensions = [".erl"]` matches `foo.erl`). Each matching `(file, grammar)`
+pair becomes one JSON object `{ "file", "grammar", "events" }` whose `events`
+array is byte-identical to single-file `parse`; unmatched files are skipped
+silently, a file matched by several grammars yields several entries, and
+`--node` filters each entry's events. Without `--grammar-dir` the command
+prints `[]` with exit zero. Targets may be relative, absolute, or end in a
+slash.
 
 ### Help Command and Flags
 LASP provides built-in help for discoverability:
