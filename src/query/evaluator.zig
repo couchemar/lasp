@@ -54,50 +54,85 @@ fn matchesFilter(event: StructuralEvent, query_filter: QueryFilter) bool {
 }
 
 /// Tests whether a single event matches a single attribute condition.
+/// Resolved_Value: what Field_Resolution yields for a field on an event — a
+/// string (capture), an integer (count/extent field), a float (the `confidence`
+/// built-in), or absent.
+const ResolvedValue = union(enum) {
+    string: []const u8,
+    integer: u32,
+    floating: f32,
+    absent,
+};
+
+/// The single place that maps a condition field name to its value on an event.
+/// Resolution order preserves today's precedence: integer fields, the
+/// `confidence` built-in, then string captures (a name present nowhere is
+/// absent). No per-language or grammar-specific branching (Req 1).
+fn resolveField(event: StructuralEvent, name: []const u8) ResolvedValue {
+    if (lookupInt(event.int_fields, name)) |v| return .{ .integer = v };
+    if (std.mem.eql(u8, name, "confidence")) return .{ .floating = event.confidence };
+    if (lookupCapture(event.captures, name)) |s| return .{ .string = s };
+    return .absent;
+}
+
+/// Tests whether a single event matches a single attribute condition.
+/// Dispatch is by operator family over the resolved value: string operators
+/// (eq/neq/contains/prefix/suffix) apply a text predicate; numeric operators
+/// (gt, plus numeric eq/neq) apply a numeric predicate.
 fn matchesCondition(event: StructuralEvent, cond: AttributeCondition) bool {
-    switch (cond.op) {
-        .eq => {
-            // Numeric (unquoted) value → compare against integer count fields.
-            if (cond.value == .number) {
-                const int_value = lookupInt(event.int_fields, cond.field);
-                return if (int_value) |v| @as(f32, @floatFromInt(v)) == cond.value.number else false;
+    const resolved = resolveField(event, cond.field);
+    return switch (cond.op) {
+        // String operators: compare the resolved STRING value.
+        .eq, .neq, .contains, .prefix, .suffix => blk: {
+            // Numeric eq/neq against an unquoted number keep the integer path
+            // (Req 3.3).
+            if ((cond.op == .eq or cond.op == .neq) and cond.value == .number) {
+                break :blk matchNumericEq(resolved, cond.op, cond.value.number);
             }
-            const capture_value = lookupCapture(event.captures, cond.field);
-            if (capture_value) |val| {
-                return std.mem.eql(u8, val, cond.value.string);
-            }
-            return false; // field not found → exclude
+            const needle = cond.value.string; // substring ops are always .string (parser-enforced)
+            break :blk switch (resolved) {
+                .string => |s| stringPredicate(cond.op, s, needle),
+                // absent / non-string: eq→false, neq→true, substring ops→false
+                else => cond.op == .neq,
+            };
         },
-        .neq => {
-            if (cond.value == .number) {
-                const int_value = lookupInt(event.int_fields, cond.field);
-                return if (int_value) |v| @as(f32, @floatFromInt(v)) != cond.value.number else true;
-            }
-            const capture_value = lookupCapture(event.captures, cond.field);
-            if (capture_value) |val| {
-                return !std.mem.eql(u8, val, cond.value.string);
-            }
-            return true; // field not found → include
-        },
-        .gt => {
-            const threshold = cond.value.number;
-            // Integer count fields compare as true integers first.
-            if (lookupInt(event.int_fields, cond.field)) |v| {
-                return @as(f32, @floatFromInt(v)) > threshold;
-            }
-            // Special-case: confidence field reads event.confidence directly
-            if (std.mem.eql(u8, cond.field, "confidence")) {
-                return event.confidence > threshold;
-            }
-            // Otherwise, attempt float parse of capture value
-            const capture_value = lookupCapture(event.captures, cond.field);
-            if (capture_value) |val| {
-                const parsed = std.fmt.parseFloat(f32, val) catch return false;
-                return parsed > threshold;
-            }
-            return false; // field not found → exclude
-        },
-    }
+        // Numeric operators: compare the resolved NUMERIC value.
+        .gt => numericGt(resolved, cond.value.number),
+    };
+}
+
+fn stringPredicate(op: ComparisonOp, haystack: []const u8, needle: []const u8) bool {
+    return switch (op) {
+        .eq => std.mem.eql(u8, haystack, needle),
+        .neq => !std.mem.eql(u8, haystack, needle),
+        .contains => std.mem.indexOf(u8, haystack, needle) != null,
+        .prefix => std.mem.startsWith(u8, haystack, needle),
+        .suffix => std.mem.endsWith(u8, haystack, needle),
+        else => unreachable,
+    };
+}
+
+/// gt preserves today's resolution: integer field, then confidence, then a
+/// capture parsed as float. resolveField already encodes int→confidence→string.
+fn numericGt(resolved: ResolvedValue, threshold: f32) bool {
+    return switch (resolved) {
+        .integer => |v| @as(f32, @floatFromInt(v)) > threshold,
+        .floating => |f| f > threshold,
+        .string => |s| (std.fmt.parseFloat(f32, s) catch return false) > threshold,
+        .absent => false,
+    };
+}
+
+/// Numeric eq/neq against an unquoted number: compare the integer field;
+/// absent → eq false / neq true (Req 3.3, unchanged).
+fn matchNumericEq(resolved: ResolvedValue, op: ComparisonOp, n: f32) bool {
+    const v: ?f32 = switch (resolved) {
+        .integer => |i| @as(f32, @floatFromInt(i)),
+        .floating => |f| f,
+        else => null,
+    };
+    if (v) |fv| return if (op == .eq) fv == n else fv != n;
+    return op == .neq; // absent: eq excludes, neq includes
 }
 
 /// Looks up a field name in the integer-field slice.
@@ -969,6 +1004,288 @@ test "property: numeric query comparison on count fields" {
                 else => @as(f32, @floatFromInt(args)) != threshold,
             };
             try testing.expectEqual(match, result.len == 1);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// ---------------------------------------------------------------------------
+// Spec: query-comparison-operators property tests
+// ---------------------------------------------------------------------------
+
+const cap_names_pool = [_][]const u8{ "name", "kind", "callee" };
+const int_names_pool = [_][]const u8{ "args", "level" };
+const string_pool = [_][]const u8{ "deadline", "test_deadline", "foo", "client.export_quotes", "other", "" };
+const type_pool = [_][]const u8{ "function", "call", "import" };
+
+fn makeEventFull(type_name: []const u8, caps: []const CaptureEntry, ints: []const IntegerField, confidence: f32) StructuralEvent {
+    return .{
+        .type_name = type_name,
+        .captures = caps,
+        .int_fields = ints,
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = confidence,
+    };
+}
+
+/// Independent reference for the PRE-refactor evaluator (the original
+/// `matchesCondition`), used only by Property 1.
+fn refMatchesCondition(event: StructuralEvent, cond: AttributeCondition) bool {
+    return switch (cond.op) {
+        .eq => blk: {
+            if (cond.value == .number) {
+                const iv = lookupInt(event.int_fields, cond.field);
+                break :blk if (iv) |v| @as(f32, @floatFromInt(v)) == cond.value.number else false;
+            }
+            const cv = lookupCapture(event.captures, cond.field);
+            if (cv) |val| break :blk std.mem.eql(u8, val, cond.value.string);
+            break :blk false;
+        },
+        .neq => blk: {
+            if (cond.value == .number) {
+                const iv = lookupInt(event.int_fields, cond.field);
+                break :blk if (iv) |v| @as(f32, @floatFromInt(v)) != cond.value.number else true;
+            }
+            const cv = lookupCapture(event.captures, cond.field);
+            if (cv) |val| break :blk !std.mem.eql(u8, val, cond.value.string);
+            break :blk true;
+        },
+        .gt => blk: {
+            const threshold = cond.value.number;
+            if (lookupInt(event.int_fields, cond.field)) |v| break :blk @as(f32, @floatFromInt(v)) > threshold;
+            if (std.mem.eql(u8, cond.field, "confidence")) break :blk event.confidence > threshold;
+            const cv = lookupCapture(event.captures, cond.field);
+            if (cv) |val| {
+                const parsed = std.fmt.parseFloat(f32, val) catch break :blk false;
+                break :blk parsed > threshold;
+            }
+            break :blk false;
+        },
+        .contains, .prefix, .suffix => unreachable,
+    };
+}
+
+fn eventFromSeed(seed: u8, idx: usize) !StructuralEvent {
+    const tn = type_pool[(seed +% @as(u8, @intCast(idx * 3))) % type_pool.len];
+    const confidence: f32 = @as(f32, @floatFromInt(seed % 11)) / 10.0;
+    // Deterministic capture/int presence from seed bits.
+    const have_cap = (@as(u16, seed) >> @intCast(@as(u4, @intCast((idx % 8) + 1)))) & 1 == 1;
+    const have_int = (@as(u16, seed) >> @intCast(@as(u4, @intCast(idx % 8)))) & 1 == 1;
+    var caps: [1]CaptureEntry = undefined;
+    var ints: [1]IntegerField = undefined;
+    const caps_slice = if (have_cap) blk: {
+        caps[0] = .{ .field_name = cap_names_pool[idx % cap_names_pool.len], .value = string_pool[(seed +% @as(u8, @intCast(idx))) % string_pool.len] };
+        break :blk caps[0..1];
+    } else &[_]CaptureEntry{};
+    const ints_slice = if (have_int) blk: {
+        ints[0] = .{ .field_name = int_names_pool[idx % int_names_pool.len], .value = seed };
+        break :blk ints[0..1];
+    } else &[_]IntegerField{};
+    return makeEventFull(tn, caps_slice, ints_slice, confidence);
+}
+
+fn condFromSeed(seed: u8, idx: usize) !AttributeCondition {
+    // 0..2: legacy ops; 3..5: substring ops (only used by later properties).
+    const op: ComparisonOp = switch (seed % 6) {
+        0 => .eq,
+        1 => .neq,
+        2 => .gt,
+        3 => .contains,
+        4 => .prefix,
+        else => .suffix,
+    };
+    const field = switch (op) {
+        .gt => if (idx % 2 == 0) "confidence" else int_names_pool[idx % int_names_pool.len],
+        .contains, .prefix, .suffix => cap_names_pool[idx % cap_names_pool.len],
+        else => if (idx % 3 == 0) int_names_pool[idx % int_names_pool.len] else cap_names_pool[idx % cap_names_pool.len],
+    };
+    const value: AttributeValue = switch (op) {
+        .gt => .{ .number = @as(f32, @floatFromInt(seed % 10)) },
+        .contains, .prefix, .suffix => .{ .string = string_pool[(seed +% @as(u8, @intCast(idx * 2))) % string_pool.len] },
+        else => if (idx % 3 == 0) .{ .number = @as(f32, @floatFromInt(seed % 10)) } else .{ .string = string_pool[(seed +% @as(u8, @intCast(idx))) % string_pool.len] },
+    };
+    return .{ .field = field, .op = op, .value = value };
+}
+
+// Feature: query-comparison-operators, Property 1: Refactor is
+// behavior-preserving for existing operators
+test "property: refactor is behavior-preserving for existing operators (P1)" {
+    const seed_gen = gen.intRange(u8, 0, 255);
+
+    try minish.check(testing.allocator, seed_gen, struct {
+        fn prop(seed: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const n_events: usize = @as(usize, seed % 5) + 1;
+            const n_conds: usize = @as(usize, (seed >> 3) % 4);
+            const events = try alloc.alloc(StructuralEvent, n_events);
+            for (0..n_events) |i| events[i] = try eventFromSeed(seed, i);
+
+            if (n_conds == 0) return;
+            const conds = try alloc.alloc(AttributeCondition, n_conds);
+            for (0..n_conds) |i| {
+                var c = try condFromSeed(seed +% @as(u8, @intCast(i * 5)), i);
+                // P1 compares ONLY legacy ops (eq/neq/gt) against the reference.
+                if (c.op == .contains or c.op == .prefix or c.op == .suffix) {
+                    c = .{
+                        .field = c.field,
+                        .op = if (c.value == .number) .gt else .eq,
+                        .value = c.value,
+                    };
+                }
+                conds[i] = c;
+            }
+
+            const f = QueryFilter{ .type_selector = .wildcard, .conditions = conds };
+            const result = try evaluate(events, f, alloc);
+
+            const expected = try alloc.alloc(StructuralEvent, events.len);
+            var n: usize = 0;
+            for (events) |event| {
+                var ok = true;
+                for (conds) |cond| {
+                    if (!refMatchesCondition(event, cond)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    expected[n] = event;
+                    n += 1;
+                }
+            }
+            try testing.expectEqual(n, result.len);
+            for (result, 0..) |r, i| {
+                try testing.expectEqualStrings(expected[i].type_name, r.type_name);
+                try testing.expectEqual(expected[i].confidence, r.confidence);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: query-comparison-operators, Property 2: Contains semantics
+test "property: contains semantics (P2)" {
+    const tuple_gen = comptime gen.tuple3(
+        []const u8,
+        []const u8,
+        bool,
+        gen.string(.{ .min_len = 0, .max_len = 12, .charset = .alphanumeric }),
+        gen.string(.{ .min_len = 0, .max_len = 6, .charset = .alphanumeric }),
+        gen.boolean(),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8, bool }) !void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var ev = try eventFromSeed(7, 2);
+            const caps = if (vals[2]) blk: {
+                const c = try alloc.alloc(CaptureEntry, 1);
+                c[0] = .{ .field_name = "f", .value = vals[0] };
+                break :blk c;
+            } else &[_]CaptureEntry{};
+            ev = makeEventFull(ev.type_name, caps, ev.int_fields, ev.confidence);
+            const cond = AttributeCondition{ .field = "f", .op = .contains, .value = .{ .string = vals[1] } };
+            const result = matchesCondition(ev, cond);
+            const expected = blk: {
+                const cap = lookupCapture(caps, "f");
+                break :blk if (cap) |s| std.mem.indexOf(u8, s, vals[1]) != null else false;
+            };
+            try testing.expectEqual(expected, result);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: query-comparison-operators, Property 3: Prefix and suffix semantics
+test "property: prefix and suffix semantics (P3)" {
+    const tuple_gen = comptime gen.tuple3(
+        []const u8,
+        []const u8,
+        bool,
+        gen.string(.{ .min_len = 0, .max_len = 12, .charset = .alphanumeric }),
+        gen.string(.{ .min_len = 0, .max_len = 6, .charset = .alphanumeric }),
+        gen.boolean(),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { []const u8, []const u8, bool }) !void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var ev = try eventFromSeed(7, 2);
+            const caps = if (vals[2]) blk: {
+                const c = try alloc.alloc(CaptureEntry, 1);
+                c[0] = .{ .field_name = "f", .value = vals[0] };
+                break :blk c;
+            } else &[_]CaptureEntry{};
+            ev = makeEventFull(ev.type_name, caps, ev.int_fields, ev.confidence);
+            const cap = lookupCapture(caps, "f");
+            const prefix_cond = AttributeCondition{ .field = "f", .op = .prefix, .value = .{ .string = vals[1] } };
+            const suffix_cond = AttributeCondition{ .field = "f", .op = .suffix, .value = .{ .string = vals[1] } };
+            const expected_prefix = if (cap) |s| std.mem.startsWith(u8, s, vals[1]) else false;
+            const expected_suffix = if (cap) |s| std.mem.endsWith(u8, s, vals[1]) else false;
+            try testing.expectEqual(expected_prefix, matchesCondition(ev, prefix_cond));
+            try testing.expectEqual(expected_suffix, matchesCondition(ev, suffix_cond));
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: query-comparison-operators, Property 7: Field resolution is
+// single-sourced and language-agnostic
+test "property: field resolution is single-sourced (P7)" {
+    const tuple_gen = comptime gen.tuple3(
+        u8,
+        []const u8,
+        u32,
+        gen.intRange(u8, 0, 3),
+        gen.string(.{ .min_len = 0, .max_len = 8, .charset = .alphanumeric }),
+        gen.intRange(u32, 0, 1000),
+    );
+
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, []const u8, u32 }) !void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Scenario: 0=string capture, 1=integer field, 2=confidence,
+            // 3=absent.
+            var ev = try eventFromSeed(7, 2);
+            switch (vals[0]) {
+                0 => {
+                    const caps = try alloc.alloc(CaptureEntry, 1);
+                    caps[0] = .{ .field_name = "f", .value = vals[1] };
+                    ev = makeEventFull(ev.type_name, caps, &.{}, ev.confidence);
+                    const r = resolveField(ev, "f");
+                    try testing.expect(r == .string);
+                    try testing.expectEqualStrings(vals[1], r.string);
+                },
+                1 => {
+                    const ints = try alloc.alloc(IntegerField, 1);
+                    ints[0] = .{ .field_name = "f", .value = vals[2] };
+                    ev = makeEventFull(ev.type_name, &.{}, ints, ev.confidence);
+                    const r = resolveField(ev, "f");
+                    try testing.expect(r == .integer);
+                    try testing.expectEqual(vals[2], r.integer);
+                },
+                2 => {
+                    const r = resolveField(ev, "confidence");
+                    try testing.expect(r == .floating);
+                    try testing.expectEqual(ev.confidence, r.floating);
+                },
+                else => {
+                    ev = makeEventFull(ev.type_name, &.{}, &.{}, ev.confidence);
+                    const r = resolveField(ev, "f");
+                    try testing.expect(r == .absent);
+                },
+            }
         }
     }.prop, .{ .num_runs = 100 });
 }

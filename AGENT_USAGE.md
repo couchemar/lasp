@@ -282,6 +282,11 @@ lasp query '<selector>' <file> -g <grammar.toml> [--names-only] [--jsonl]
 # Exclude known built-in calls
 .bin/lasp query 'call[name!="print"]' file.dart -g grammars/dart.toml
 
+# Substring operators: contains / prefix / suffix (quoted values only)
+.bin/lasp query 'function[name~="deadline"]' file.zig -g examples/grammars/zig.toml
+.bin/lasp query 'function[name^="test_"]' file.zig -g examples/grammars/zig.toml
+.bin/lasp query 'call[callee$="export_quotes"]' file.zig -g examples/grammars/zig.toml
+
 # Names-only output for scripting
 .bin/lasp query 'function' file.zig -g examples/grammars/zig.toml --names-only
 
@@ -297,7 +302,11 @@ cat src/main.zig | .bin/lasp query 'function[name!="main"]' - -g examples/gramma
 - `[field="value"]` — equality: include events where capture `field` equals `value`
 - `[field!="value"]` — negation: include events where `field` is absent or differs from `value`
 - `[confidence>N]` — threshold: include events with confidence strictly above N (0.0–1.0)
-- `[args>N]` / `[args=N]` / `[args!=N]` — numeric conditions on integer count fields (`[[patterns.count]]`): unquoted numeric values compare against the event's integer fields; `!=` includes events lacking the field, `=`/`>` exclude them (a `"..."`-quoted value always compares against string captures)
+- `[field>N]` / `[field=N]` / `[field!=N]` — numeric conditions on integer count fields (`[[patterns.count]]`): unquoted numeric values compare against the event's integer fields; `!=` includes events lacking the field, `=`/`>` exclude them (a `"..."`-quoted value always compares against string captures)
+- `[field~="text"]` — contains: include events whose capture `field` contains `text` as a substring (empty `text` includes every present-string field)
+- `[field^="text"]` — prefix: include events whose capture `field` starts with `text`
+- `[field$="text"]` — suffix: include events whose capture `field` ends with `text` — the fix for dotted captures: `[callee$="export_quotes"]` matches a `callee` of `client.export_quotes`
+- Substring operators accept a **quoted string value only**; an unquoted value is a parse error (`ExpectedQuotedValue`). Against an absent field or a non-string field (e.g. an integer count), they exclude.
 - Multiple conditions are AND-combined: all must pass
 
 ### Differences from `--node`
@@ -680,3 +689,4 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | `[language] extensions` not an array of non-empty strings | stderr message, non-zero exit |
 | `--jsonl` combined with `--names-only` | `error: --jsonl and --names-only are mutually exclusive` on stderr, non-zero exit (order-independent) |
 | `--jsonl` with `version`/`help` output | `error: --jsonl is only supported on parse, parse-dir, and query commands` on stderr, non-zero exit (incl. `--jsonl --version` / `--jsonl --help`) |
+| Substring operator (`~=`, `^=`, `$=`) with an unquoted value | stderr message, non-zero exit |

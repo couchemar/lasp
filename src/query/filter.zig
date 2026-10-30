@@ -6,6 +6,9 @@ pub const ComparisonOp = enum {
     eq, // =
     neq, // !=
     gt, // >
+    contains, // ~=
+    prefix, // ^=
+    suffix, // $=
 };
 
 pub const AttributeValue = union(enum) {
@@ -53,6 +56,9 @@ pub fn format(filter: QueryFilter, allocator: std.mem.Allocator) ![]const u8 {
             .eq => try buf.append(allocator, '='),
             .neq => try buf.appendSlice(allocator, "!="),
             .gt => try buf.append(allocator, '>'),
+            .contains => try buf.appendSlice(allocator, "~="),
+            .prefix => try buf.appendSlice(allocator, "^="),
+            .suffix => try buf.appendSlice(allocator, "$="),
         }
 
         // Write value
@@ -175,6 +181,21 @@ test "format: multiple conditions" {
     try testing.expectEqualStrings("function[name=\"foo\"][confidence>0.80]", result);
 }
 
+test "format: contains/prefix/suffix operators render sigils with quoted value" {
+    const conditions = [_]AttributeCondition{
+        .{ .field = "name", .op = .contains, .value = .{ .string = "dead" } },
+        .{ .field = "name", .op = .prefix, .value = .{ .string = "test_" } },
+        .{ .field = "callee", .op = .suffix, .value = .{ .string = "export_quotes" } },
+    };
+    const filter = QueryFilter{
+        .type_selector = .{ .named = "call" },
+        .conditions = &conditions,
+    };
+    const result = try format(filter, testing.allocator);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("call[name~=\"dead\"][name^=\"test_\"][callee$=\"export_quotes\"]", result);
+}
+
 // --- Property Tests ---
 
 const minish = @import("minish");
@@ -218,18 +239,21 @@ test "property: QueryFilter round-trip (parse -> format -> parse)" {
             // Build conditions
             var cond_buf: [3]AttributeCondition = undefined;
             for (0..num_conditions) |i| {
-                // Derive op from seed bits: each condition uses 2 bits
-                const op_bits: u2 = @truncate(seed >> @intCast(i * 2));
-                const op: ComparisonOp = switch (op_bits % 3) {
+                // Derive op from seed bits: each condition uses 3 bits, 6 ops
+                const op_bits: u3 = @truncate(seed >> @intCast(i * 3));
+                const op: ComparisonOp = switch (op_bits % 6) {
                     0 => .eq,
                     1 => .neq,
                     2 => .gt,
+                    3 => .contains,
+                    4 => .prefix,
+                    5 => .suffix,
                     else => unreachable,
                 };
 
                 const field = field_names[i];
                 const value: AttributeValue = switch (op) {
-                    .eq, .neq => .{ .string = string_values[i] },
+                    .eq, .neq, .contains, .prefix, .suffix => .{ .string = string_values[i] },
                     .gt => blk: {
                         // Use seed to pick a percentage (0-99) for a clean 2-decimal float
                         const pct: u8 = @intCast((@as(u16, seed) * @as(u16, @intCast(i + 1))) % 100);

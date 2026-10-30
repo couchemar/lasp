@@ -460,6 +460,9 @@ lasp query 'function' file.rs -g grammars/rust.toml
 lasp query 'function[name="foo"]' file.rs -g grammars/rust.toml
 lasp query '*[confidence>0.8]' file.rs -g grammars/rust.toml
 lasp query 'call[name!="print"]' file.rs -g grammars/rust.toml --names-only
+lasp query 'function[name~="deadline"]' file.rs -g grammars/rust.toml  # contains
+lasp query 'function[name^="test_"]' file.rs -g grammars/rust.toml   # prefix
+lasp query 'call[callee$="export_quotes"]' file.rs -g grammars/rust.toml --names-only  # suffix (dotted captures)
 
 # NDJSON output (one JSON value per line, --jsonl)
 lasp parse file.rs -g grammars/rust.toml --jsonl
