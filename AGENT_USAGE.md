@@ -63,13 +63,37 @@ Returns structural events with captures, confidence scores, and position info:
 ] }
 ```
 
-### Directory walk (`parse-dir`)
+### NDJSON output (`--jsonl`)
+
+Opt-in, one-JSON-value-per-line framing — no document wrapper. Each record is
+the same object as the corresponding Wrapped_Form element, with exactly one
+`\n` terminator, so records are independently greppable and streamable:
+
+```bash
+.bin/lasp parse file.zig -g examples/grammars/zig.toml --jsonl
+.bin/lasp parse-dir <dir> --grammar-dir <gdir> --jsonl
+.bin/lasp query 'function' file.zig -g examples/grammars/zig.toml --jsonl
+```
+
+- Single-file `parse`: one line per structural event; the raw-token fallback
+  emits one line per token; zero events/tokens ⇒ zero bytes.
+- `parse-dir` and multi-grammar defaults: every event of every
+  `{ "file", "grammar", "events" }` entry flattens into its own line whose
+  FIRST two fields are `file` and `grammar` (remaining fields byte-identical to
+  the wrapped event); entries with no events emit nothing.
+- The trailing document newline that Wrapped_Form adds is suppressed in
+  `--jsonl` mode (each record already ends in `\n`).
+- Mutually exclusive with `--names-only` (usage error). Rejected on
+  `version`/`help` — `--jsonl --version` and `--jsonl --help` included.
+  Flag off ⇒ output byte-for-byte identical to today's wrapped JSON.
+
+
 
 Parses every file in a directory tree whose extension is declared by a grammar
 in `--grammar-dir`, emitting one JSON array of per-file results:
 
 ```bash
-.bin/lasp parse-dir <dir> --grammar-dir <grammar-dir>
+   bin/lasp parse-dir <dir> --grammar-dir <grammar-dir> [--jsonl]
 ```
 
 Behavior:
@@ -171,6 +195,8 @@ echo 'fn add() void {} fn sub() void {}' | .bin/lasp parse - -g examples/grammar
 
 # Pipe source and filter to calls, JSON output
 cat src/main.zig | .bin/lasp parse - -g examples/grammars/zig.toml --node call# Count functions in a file
+# Count functions in a file — --jsonl emits one JSON event per line for exact counts
+.bin/lasp parse src/main.zig -g examples/grammars/zig.toml --node function --jsonl | wc -l
 .bin/lasp parse src/main.zig -g examples/grammars/zig.toml --node function --names-only | wc -l
 
 # Find a specific function
@@ -226,7 +252,7 @@ absent default dir keep the `requires --grammar/-g` error).
 ### Syntax
 
 ```
-lasp query '<selector>' <file> -g <grammar.toml> [--names-only]
+lasp query '<selector>' <file> -g <grammar.toml> [--names-only] [--jsonl]
 ```
 
 ### Selector syntax
@@ -652,3 +678,5 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | `--grammar-dir` is missing or not a directory | `grammar directory not found` on stderr, non-zero exit |
 | Malformed grammar inside `--grammar-dir` | grammar error message naming the offending `.toml` path, non-zero exit |
 | `[language] extensions` not an array of non-empty strings | stderr message, non-zero exit |
+| `--jsonl` combined with `--names-only` | `error: --jsonl and --names-only are mutually exclusive` on stderr, non-zero exit (order-independent) |
+| `--jsonl` with `version`/`help` output | `error: --jsonl is only supported on parse, parse-dir, and query commands` on stderr, non-zero exit (incl. `--jsonl --version` / `--jsonl --help`) |

@@ -203,7 +203,10 @@ fn run(
                         try writeNamesOnlyLine(stdout, event);
                     }
                 } else {
-                    try json.serializeEvents(filtered, stdout);
+                    if (parsed.jsonl)
+                        try json.serializeEventsNdjson(filtered, false, stdout)
+                    else
+                        try json.serializeEvents(filtered, stdout);
                 }
             } else {
                 // Default grammar resolution (nullable: absent dir or stdin).
@@ -247,7 +250,10 @@ fn run(
                             try writeNamesOnlyLine(stdout, event);
                         }
                     } else {
-                        try json.serializeEvents(filtered, stdout);
+                        if (parsed.jsonl)
+                            try json.serializeEventsNdjson(filtered, false, stdout)
+                        else
+                            try json.serializeEvents(filtered, stdout);
                     }
                 } else {
                     // Multi-grammar default: one array entry per matching grammar.
@@ -264,7 +270,10 @@ fn run(
                             .events = filtered,
                         });
                     }
-                    try json.serializeDirResults(entries.items, false, stdout);
+                    if (parsed.jsonl)
+                        try json.serializeDirResultsNdjson(entries.items, false, stdout)
+                    else
+                        try json.serializeDirResults(entries.items, false, stdout);
                 }
             }
         },
@@ -340,7 +349,10 @@ fn run(
                         try writeNamesOnlyLine(stdout, event);
                     }
                 } else {
-                    try json.serializeEventsWithAlternatives(structural_events, collect_alternatives, stdout);
+                    if (parsed.jsonl)
+                        try json.serializeEventsNdjson(structural_events, collect_alternatives, stdout)
+                    else
+                        try json.serializeEventsWithAlternatives(structural_events, collect_alternatives, stdout);
                 }
             } else if (resolved_default) |resolved| {
                 const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
@@ -349,7 +361,10 @@ fn run(
                 if (resolved.len == 0) {
                     // Default dir present but no grammar matches: raw token output.
                     const tokens = try tokenizer.tokenize(source, null, .{}, allocator);
-                    try json.serializeTokens(tokens, stdout);
+                    if (parsed.jsonl)
+                        try json.serializeTokensNdjson(tokens, stdout)
+                    else
+                        try json.serializeTokens(tokens, stdout);
                 } else if (resolved.len == 1) {
                     // Single match: byte-identical to explicit -g.
                     const lg = resolved[0];
@@ -359,7 +374,10 @@ fn run(
                             try writeNamesOnlyLine(stdout, event);
                         }
                     } else {
-                        try json.serializeEventsWithAlternatives(structural_events, parsed.alternatives or parsed.resemble, stdout);
+                        if (parsed.jsonl)
+                            try json.serializeEventsNdjson(structural_events, parsed.alternatives or parsed.resemble, stdout)
+                        else
+                            try json.serializeEventsWithAlternatives(structural_events, parsed.alternatives or parsed.resemble, stdout);
                     }
                 } else {
                     // Multi-grammar default: one array entry per matching grammar
@@ -377,7 +395,10 @@ fn run(
                             .events = events_list,
                         });
                     }
-                    try json.serializeDirResults(entries.items, collect_alternatives, stdout);
+                    if (parsed.jsonl)
+                        try json.serializeDirResultsNdjson(entries.items, collect_alternatives, stdout)
+                    else
+                        try json.serializeDirResults(entries.items, collect_alternatives, stdout);
                 }
             } else {
                 // No grammar: raw token output
@@ -385,7 +406,10 @@ fn run(
                     std.process.fatal("failed to read file: {s}", .{parsed.target_path});
                 };
                 const tokens = try tokenizer.tokenize(source, null, .{}, allocator);
-                try json.serializeTokens(tokens, stdout);
+                if (parsed.jsonl)
+                    try json.serializeTokensNdjson(tokens, stdout)
+                else
+                    try json.serializeTokens(tokens, stdout);
             }
         },
         .parse_dir => {
@@ -449,13 +473,16 @@ fn run(
                 }
             }
 
-            try json.serializeDirResults(entries.items, collect_alternatives, stdout);
+            if (parsed.jsonl)
+                try json.serializeDirResultsNdjson(entries.items, collect_alternatives, stdout)
+            else
+                try json.serializeDirResults(entries.items, collect_alternatives, stdout);
         },
         .version => unreachable,
         .help => unreachable,
     }
 
-    if (!parsed.names_only) try stdout.writeAll("\n");
+    if (!parsed.names_only and !parsed.jsonl) try stdout.writeAll("\n");
     try stdout.flush();
 }
 

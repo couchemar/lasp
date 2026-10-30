@@ -45,6 +45,7 @@ This pattern matches functions in many languages:
 3. **Agent-Defined Parsing Specs**: Agents can dynamically define parsing rules for unknown languages or DSLs.
 4. **Nested Parsing**: Parsing is performed in **layers**. Nodes may store block ranges rather than fully parsed children, keeping the initial parse fast and modular.
 5. **Linear Performance**: Tokenization, index building, and pattern matching run in `O(N)` complexity where `N` is the number of tokens.
+6. **NDJSON output**: `--jsonl` emits one JSON value per line (no document wrapper) for `parse`, `parse-dir`, and `query` — each record is the same object as the wrapped-JSON element (`file`/`grammar` lead in dir mode), records end in exactly one `\n`, zero records ⇒ zero bytes, and the trailing document newline is suppressed. Mutually exclusive with `--names-only`; rejected on `version`/`help`; flag off ⇒ byte-identical wrapped JSON.
 
 ---
 
@@ -459,6 +460,15 @@ lasp query 'function' file.rs -g grammars/rust.toml
 lasp query 'function[name="foo"]' file.rs -g grammars/rust.toml
 lasp query '*[confidence>0.8]' file.rs -g grammars/rust.toml
 lasp query 'call[name!="print"]' file.rs -g grammars/rust.toml --names-only
+
+# NDJSON output (one JSON value per line, --jsonl)
+lasp parse file.rs -g grammars/rust.toml --jsonl
+lasp parse-dir ./repo --grammar-dir grammars/ --jsonl
+lasp query 'function' file.rs -g grammars/rust.toml --jsonl
+
+# Count events exactly (one JSON value per line) and filter with jq
+lasp parse file.rs -g grammars/rust.toml --jsonl | wc -l
+lasp parse file.rs -g grammars/rust.toml --jsonl | jq -c 'select(.type == "function")'
 
 # Composable pipeline
 echo 'fn add() {}' | lasp parse - -g grammars/rust.toml --node function --names-only

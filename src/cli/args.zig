@@ -15,6 +15,7 @@ pub const ParsedArgs = struct {
     grammar_dir: ?[]const u8 = null,
     node_filter: ?[]const u8 = null,
     names_only: bool = false,
+    jsonl: bool = false,
     query_selector: ?[]const u8 = null,
     help_topic: ?Command = null,
     alternatives: bool = false,
@@ -31,15 +32,17 @@ pub const CliError = error{
     MissingSelectorString,
     AlternativesOnQuery,
     ResembleOnQuery,
+    JsonlWithNamesOnly,
+    JsonlOnNonOutputCommand,
 };
 
 pub const general_help_text =
     \\lasp - Language-Agnostic Structural Parser
     \\
     \\Usage:
-    \\  lasp parse <file|-> [-g <grammar.toml>] [-n <type>] [--names-only]
-    \\  lasp parse-dir <dir> [--grammar-dir <dir>]
-    \\  lasp query <selector> <file|-> -g <grammar.toml> [--names-only]
+    \\  lasp parse <file|-> [-g <grammar.toml>] [-n <type>] [--names-only] [--jsonl]
+    \\  lasp parse-dir <dir> [--grammar-dir <dir>] [--jsonl]
+    \\  lasp query <selector> <file|-> -g <grammar.toml> [--names-only] [--jsonl]
     \\  lasp version
     \\  lasp help
     \\
@@ -47,7 +50,7 @@ pub const general_help_text =
     \\  -g, --grammar <path>   Grammar TOML file (structural parsing)
     \\      --grammar-dir <d>  Grammar directory (parse-dir)
     \\  -n, --node <type>      Emit only events of this type (case-insensitive)
-    \\      --names-only       Emit first capture value per event, one per line
+    \\      --jsonl          Emit NDJSON (one JSON value per line)
     \\      --resemble         Annotate alternatives with grammar-projected token resemblance
     \\  -V, --version          Print the version and exit
     \\  -h, --help             Print help and exit
@@ -63,7 +66,7 @@ pub const parse_help_text =
     \\lasp parse - parse a single file into structural or token events
     \\
     \\Usage:
-    \\  lasp parse <file|-> [-g <grammar.toml>] [-n <type>] [--names-only]
+    \\  lasp parse <file|-> [-g <grammar.toml>] [-n <type>] [--names-only] [--jsonl]
     \\
     \\Arguments:
     \\  <file|->   Source file path, or '-' to read from standard input
@@ -71,6 +74,7 @@ pub const parse_help_text =
     \\Flags:
     \\  -g, --grammar <path>   Grammar TOML file; omit for raw token output
     \\  -n, --node <type>      Emit only events of this type (case-insensitive)
+    \\      --jsonl          Emit NDJSON (one JSON value per line)
     \\      --resemble         Annotate alternatives with grammar-projected token resemblance
     \\
 ;
@@ -79,13 +83,13 @@ pub const parse_dir_help_text =
     \\lasp parse-dir - parse all files in a directory
     \\
     \\Usage:
-    \\  lasp parse-dir <dir> [--grammar-dir <dir>]
+    \\  lasp parse-dir <dir> [--grammar-dir <dir>] [--jsonl]
     \\
     \\Arguments:
     \\  <dir>   Directory to parse
     \\
     \\Flags:
-    \\      --grammar-dir <dir>   Directory of grammar TOML files
+    \\      --jsonl          Emit NDJSON (one JSON value per line)
     \\
 ;
 
@@ -93,7 +97,7 @@ pub const query_help_text =
     \\lasp query - filter structural events with a CSS-like selector
     \\
     \\Usage:
-    \\  lasp query <selector> <file|-> -g <grammar.toml> [--names-only]
+    \\  lasp query <selector> <file|-> -g <grammar.toml> [--names-only] [--jsonl]
     \\
     \\Arguments:
     \\  <selector>   e.g. 'function', 'function[name="foo"]', '*[confidence>0.8]'
@@ -101,7 +105,7 @@ pub const query_help_text =
     \\
     \\Flags:
     \\  -g, --grammar <path>   Grammar TOML file (required)
-    \\      --names-only       Emit first capture value per event, one per line
+    \\      --jsonl          Emit NDJSON (one JSON value per line)
     \\
 ;
 
@@ -127,6 +131,8 @@ pub fn formatCliError(err: CliError) []const u8 {
         error.MissingSelectorString => "error: query command requires a selector string",
         error.AlternativesOnQuery => "error: --alternatives is supported on the parse command only",
         error.ResembleOnQuery => "error: --resemble is supported on the parse command only",
+        error.JsonlWithNamesOnly => "error: --jsonl and --names-only are mutually exclusive",
+        error.JsonlOnNonOutputCommand => "error: --jsonl is only supported on parse, parse-dir, and query commands",
     };
 }
 
@@ -138,7 +144,13 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
 
     // Help pre-scan: a Help_Flag anywhere wins over everything except NoCommand,
     // and takes precedence over Version_Flag (Requirement 5, 6).
+    // `--jsonl` conflicts with version/help output regardless of where the
+    // flags appear (R5/R6) — including argv where the first token is not a
+    // recognized command (e.g. `--jsonl --version`).
+    if (hasJsonl(args) and (hasVersionFlag(args) or hasHelpFlag(args))) return error.JsonlOnNonOutputCommand;
+
     if (helpScan(args)) {
+        if (hasJsonl(args)) return error.JsonlOnNonOutputCommand;
         return ParsedArgs{
             .command = .help,
             .target_path = "",
@@ -151,9 +163,11 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
 
     // Version and help are global commands: report and exit before any positional parsing.
     if (command == .version) {
+        if (hasJsonl(args)) return error.JsonlOnNonOutputCommand;
         return ParsedArgs{ .command = .version, .target_path = "" };
     }
     if (command == .help) {
+        if (hasJsonl(args)) return error.JsonlOnNonOutputCommand;
         return ParsedArgs{ .command = .help, .target_path = "", .help_topic = null };
     }
 
@@ -181,6 +195,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     var grammar_dir: ?[]const u8 = null;
     var node_filter: ?[]const u8 = null;
     var names_only: bool = false;
+    var jsonl: bool = false;
     var alternatives: bool = false;
     var resemble: bool = false;
 
@@ -202,11 +217,14 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
             node_filter = args[i];
         } else if (std.mem.eql(u8, arg, "--names-only")) {
             names_only = true;
+        } else if (std.mem.eql(u8, arg, "--jsonl")) {
+            jsonl = true;
         } else if (std.mem.eql(u8, arg, "--alternatives")) {
             alternatives = true;
         } else if (std.mem.eql(u8, arg, "--resemble")) {
             resemble = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            if (jsonl or hasJsonl(args)) return error.JsonlOnNonOutputCommand;
             return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
             return error.UnrecognizedFlag;
@@ -215,6 +233,8 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
         i += 1;
     }
 
+    if (names_only and jsonl) return error.JsonlWithNamesOnly;
+
     return ParsedArgs{
         .command = command,
         .target_path = target_path,
@@ -222,6 +242,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
         .grammar_dir = grammar_dir,
         .node_filter = node_filter,
         .names_only = names_only,
+        .jsonl = jsonl,
         .alternatives = alternatives,
         .resemble = resemble,
     };
@@ -243,6 +264,7 @@ fn parseQueryArgs(args: []const []const u8) CliError!ParsedArgs {
     // Parse optional flags starting from args[3]
     var grammar_path: ?[]const u8 = null;
     var names_only: bool = false;
+    var jsonl: bool = false;
 
     var i: usize = 3;
     while (i < args.len) {
@@ -254,11 +276,14 @@ fn parseQueryArgs(args: []const []const u8) CliError!ParsedArgs {
             grammar_path = args[i];
         } else if (std.mem.eql(u8, arg, "--names-only")) {
             names_only = true;
+        } else if (std.mem.eql(u8, arg, "--jsonl")) {
+            jsonl = true;
         } else if (std.mem.eql(u8, arg, "--alternatives")) {
             return error.AlternativesOnQuery;
         } else if (std.mem.eql(u8, arg, "--resemble")) {
             return error.ResembleOnQuery;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            if (jsonl or hasJsonl(args)) return error.JsonlOnNonOutputCommand;
             return ParsedArgs{ .command = .version, .target_path = "" };
         } else {
             return error.UnrecognizedFlag;
@@ -267,11 +292,14 @@ fn parseQueryArgs(args: []const []const u8) CliError!ParsedArgs {
         i += 1;
     }
 
+    if (names_only and jsonl) return error.JsonlWithNamesOnly;
+
     return ParsedArgs{
         .command = .query,
         .target_path = target_path,
         .grammar_path = grammar_path,
         .names_only = names_only,
+        .jsonl = jsonl,
         .query_selector = query_selector,
     };
 }
@@ -301,6 +329,30 @@ pub fn helpScan(args: []const []const u8) bool {
     return false;
 }
 
+/// Returns true if any argument in `args` is the `--jsonl` flag.
+/// Pure, allocation-free linear scan.
+fn hasJsonl(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--jsonl")) return true;
+    }
+    return false;
+}
+
+/// Returns true if any argument is a Version_Flag (`--version`/`-V`).
+fn hasVersionFlag(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) return true;
+    }
+    return false;
+}
+
+/// Returns true if any argument is a Help_Flag.
+fn hasHelpFlag(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return true;
+    }
+    return false;
+}
 /// Maps a token to a subcommand topic (only `parse`/`parse-dir`/`query`).
 /// Returns `null` for any other input (including `help`, `version`, `--help`, etc.).
 pub fn parseSubcommand(arg: []const u8) ?Command {
@@ -1159,4 +1211,86 @@ test "formatCliError: ResembleOnQuery message" {
 test "help text mentions --resemble" {
     try testing.expect(std.mem.indexOf(u8, general_help_text, "--resemble") != null);
     try testing.expect(std.mem.indexOf(u8, parse_help_text, "--resemble") != null);
+}
+
+// --- `--jsonl` flag tests (Spec: ndjson-output) ---
+
+test "--jsonl sets jsonl on parse" {
+    const args = &[_][]const u8{ "parse", "file.zig", "--jsonl" };
+    const result = try parseArgs(args);
+    try testing.expect(result.jsonl);
+    try testing.expect(!result.names_only);
+}
+
+test "--jsonl accepted order-independently on parse-dir and query" {
+    const r1 = try parseArgs(&.{ "parse-dir", "src", "--grammar-dir", "g", "--jsonl" });
+    try testing.expect(r1.jsonl);
+    const r2 = try parseArgs(&.{ "query", "function", "file.zig", "-g", "g.toml", "--jsonl" });
+    try testing.expect(r2.jsonl);
+    const r3 = try parseArgs(&.{ "parse", "file.zig", "--node", "fn", "--jsonl", "-g", "g.toml" });
+    try testing.expect(r3.jsonl);
+}
+
+test "--jsonl with --names-only is a usage error on all output commands" {
+    try testing.expectError(error.JsonlWithNamesOnly, parseArgs(&.{ "parse", "file.zig", "--jsonl", "--names-only" }));
+    try testing.expectError(error.JsonlWithNamesOnly, parseArgs(&.{ "parse", "file.zig", "--names-only", "--jsonl" }));
+    try testing.expectError(error.JsonlWithNamesOnly, parseArgs(&.{ "parse-dir", "src", "--jsonl", "--names-only" }));
+    try testing.expectError(error.JsonlWithNamesOnly, parseArgs(&.{ "query", "function", "file.zig", "-g", "g.toml", "--jsonl", "--names-only" }));
+    try testing.expectError(error.JsonlWithNamesOnly, parseArgs(&.{ "query", "function", "file.zig", "-g", "g.toml", "--names-only", "--jsonl" }));
+}
+
+test "--jsonl on version/help is a usage error" {
+    try testing.expectError(error.JsonlOnNonOutputCommand, parseArgs(&.{ "help", "--jsonl" }));
+    try testing.expectError(error.JsonlOnNonOutputCommand, parseArgs(&.{ "version", "--jsonl" }));
+    try testing.expectError(error.JsonlOnNonOutputCommand, parseArgs(&.{ "--jsonl", "--help" }));
+    try testing.expectError(error.JsonlOnNonOutputCommand, parseArgs(&.{ "--jsonl", "--version" }));
+    try testing.expectError(error.JsonlOnNonOutputCommand, parseArgs(&.{ "parse", "file.zig", "--version", "--jsonl" }));
+    try testing.expectError(error.JsonlOnNonOutputCommand, parseArgs(&.{ "query", "function", "file.zig", "-g", "g.toml", "--jsonl", "-V" }));
+}
+
+test "formatCliError: jsonl messages" {
+    try testing.expectEqualStrings("error: --jsonl and --names-only are mutually exclusive", formatCliError(error.JsonlWithNamesOnly));
+    try testing.expectEqualStrings("error: --jsonl is only supported on parse, parse-dir, and query commands", formatCliError(error.JsonlOnNonOutputCommand));
+}
+
+test "help texts mention --jsonl" {
+    try testing.expect(std.mem.indexOf(u8, general_help_text, "--jsonl") != null);
+    try testing.expect(std.mem.indexOf(u8, parse_help_text, "--jsonl") != null);
+    try testing.expect(std.mem.indexOf(u8, parse_dir_help_text, "--jsonl") != null);
+    try testing.expect(std.mem.indexOf(u8, query_help_text, "--jsonl") != null);
+}
+
+// Feature: ndjson-output, Property 7: jsonl plus names-only is a usage error
+test "property: jsonl plus names-only is a usage error (order-independent)" {
+    const tuple_gen = gen.tuple3(u8, u8, u16, gen.intRange(u8, 0, 5), gen.intRange(u8, 0, 5), gen.intRange(u16, 0, 1000));
+    try minish.check(testing.allocator, tuple_gen, struct {
+        fn prop(vals: struct { u8, u8, u16 }) !void {
+            const cmds = [_][]const u8{ "parse", "parse-dir", "query" };
+            const cmd = cmds[vals[2] % 3];
+            const pre = switch (cmd[0]) {
+                'p' => if (std.mem.eql(u8, cmd, "parse-dir")) &[_][]const u8{ cmd, "src" } else &[_][]const u8{ cmd, "f.zig" },
+                else => &[_][]const u8{ cmd, "function", "f.zig" },
+            };
+            var buf: [6][]const u8 = undefined;
+            var args_len: usize = 0;
+            for (pre) |p| {
+                buf[args_len] = p;
+                args_len += 1;
+            }
+            if (vals[0] % 2 == 0) {
+                buf[args_len] = "--jsonl";
+                args_len += 1;
+                buf[args_len] = "--names-only";
+                args_len += 1;
+            } else {
+                buf[args_len] = "--names-only";
+                args_len += 1;
+                buf[args_len] = "--jsonl";
+                args_len += 1;
+            }
+            _ = vals[1];
+            const result = parseArgs(buf[0..args_len]);
+            try testing.expectError(error.JsonlWithNamesOnly, result);
+        }
+    }.prop, .{ .num_runs = 100 });
 }

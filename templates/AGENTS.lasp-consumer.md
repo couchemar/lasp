@@ -68,7 +68,8 @@ diff /tmp/before.txt <(lasp parse src/app.py -g .lasp/grammars/python.toml --nod
 
 **Count constructs:**
 ```bash
-lasp parse src/app.py -g .lasp/grammars/python.toml --node function --names-only | wc -l
+lasp parse src/app.py -g .lasp/grammars/python.toml --node function --jsonl | wc -l
+# (--jsonl counts events exactly, one JSON value per line; --names-only counts renderable captures)
 ```
 
 **Pipe source from stdin** (no file on disk):
@@ -98,8 +99,9 @@ lasp parse <file> -g .lasp/grammars/<lang>.toml --node function   # only events 
 lasp parse <file> -g .lasp/grammars/<lang>.toml --names-only      # first capture value per event, one per line
 lasp parse <file> -g .lasp/grammars/<lang>.toml --alternatives    # each event gains an "alternatives" array of losing competitors (parse only)
 lasp parse <file> -g .lasp/grammars/<lang>.toml --resemble      # advisory grammar-projected resemblance candidates in alternatives (parse only)
+lasp parse <file> -g .lasp/grammars/<lang>.toml --jsonl         # NDJSON: one JSON value per line (parse/parse-dir/query)
 ```
-`--node` and `--names-only` compose, and both are silently ignored when no grammar is given (raw tokens are emitted instead). `--alternatives` is parse-only (rejected on `query`), off by default, and ignored by `--names-only`; when set, each event carries an `alternatives` array listing the same-region candidates that lost the tiebreak, each with only `type`, `confidence`, and captures. `--resemble` is also parse-only: it scores each token's partial membership against the grammar's own `char_class_run` kinds and appends the best above-floor match as an advisory alternative (`"source": "resemblance"` + `resembled_kind`/`membership`). It implies alternatives collection, never changes the winner, and emits nothing when the flag is off.
+`--node` and `--names-only` compose, and both are silently ignored when no grammar is given (raw tokens are emitted instead). `--alternatives` is parse-only (rejected on `query`), off by default, and ignored by `--names-only`; when set, each event carries an `alternatives` array listing the same-region candidates that lost the tiebreak, each with only `type`, `confidence`, and captures. `--resemble` is also parse-only: it scores each token's partial membership against the grammar's own `char_class_run` kinds and appends the best above-floor match as an advisory alternative (`"source": "resemblance"` + `resembled_kind`/`membership`). It implies alternatives collection, never changes the winner, and emits nothing when the flag is off. `--jsonl` emits one JSON value per line (no wrapper; `file`/`grammar` lead in dir mode), is mutually exclusive with `--names-only`, and is rejected on `version`/`help`.
 
 ### Structural query (CSS-selector-inspired)
 ```bash
