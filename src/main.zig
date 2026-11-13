@@ -488,17 +488,29 @@ fn run(
     try stdout.flush();
 }
 
-/// --names-only rendering: an integer field precedes string captures in emission
-/// order, so when present it renders as decimal digits on its own line;
-/// otherwise the first capture value renders (unchanged behavior).
+/// `--names-only` value selector: an event renders its first string capture;
+/// an event with no string capture falls back to its leading integer field
+/// (decimal digits); an event with neither renders nothing. No allocation,
+/// no I/O — `writeNamesOnlyLine` delegates to this pure selector.
+const NamesOnlyValue = union(enum) { text: []const u8, number: u32 };
+
+fn namesOnlyValue(event: events.StructuralEvent) ?NamesOnlyValue {
+    if (event.captures.len > 0) return .{ .text = event.captures[0].value };
+    if (event.int_fields.len > 0) return .{ .number = event.int_fields[0].value };
+    return null;
+}
+
+/// `--names-only` rendering: the first string capture renders; an event with
+/// no string capture falls back to its leading integer field (decimal digits);
+/// an event with neither prints nothing. Each value ends in a single '\n'.
 fn writeNamesOnlyLine(stdout: *std.Io.Writer, event: events.StructuralEvent) !void {
-    if (event.int_fields.len > 0) {
-        try stdout.print("{d}\n", .{event.int_fields[0].value});
-        return;
-    }
-    if (event.captures.len > 0) {
-        try stdout.writeAll(event.captures[0].value);
-        try stdout.writeAll("\n");
+    const value = namesOnlyValue(event) orelse return;
+    switch (value) {
+        .text => |t| {
+            try stdout.writeAll(t);
+            try stdout.writeAll("\n");
+        },
+        .number => |n| try stdout.print("{d}\n", .{n}),
     }
 }
 /// Shared "source + grammar → structural events" pipeline used by single-file
@@ -656,7 +668,7 @@ test "integration: count tables emit integer fields in JSON" {
     try std.testing.expectEqual(@as(i64, 1), args2.integer);
 }
 
-test "integration: query on count field + names-only renders count first" {
+test "integration: query on count field + names-only renders name, not count" {
     const allocator = std.testing.allocator;
 
     const q = try runLasp(allocator, &.{
@@ -690,15 +702,18 @@ test "integration: query on count field + names-only renders count first" {
         allocator.free(n.stderr);
     }
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, n.term);
-    // Integer field comes first in emission order → counts, not capture text.
-    var count_lines: usize = 0;
+    // String capture is preferred over the integer field → names, not counts.
+    var lines: usize = 0;
+    var all_digit: bool = false;
     var rest: []const u8 = n.stdout;
     while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
         const line = rest[0..nl];
-        if (std.mem.eql(u8, line, "3") or std.mem.eql(u8, line, "1")) count_lines += 1;
+        lines += 1;
+        if (std.mem.eql(u8, line, "add") or std.mem.eql(u8, line, "one")) {} else if (std.mem.eql(u8, line, "3") or std.mem.eql(u8, line, "1")) all_digit = true;
         rest = rest[nl + 1 ..];
     }
-    try std.testing.expectEqual(@as(usize, 2), count_lines);
+    try std.testing.expectEqual(@as(usize, 2), lines);
+    try std.testing.expectEqual(false, all_digit);
 }
 
 // Feature: region-extent, Integration
@@ -2499,7 +2514,338 @@ test "property: names-only output correctness" {
         }
     }.prop, .{ .num_runs = 100 });
 }
+// Feature: names-only-prefer-string-capture
+// Test-only copy of the unfixed helper (the F reference): integer first, then capture.
+fn referenceWriteNamesOnlyLine(stdout: *std.Io.Writer, event: events.StructuralEvent) !void {
+    if (event.int_fields.len > 0) {
+        try stdout.print("{d}\n", .{event.int_fields[0].value});
+        return;
+    }
+    if (event.captures.len > 0) {
+        try stdout.writeAll(event.captures[0].value);
+        try stdout.writeAll("\n");
+    }
+}
 
+fn namesOnlyTestEvent(captures: []const events.CaptureEntry, ints: []const events.IntegerField) events.StructuralEvent {
+    return .{
+        .type_name = "test",
+        .captures = captures,
+        .start = 0,
+        .end = 10,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .int_fields = ints,
+    };
+}
+
+fn renderNamesOnly(allocator: std.mem.Allocator, event: events.StructuralEvent, reference: bool) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    if (reference) {
+        try referenceWriteNamesOnlyLine(&aw.writer, event);
+    } else {
+        try writeNamesOnlyLine(&aw.writer, event);
+    }
+    return aw.toOwnedSlice();
+}
+
+/// Generated event storage: captures "c<seed>_<i>" and u32 integer fields.
+const NamesOnlyGen = struct {
+    captures: []events.CaptureEntry,
+    ints: []events.IntegerField,
+    values: [][]u8,
+
+    fn init(allocator: std.mem.Allocator, ncap: usize, nint: usize, seed: u32) !NamesOnlyGen {
+        const captures = try allocator.alloc(events.CaptureEntry, ncap);
+        errdefer allocator.free(captures);
+        const values = try allocator.alloc([]u8, ncap);
+        errdefer allocator.free(values);
+        var made: usize = 0;
+        errdefer for (values[0..made]) |v| allocator.free(v);
+        while (made < ncap) : (made += 1) {
+            values[made] = try std.fmt.allocPrint(allocator, "c{d}_{d}", .{ seed, made });
+            captures[made] = .{ .field_name = "name", .value = values[made] };
+        }
+        const ints = try allocator.alloc(events.IntegerField, nint);
+        for (ints, 0..) |*f, i| f.* = .{ .field_name = "n", .value = seed *% 2654435761 +% @as(u32, @intCast(i)) };
+        return .{ .captures = captures, .ints = ints, .values = values };
+    }
+
+    fn deinit(self: NamesOnlyGen, allocator: std.mem.Allocator) void {
+        for (self.values) |v| allocator.free(v);
+        allocator.free(self.values);
+        allocator.free(self.captures);
+        allocator.free(self.ints);
+    }
+};
+
+test "unit: namesOnlyValue prefers first string capture over integer fields" {
+    const caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "add" }};
+    const ints = [_]events.IntegerField{.{ .field_name = "args", .value = 3 }};
+    const v = namesOnlyValue(namesOnlyTestEvent(&caps, &ints)).?;
+    try std.testing.expectEqualStrings("add", v.text);
+}
+
+test "unit: namesOnlyValue extent shape (capture n + integer body) returns text" {
+    const caps = [_]events.CaptureEntry{.{ .field_name = "n", .value = "foo" }};
+    const ints = [_]events.IntegerField{.{ .field_name = "body", .value = 10815 }};
+    const v = namesOnlyValue(namesOnlyTestEvent(&caps, &ints)).?;
+    try std.testing.expectEqualStrings("foo", v.text);
+}
+
+test "unit: namesOnlyValue several captures and integers returns first capture" {
+    const caps = [_]events.CaptureEntry{
+        .{ .field_name = "a", .value = "first" },
+        .{ .field_name = "b", .value = "second" },
+    };
+    const ints = [_]events.IntegerField{
+        .{ .field_name = "x", .value = 0 },
+        .{ .field_name = "y", .value = 9 },
+    };
+    const v = namesOnlyValue(namesOnlyTestEvent(&caps, &ints)).?;
+    try std.testing.expectEqualStrings("first", v.text);
+}
+
+test "unit: namesOnlyValue integer-only returns number, including 0" {
+    const zero = [_]events.IntegerField{.{ .field_name = "body", .value = 0 }};
+    const v0 = namesOnlyValue(namesOnlyTestEvent(&.{}, &zero)).?;
+    try std.testing.expectEqual(@as(u32, 0), v0.number);
+    const some = [_]events.IntegerField{ .{ .field_name = "body", .value = 42 }, .{ .field_name = "z", .value = 7 } };
+    const v1 = namesOnlyValue(namesOnlyTestEvent(&.{}, &some)).?;
+    try std.testing.expectEqual(@as(u32, 42), v1.number);
+}
+
+test "unit: namesOnlyValue string-only returns text; neither returns null" {
+    const caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "solo" }};
+    const v = namesOnlyValue(namesOnlyTestEvent(&caps, &.{})).?;
+    try std.testing.expectEqualStrings("solo", v.text);
+    try std.testing.expect(namesOnlyValue(namesOnlyTestEvent(&.{}, &.{})) == null);
+}
+
+test "unit: writeNamesOnlyLine renders text, number, nothing, and empty capture" {
+    const allocator = std.testing.allocator;
+    const caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "name" }};
+    const out_text = try renderNamesOnly(allocator, namesOnlyTestEvent(&caps, &.{}), false);
+    defer allocator.free(out_text);
+    try std.testing.expectEqualStrings("name\n", out_text);
+
+    const ints = [_]events.IntegerField{.{ .field_name = "body", .value = 12 }};
+    const out_num = try renderNamesOnly(allocator, namesOnlyTestEvent(&.{}, &ints), false);
+    defer allocator.free(out_num);
+    try std.testing.expectEqualStrings("12\n", out_num);
+
+    const out_none = try renderNamesOnly(allocator, namesOnlyTestEvent(&.{}, &.{}), false);
+    defer allocator.free(out_none);
+    try std.testing.expectEqual(@as(usize, 0), out_none.len);
+
+    const empty_caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "" }};
+    const out_empty = try renderNamesOnly(allocator, namesOnlyTestEvent(&empty_caps, &.{}), false);
+    defer allocator.free(out_empty);
+    try std.testing.expectEqualStrings("\n", out_empty);
+}
+
+test "unit: writeNamesOnlyLine both kinds incl. integer 0 prints the name (bug condition)" {
+    const allocator = std.testing.allocator;
+    const caps = [_]events.CaptureEntry{.{ .field_name = "n", .value = "add" }};
+    const ints = [_]events.IntegerField{ .{ .field_name = "args", .value = 0 }, .{ .field_name = "body", .value = 99 } };
+    const out = try renderNamesOnly(allocator, namesOnlyTestEvent(&caps, &ints), false);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("add\n", out);
+}
+
+// Feature: names-only-prefer-string-capture, Property 1: events with a string capture and
+// an integer field render captures[0].value ++ "\n"
+test "property: names-only prefers first string capture (Property 1)" {
+    const t = comptime gen.tuple3(u8, u8, u32, gen.intRange(u8, 1, 3), gen.intRange(u8, 1, 3), gen.intRange(u32, 0, std.math.maxInt(u32)));
+    try minish.check(std.testing.allocator, t, struct {
+        fn prop(v: struct { u8, u8, u32 }) !void {
+            const allocator = std.testing.allocator;
+            const g = try NamesOnlyGen.init(allocator, v[0], v[1], v[2]);
+            defer g.deinit(allocator);
+            const out = try renderNamesOnly(allocator, namesOnlyTestEvent(g.captures, g.ints), false);
+            defer allocator.free(out);
+            const expected = try std.fmt.allocPrint(allocator, "{s}\n", .{g.captures[0].value});
+            defer allocator.free(expected);
+            try std.testing.expectEqualStrings(expected, out);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: names-only-prefer-string-capture, Property 2: non-bug events render as the
+// unfixed reference helper does
+test "property: names-only preserves non-buggy events (Property 2)" {
+    const t = comptime gen.tuple3(u8, u8, u32, gen.intRange(u8, 0, 3), gen.intRange(u8, 0, 3), gen.intRange(u32, 0, std.math.maxInt(u32)));
+    try minish.check(std.testing.allocator, t, struct {
+        fn prop(v: struct { u8, u8, u32 }) !void {
+            // Restrict to captures.len == 0 or int_fields.len == 0.
+            const ncap: usize = v[0];
+            const nint: usize = if (ncap > 0) 0 else v[1];
+            const allocator = std.testing.allocator;
+            const g = try NamesOnlyGen.init(allocator, ncap, nint, v[2]);
+            defer g.deinit(allocator);
+            const ev = namesOnlyTestEvent(g.captures, g.ints);
+            const fixed = try renderNamesOnly(allocator, ev, false);
+            defer allocator.free(fixed);
+            const ref = try renderNamesOnly(allocator, ev, true);
+            defer allocator.free(ref);
+            try std.testing.expectEqualStrings(ref, fixed);
+            if (ncap == 0 and nint > 0) {
+                const digits = try std.fmt.allocPrint(allocator, "{d}\n", .{g.ints[0].value});
+                defer allocator.free(digits);
+                try std.testing.expectEqualStrings(digits, fixed);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: names-only-prefer-string-capture, Property 3: framing over mixed event lists
+test "property: names-only framing (Property 3)" {
+    const t = comptime gen.tuple2(u8, u32, gen.intRange(u8, 0, 6), gen.intRange(u32, 0, std.math.maxInt(u32)));
+    try minish.check(std.testing.allocator, t, struct {
+        fn prop(v: struct { u8, u32 }) !void {
+            const allocator = std.testing.allocator;
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            var renderable: usize = 0;
+            var i: usize = 0;
+            while (i < v[0]) : (i += 1) {
+                const sel: u32 = (v[1] +% @as(u32, @intCast(i)) *% 7) % 4;
+                const ncap: usize = sel & 1;
+                const nint: usize = (sel >> 1) & 1;
+                const g = try NamesOnlyGen.init(allocator, ncap, nint, v[1] +% @as(u32, @intCast(i)));
+                defer g.deinit(allocator);
+                if (ncap > 0 or nint > 0) renderable += 1;
+                try writeNamesOnlyLine(&aw.writer, namesOnlyTestEvent(g.captures, g.ints));
+            }
+            const out = aw.written();
+            try std.testing.expectEqual(renderable, std.mem.count(u8, out, "\n"));
+            try std.testing.expect(out.len == 0 or out[out.len - 1] == '\n');
+            try std.testing.expect(std.mem.indexOf(u8, out, "\n\n") == null);
+            if (renderable == 0) try std.testing.expectEqual(@as(usize, 0), out.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+fn allLinesNonDigit(text: []const u8) bool {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var digits = true;
+        for (line) |c| {
+            if (c < '0' or c > '9') digits = false;
+        }
+        if (digits) return false;
+    }
+    return true;
+}
+
+test "integration: names-only extent_brace prints function names, not offsets" {
+    const allocator = std.testing.allocator;
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "tests/fixtures/grammars/extent_brace.toml", "--names-only" }, "fn alpha() { x }\nfn beta() { y }\n");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expectEqualStrings("alpha\nbeta\n", r.stdout);
+    try std.testing.expect(allLinesNonDigit(r.stdout));
+}
+
+test "integration: names-only extent_terminator (no captures) prints offsets as digits" {
+    const allocator = std.testing.allocator;
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "tests/fixtures/grammars/extent_terminator.toml", "--names-only" }, "foo()\nbody.\nbar()\nx.\n");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expect(r.stdout.len > 0);
+    var it = std.mem.splitScalar(u8, r.stdout, '\n');
+    var lines: usize = 0;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        lines += 1;
+        _ = try std.fmt.parseInt(u32, line, 10);
+    }
+    try std.testing.expect(lines >= 1);
+    try std.testing.expect(!std.mem.endsWith(u8, r.stdout, "\n\n"));
+}
+
+test "integration: names-only default-grammar sites print names (parse and query)" {
+    const allocator = std.testing.allocator;
+    const counts_toml =
+        \\[language]
+        \\name = "counts"
+        \\extensions = [".cnt"]
+        \\
+        \\[[patterns]]
+        \\type = "fn"
+        \\sequence = ["identifier", "$n:IDENTIFIER"]
+        \\
+        \\[[patterns.count]]
+        \\field = "args"
+        \\open = "("
+        \\close = ")"
+        \\separator = ","
+        \\
+    ;
+    try seedDefaultGrammars(allocator, &.{.{ .name = "counts.toml", .content = counts_toml }});
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+    const src = "test_names_only_default.cnt";
+    try writeFixtureFile(std.testing.io, src, "fn add(a, b, c) {}\nfn one(x) {}\n");
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, src) catch {};
+
+    const p = try runLasp(allocator, &.{ "parse", src, "--names-only" });
+    defer {
+        allocator.free(p.stdout);
+        allocator.free(p.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, p.term);
+    try std.testing.expectEqualStrings("add\none\n", p.stdout);
+
+    const q = try runLasp(allocator, &.{ "query", "fn[args>0]", src, "--names-only" });
+    defer {
+        allocator.free(q.stdout);
+        allocator.free(q.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, q.term);
+    try std.testing.expectEqualStrings("add\none\n", q.stdout);
+}
+
+test "integration: names-only --node nosuchtype is zero bytes; JSON and --jsonl guard preserved" {
+    const allocator = std.testing.allocator;
+    const none = try runLasp(allocator, &.{ "parse", "tests/fixtures/counts_sample.txt", "-g", "tests/fixtures/grammars/counts.toml", "--node", "nosuchtype", "--names-only" });
+    defer {
+        allocator.free(none.stdout);
+        allocator.free(none.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, none.term);
+    try std.testing.expectEqual(@as(usize, 0), none.stdout.len);
+
+    const names = try runLasp(allocator, &.{ "parse", "tests/fixtures/counts_sample.txt", "-g", "tests/fixtures/grammars/counts.toml", "--names-only" });
+    defer {
+        allocator.free(names.stdout);
+        allocator.free(names.stderr);
+    }
+    try std.testing.expect(!std.mem.endsWith(u8, names.stdout, "\n\n"));
+
+    const plain = try runLasp(allocator, &.{ "parse", "tests/fixtures/counts_sample.txt", "-g", "tests/fixtures/grammars/counts.toml" });
+    defer {
+        allocator.free(plain.stdout);
+        allocator.free(plain.stderr);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, plain.stdout, "\"args\": 3") != null);
+
+    const bad = try runLasp(allocator, &.{ "parse", "tests/fixtures/counts_sample.txt", "-g", "tests/fixtures/grammars/counts.toml", "--jsonl", "--names-only" });
+    defer {
+        allocator.free(bad.stdout);
+        allocator.free(bad.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(bad.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, bad.stderr, "mutually exclusive") != null);
+}
 // Helper: run lasp with data piped to stdin
 fn runLaspWithStdin(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: []const u8) !struct { stdout: []u8, stderr: []u8, term: std.process.Child.Term } {
     const io = std.testing.io;

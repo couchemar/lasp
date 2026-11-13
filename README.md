@@ -330,7 +330,7 @@ Outputs `Capture` struct:
 ```zig
 const Capture = struct { name: []const u8, position: usize };
 ```
-Parameterized captures `$name:IDENTIFIER(sep="...", suffix="...")` were **removed** (rejected with `ParenthesizedCaptureParam`); the same span behavior is now expressed with plain `[[patterns.capture]]` tables, and `[[patterns.count]]` tables add **integer** result fields (JSON bare numbers, numeric query conditions like `[args>1]`, rendered first by `--names-only`). Typed captures `$field:NUMBER` / `$field:STRING` capture any token of the named kind, `string` is a kind wildcard, and `Name:KIND` constrains exact text over any kind.
+Parameterized captures `$name:IDENTIFIER(sep="...", suffix="...")` were **removed** (rejected with `ParenthesizedCaptureParam`); the same span behavior is now expressed with plain `[[patterns.capture]]` tables, and `[[patterns.count]]` tables add **integer** result fields (JSON bare numbers, numeric query conditions like `[args>1]`, `--names-only` falls back to them only when an event has no string capture). Typed captures `$field:NUMBER` / `$field:STRING` capture any token of the named kind, `string` is a kind wildcard, and `Name:KIND` constrains exact text over any kind.
 
 ### Exact Identifier Matching
 To match an identifier with specific text without capturing, use `Name:IDENTIFIER`:

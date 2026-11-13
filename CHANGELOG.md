@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `--names-only` now prints the first string capture even when the event also has a count or extent integer field; the leading integer is printed only for events with no string capture. Amends the plain-toml-capture-tables 'leading integer first' rule. Shared helper `writeNamesOnlyLine` now delegates to the pure selector `namesOnlyValue`. (Spec: names-only-prefer-string-capture)
+
 ### Added
 
 - Directory walk (`parse-dir`): parses every file in a directory tree whose basename ends with a grammar's `[language] extensions` entry (suffix match), emitting one JSON array of `{ "file", "grammar", "events" }` objects — one entry per matching `(file, grammar)` pair, events byte-identical to single-file `parse`. Recursive over subdirectories; unmatched files skipped silently; `--node` filters each entry's events; grammars load from `--grammar-dir` in sorted order with each automaton compiled once and reused; missing/non-directory target or grammar dir and malformed grammars exit non-zero naming the offending path; without `--grammar-dir` the output is `[]` with exit zero and the target is never read as a single file. New loader field `Grammar.extensions` with `InvalidExtensionsList` validation; `serializeDirResults` in `src/output/json.zig`. (Spec: parse-dir-directory-walk)

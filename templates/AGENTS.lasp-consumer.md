@@ -252,7 +252,7 @@ open = "("
 close = ")"
 separator = ","
 ```
-- Emitted as a bare JSON number (never a quoted string), queryable with numeric conditions (`[args>1]`), and rendered first by `--names-only`.
+- Emitted as a bare JSON number (never a quoted string), queryable with numeric conditions (`[args>1]`), and printed by `--names-only` only when the event has no string capture.
 - Validation: each of `field`/`open`/`close`/`separator` required non-empty (1–8 bytes), ≤16 tables per pattern, no collisions with captures or earlier count fields.
 
 ### Region extent (`[[patterns.extent]]`)
@@ -269,7 +269,7 @@ close = "}"
 ```
 - **Balanced mode** (`open`/`close`): depth-balanced scan to the matching close; extent = that close token's end (unclosed/missing open ⇒ EOF; `open == close` ⇒ no nesting).
 - **Terminator mode** (`terminator` + optional `at_column`): extent = end of the first qualifying terminator token (column-filtered when `at_column` given; none ⇒ EOF).
-- Extent values are bare JSON integers, numerically queryable (`[body>N]`), and `--names-only` renders the leading integer field first. Use them to slice a file by construct range (e.g. read exactly one function). `block_end` stays `null`.
+- Extent values are bare JSON integers, numerically queryable (`[body>N]`), and `--names-only` prints the first string capture (the leading integer field only when there is none). Use them to slice a file by construct range (e.g. read exactly one function). `block_end` stays `null`.
 - Load-time validation: exactly one mode; `field` 1–64 bytes; delimiters 1–8 bytes; `at_column` 0–65535 and terminator-only; no field collisions with captures/counts; at most one table per pattern.
 
 ### Position constraint

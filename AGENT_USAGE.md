@@ -592,7 +592,7 @@ close = "}"
 ```
 - **Balanced mode** (`open` + `close`): depth-balanced forward scan to the matching close delimiter; extent = that close token's end. Unclosed, or no `open` at/after the match, ⇒ EOF. `open == close` ⇒ no nesting (first occurrence opens, next closes).
 - **Terminator mode** (`terminator`, optional `at_column`): extent = end of the first token byte-equal to `terminator`, restricted to 0-based `at_column` when supplied; none found ⇒ EOF.
-- Output: bare JSON integer (never quoted), queryable with numeric conditions (`[body>100]`), rendered first by `--names-only` when no capture precedes it; `block_end` stays `null` (extent is the single region-end answer).
+- Output: bare JSON integer (never quoted), queryable with numeric conditions (`[body>100]`), `--names-only` prints the first string capture and falls back to this integer only when the event has no string capture; `block_end` stays `null` (extent is the single region-end answer).
 - Validation: mode conflict / missing mode / half-balanced / `field` empty or >64 bytes / delimiter empty or >8 bytes / `at_column` without terminator or outside 0–65535 / field collision with captures·counts / >1 table per pattern — each a load-time grammar error.
 - No extent table ⇒ byte-identical output.
 
