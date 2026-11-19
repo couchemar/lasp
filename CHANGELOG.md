@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-19
+
 ### Fixed
 
 - `.qmd` code-chunk label capture: a `char_class_run` spec such as `a-zA-Z0-9_\-Ѐ-ӿ` compiled `\-<byte>` as a byte range starting at 0x5C, which swallowed `}` and most punctuation, so ```` ```{r setup} ```` captured `label = "setup}"`, never closed, and emitted no event. `\` is now an escape (below), so `continue = "a-zA-Z0-9_\\-"` captures `setup`. Also fixes non-ASCII ranges such as `Ѐ-ӿ` silently compiling to unrelated byte ranges (accepting `é`, rejecting `中`). (feedbacks/2026-11-18.md; Spec: charset-escape-and-nonascii-ranges)
