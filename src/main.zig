@@ -11,6 +11,9 @@ pub const query_filter = @import("query/filter.zig");
 pub const query_parser = @import("query/parser.zig");
 pub const query_evaluator = @import("query/evaluator.zig");
 const build_options = @import("build_options");
+/// Single message for `error.InvalidCharSet` (empty, inverted, non-ASCII endpoint, or bad escape).
+const invalid_char_set_message = "error: [tokens] invalid char set: ranges must have ASCII endpoints and run low-to-high, use \\- for a literal '-' and \\\\ for a literal '\\' (other escapes are not allowed)";
+
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
 /// Prints descriptive error messages to stderr for FileNotFound and AccessDenied.
@@ -160,7 +163,7 @@ fn run(
                         error.DuplicateKindName => "error: [tokens] duplicate kind name",
                         error.EmptyKindName => "error: [tokens] kind name must not be empty",
                         error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
-                        error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
+                        error.InvalidCharSet => invalid_char_set_message,
                         error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
                         error.OutOfMemory => "out of memory",
                         else => "unknown grammar error",
@@ -318,7 +321,7 @@ fn run(
                         error.DuplicateKindName => "error: [tokens] duplicate kind name",
                         error.EmptyKindName => "error: [tokens] kind name must not be empty",
                         error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
-                        error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
+                        error.InvalidCharSet => invalid_char_set_message,
                         error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
                         error.InvalidCountTable => "error: [[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)",
                         error.TooManyCountTables => "error: too many [[patterns.count]] tables (max 16)",
@@ -998,7 +1001,7 @@ fn loadGrammarsFromDir(io: std.Io, allocator: std.mem.Allocator, gdir: []const u
                 error.DuplicateKindName => "error: [tokens] duplicate kind name",
                 error.EmptyKindName => "error: [tokens] kind name must not be empty",
                 error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
-                error.InvalidCharSet => "error: [tokens] invalid char set (empty or inverted range)",
+                error.InvalidCharSet => invalid_char_set_message,
                 error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
                 error.InvalidCountTable => "error: [[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)",
                 error.TooManyCountTables => "error: too many [[patterns.count]] tables (max 16)",
@@ -4066,6 +4069,102 @@ test "integration: events after a multi-line delimited_span have ground-truth li
         n += 1;
     }
     try std.testing.expectEqual(@as(usize, 5), n);
+}
+
+// charset-escape-and-nonascii-ranges E6 (Property 1). Encodes the FIXED behavior.
+fn expectSetupLabelEvent(fixture: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", fixture }, "```{r setup}\n");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+    defer parsed.deinit();
+    const evs = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqualStrings("setup", evs[0].object.get("label").?.string);
+}
+
+test "charset exploration E6: escaped dash in continue set captures label 'setup'" {
+    try expectSetupLabelEvent("tests/fixtures/grammars/charset_escape.toml");
+}
+
+test "charset exploration E6b: escaped dash before a non-ASCII literal does not swallow '}'" {
+    try expectSetupLabelEvent("tests/fixtures/grammars/charset_escape_nonascii.toml");
+}
+
+// charset-escape-and-nonascii-ranges: CLI / integration tests (U12, I1, I3).
+// Writes a one-kind grammar with the given char-set TOML fragment to a temp
+// file, runs `parse` on it, and removes the file.
+const CharSetRun = struct { stdout: []u8, stderr: []u8, term: std.process.Child.Term };
+
+fn runWithCharSetGrammar(allocator: std.mem.Allocator, kind_body: []const u8) !CharSetRun {
+    const io = std.testing.io;
+    const path = "test_charset_tmp_grammar.toml";
+    const toml_text = try std.fmt.allocPrint(
+        allocator,
+        "[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n[tokens]\nident = {{ char_class_run = {{ {s} }} }}\n",
+        .{kind_body},
+    );
+    defer allocator.free(toml_text);
+    try writeFixtureFile(io, path, toml_text);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const r = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", path });
+    return .{ .stdout = r.stdout, .stderr = r.stderr, .term = r.term };
+}
+
+test "charset U12: non-ASCII range endpoint fails with an actionable message" {
+    const allocator = std.testing.allocator;
+    const r = try runWithCharSetGrammar(allocator, "start = \"a-é\"");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(r.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "ASCII endpoints") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "\\-") != null);
+}
+
+test "charset I1: the old non-ASCII-range workaround fails to load with the new message" {
+    const allocator = std.testing.allocator;
+    const r = try runWithCharSetGrammar(allocator, "start = \"a-zA-Z_\", continue = \"a-zA-Z0-9_Ѐ-ӿ-\"");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expect(!std.meta.eql(r.term, std.process.Child.Term{ .exited = 0 }));
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "ASCII endpoints") != null);
+}
+
+test "charset I3: example and valid fixture grammars still load" {
+    const allocator = std.testing.allocator;
+    const dir = try runLasp(allocator, &.{ "parse-dir", "tests/fixtures", "--grammar-dir", "examples/grammars" });
+    defer {
+        allocator.free(dir.stdout);
+        allocator.free(dir.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, dir.term);
+
+    // Intentionally malformed fixtures (malformed, invalid_position, bad_prior) are excluded.
+    const valid = [_][]const u8{
+        "charset_escape", "charset_escape_nonascii", "colliding_function_call",
+        "counts",         "extent_brace",            "extent_terminator",
+        "multiline_span", "multiline_span_position", "number",
+        "resemblance",    "typed",                   "union",
+        "zig",
+    };
+    for (valid) |name| {
+        const path = try std.fmt.allocPrint(allocator, "tests/fixtures/grammars/{s}.toml", .{name});
+        defer allocator.free(path);
+        const r = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", path });
+        defer {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    }
 }
 
 // Regression guard: passes before AND after the fix. markdown_tasks.toml has no

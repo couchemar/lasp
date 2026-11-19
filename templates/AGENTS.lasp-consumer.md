@@ -223,11 +223,11 @@ ident = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_" } }
 quoted_atom = { delimited_span = { open = "'", close = "'" } }
 arrow = { literal_set = ["->", "=>"] }
 ```
-- `char_class_run`: greedy run of one `start` char then `continue` chars (defaults to `start`); char-set specs support literals and ranges (`a-zA-Z0-9_`).
+- `char_class_run`: greedy run of one `start` char then `continue` chars (defaults to `start`); char-set specs support literals and inclusive ASCII ranges (`a-zA-Z0-9_`). A `-` at the start or end of a spec, or written `\-`, is a literal; `\\` is a literal backslash; any other `\` use is an error. Specs are byte-based: a range with a non-ASCII endpoint (`Ѐ-ӿ`, `a-é`) is rejected. In TOML, double the backslash: `continue = "a-zA-Z0-9_\\-"`.
 - `delimited_span`: `open`…`close` with optional single-char `escape`; unclosed spans extend to EOF.
 - `literal_set`: longest matching literal (non-empty members).
 - Patterns reference kinds by name: bare `ident`, exact-text `foo:ident`, or typed capture `$field:ident`. Built-in names keep their default semantics; unknown custom names with class/span recognizers behave like identifiers, literal-set kinds like symbols.
-- A grammar without `[tokens]` is byte-for-byte identical to pre-feature output. Invalid declarations (empty/inverted char sets, empty spans/literal sets, zero or multiple recognizers, empty names) are grammar errors.
+- A grammar without `[tokens]` is byte-for-byte identical to pre-feature output. Invalid declarations (empty/inverted/non-ASCII-range char sets, malformed char-set escapes, empty spans/literal sets, zero or multiple recognizers, empty names) are grammar errors.
 
 ### Capture modifier tables (`[[patterns.capture]]`)
 Attaches separator/suffix span behavior to a field already declared bare in `sequence` (the removed `$field:KIND(sep=...)` form):

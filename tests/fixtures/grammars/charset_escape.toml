@@ -1,0 +1,11 @@
+# Fixture for the charset-escape-and-nonascii-ranges spec: a label kind whose
+# `continue` set holds a literal '-' written as the escape `\-`.
+[language]
+name = "charset-escape"
+[tokens]
+fence = { literal_set = ["```"] }
+brace = { literal_set = ["{", "}"] }
+label = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_\\-" } }
+[[patterns]]
+type = "chunk"
+sequence = ["fence", "{", "r:label", "$label:label", "}"]

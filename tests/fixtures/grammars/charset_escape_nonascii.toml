@@ -1,0 +1,11 @@
+# Variant of charset_escape.toml with a single non-ASCII literal after `\-` (the original .qmd shape).
+# Unfixed: `\-<D0>` compiles as the byte range 0x5C..0xD0 and swallows `}`.
+[language]
+name = "charset-escape"
+[tokens]
+fence = { literal_set = ["```"] }
+brace = { literal_set = ["{", "}"] }
+label = { char_class_run = { start = "a-zA-Z_", continue = "a-zA-Z0-9_\\-Ѐ" } }
+[[patterns]]
+type = "chunk"
+sequence = ["fence", "{", "r:label", "$label:label", "}"]

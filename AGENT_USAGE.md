@@ -530,13 +530,13 @@ quoted_atom = { delimited_span = { open = "'", close = "'" } }
 arrow = { literal_set = ["->", "=>"] }
 ```
 
-- `char_class_run`: greedy run of one `start` char then `continue` chars (defaults to `start`); char-set specs support literals and ranges (`a-zA-Z0-9_`).
+- `char_class_run`: greedy run of one `start` char then `continue` chars (defaults to `start`); char-set specs support literals and inclusive ASCII ranges (`a-zA-Z0-9_`). A `-` at the start or end of a spec, or written `\-`, is a literal; `\\` is a literal backslash; any other `\` use is an error. Specs are byte-based: non-ASCII bytes are accepted only as single literals, and a range with a non-ASCII endpoint (`Ѐ-ӿ`, `a-é`) is rejected (UTF-8 code-point ranges are a known limitation). `x-?` is an ordinary range; write `x\-?` for three literals. In TOML, double the backslash: `continue = "a-zA-Z0-9_\\-"`.
 - `delimited_span`: `open`…`close` with optional single-char `escape`; unclosed spans extend to EOF.
 - `literal_set`: longest matching literal (non-empty members).
 - Declaration order is matching priority; the first recognizer that matches at a position wins. Custom kind names are allowed.
 - Patterns reference kinds by name: bare `ident`, exact-text `foo:ident`, or typed capture `$field:ident`.
 - A grammar without `[tokens]` is byte-for-byte identical to pre-feature output. The `[keywords]` section stays a keyword overlay over identifier-run kinds.
-- Invalid declarations (empty/inverted char sets, empty spans/literal sets, zero or multiple recognizers, empty names) are grammar errors.
+- Invalid declarations (empty char sets, inverted or non-ASCII char-set ranges, malformed char-set escapes (`InvalidCharSet`), empty spans/literal sets, zero or multiple recognizers, empty names) are grammar errors. The CLI message for `InvalidCharSet` is `[tokens] invalid char set: ranges must have ASCII endpoints and run low-to-high, use \- for a literal '-' and \\ for a literal '\' (other escapes are not allowed)`.
 - See `examples/grammars/erlang_tokens.toml` and `examples/grammars/forth_tokens.toml`.
 ### Sequence elements
 

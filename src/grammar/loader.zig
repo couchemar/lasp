@@ -225,21 +225,58 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
     }
 }
 
+/// One element of a char-set spec: a single byte or an inclusive byte range.
+const SetItem = union(enum) {
+    literal: u8,
+    range: struct { lo: u8, hi: u8 },
+};
+
+/// Allocation-free iterator over the items of a char-set spec. The single
+/// place a spec is scanned; `compileCharSet` is a fold over it.
+const SpecItems = struct {
+    spec: []const u8,
+    pos: usize = 0,
+
+    /// Resolves one atom: a raw byte, or `\-` / `\\`. The only place that reads `\`.
+    fn atom(self: *SpecItems) GrammarError!u8 {
+        const c = self.spec[self.pos];
+        if (c != '\\') {
+            self.pos += 1;
+            return c;
+        }
+        if (self.pos + 1 >= self.spec.len) return error.InvalidCharSet;
+        const e = self.spec[self.pos + 1];
+        if (e != '-' and e != '\\') return error.InvalidCharSet;
+        self.pos += 2;
+        return e;
+    }
+
+    fn next(self: *SpecItems) GrammarError!?SetItem {
+        if (self.pos >= self.spec.len) return null;
+        const lo = try self.atom();
+        // Range operator: an unescaped '-' with at least one more byte after it.
+        if (self.pos + 1 < self.spec.len and self.spec[self.pos] == '-') {
+            self.pos += 1;
+            const hi = try self.atom();
+            if (lo >= 0x80 or hi >= 0x80) return error.InvalidCharSet;
+            if (lo > hi) return error.InvalidCharSet;
+            return .{ .range = .{ .lo = lo, .hi = hi } };
+        }
+        return .{ .literal = lo };
+    }
+};
+
 /// Compiles a char-set spec ("a-zA-Z0-9_") into a CharClass bitset.
 fn compileCharSet(spec: []const u8) GrammarError!tokenizer.CharClass {
     var cc = tokenizer.CharClass{};
-    var i: usize = 0;
-    while (i < spec.len) {
-        const lo = spec[i];
-        if (i + 2 < spec.len and spec[i + 1] == '-' and spec[i + 2] != '?') {
-            const hi = spec[i + 2];
-            if (lo > hi) return error.InvalidCharSet;
-            var ch = lo;
-            while (ch <= hi) : (ch += 1) cc.set(ch);
-            i += 3;
-        } else {
-            cc.set(lo);
-            i += 1;
+    var it = SpecItems{ .spec = spec };
+    while (try it.next()) |item| {
+        switch (item) {
+            .literal => |b| cc.set(b),
+            .range => |r| {
+                var ch: u16 = r.lo;
+                while (ch <= r.hi) : (ch += 1) cc.set(@intCast(ch));
+            },
         }
     }
     return cc;
@@ -4422,6 +4459,411 @@ test "char-set compiler: literals, ranges, mixed" {
 test "char-set compiler: inverted range rejected" {
     try testing.expectError(error.InvalidCharSet, compileCharSet("z-a"));
     try testing.expectError(error.InvalidCharSet, compileCharSet("9-0"));
+}
+
+// --- charset-escape-and-nonascii-ranges: bug condition exploration (Property 1) ---
+// These encode the FIXED behavior and MUST FAIL on unfixed code.
+
+test "char-set exploration E1: escaped dash before a non-ASCII literal does not swallow punctuation" {
+    const cc = try compileCharSet("a-zA-Z0-9_\\-" ++ "\xD0\x80");
+    try testing.expect(!cc.contains('}'));
+}
+
+test "char-set exploration E2: escaped dash is a lone '-' and '\\' is not a member" {
+    const cc = try compileCharSet("a-z\\-");
+    try testing.expect(cc.contains('-'));
+    try testing.expect(!cc.contains('\\'));
+}
+
+test "char-set exploration E3: non-ASCII range is rejected" {
+    try testing.expectError(error.InvalidCharSet, compileCharSet("Ѐ-ӿ"));
+}
+
+test "char-set exploration E4: mixed ASCII/non-ASCII range endpoint is rejected" {
+    try testing.expectError(error.InvalidCharSet, compileCharSet("a-é"));
+}
+
+test "char-set exploration E5: malformed escapes are rejected" {
+    try testing.expectError(error.InvalidCharSet, compileCharSet("a\\x"));
+    try testing.expectError(error.InvalidCharSet, compileCharSet("abc\\"));
+}
+
+// --- charset-escape-and-nonascii-ranges: preservation (Property 2) ---
+// These pin the behavior of escape-free ASCII specs (and non-ASCII single
+// literals) on the pre-fix code and MUST PASS before and after the fix.
+
+test "char-set preservation U1: common ASCII specs compile to expected bitsets" {
+    const cc = try compileCharSet("a-zA-Z0-9_");
+    var count: usize = 0;
+    for (cc.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        const expected = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        try testing.expectEqual(expected, b);
+        if (b) count += 1;
+    }
+    try testing.expectEqual(@as(usize, 63), count);
+
+    const au = try compileCharSet("A-Z_");
+    for (au.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        try testing.expectEqual((c >= 'A' and c <= 'Z') or c == '_', b);
+    }
+    const dg = try compileCharSet("0-9");
+    for (dg.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        try testing.expectEqual(c >= '0' and c <= '9', b);
+    }
+    const pr = try compileCharSet("!-~");
+    for (pr.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        try testing.expectEqual(c >= 0x21 and c <= 0x7E, b);
+    }
+}
+
+test "char-set preservation U2: inverted ranges and empty spec" {
+    try testing.expectError(error.InvalidCharSet, compileCharSet("z-a"));
+    try testing.expectError(error.InvalidCharSet, compileCharSet("9-0"));
+    // An empty `start` is rejected by the caller (parseTokensSection), not by compileCharSet.
+    try expectGrammarError(
+        "[tokens]\nid = { char_class_run = { start = \"\" } }\n[[patterns]]\ntype = \"x\"\nsequence = [\"id\"]\n",
+        error.InvalidCharSet,
+    );
+}
+
+test "char-set preservation U7: leading and trailing '-' are literal" {
+    for ([_][]const u8{ "-a", "a-" }) |spec| {
+        const cc = try compileCharSet(spec);
+        try testing.expect(cc.contains('-'));
+        try testing.expect(cc.contains('a'));
+        var count: usize = 0;
+        for (cc.bits) |b| {
+            if (b) count += 1;
+        }
+        try testing.expectEqual(@as(usize, 2), count);
+    }
+}
+
+test "char-set preservation U8: non-ASCII single literals are byte-level members" {
+    const cc = try compileCharSet("a-zé");
+    try testing.expect(cc.contains(0xC3));
+    try testing.expect(cc.contains(0xA9));
+    for (cc.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        try testing.expectEqual((c >= 'a' and c <= 'z') or c == 0xC3 or c == 0xA9, b);
+    }
+}
+
+/// Preservation items for the model-based properties below: `text` is the
+/// escape-free spec fragment, `bytes` its single-byte literal members, and
+/// `lo..hi` its ASCII range members (`lo > hi` means none).
+const PreserveItem = struct { text: []const u8, bytes: []const u8 = "", lo: u8 = 1, hi: u8 = 0 };
+
+fn expectPreserveModel(items: []const PreserveItem) !void {
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    for (items) |it| {
+        @memcpy(buf[n .. n + it.text.len], it.text);
+        n += it.text.len;
+    }
+    const cc = try compileCharSet(buf[0..n]);
+    for (cc.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        var expected = false;
+        for (items) |it| {
+            if ((c >= it.lo and c <= it.hi) or std.mem.indexOfScalar(u8, it.bytes, c) != null) expected = true;
+        }
+        try testing.expectEqual(expected, b);
+    }
+}
+
+test "property: P-preserve-ASCII escape-free ASCII specs match the item model" {
+    // Single-literal and range items; ranges are always followed by a non-'-' item
+    // boundary so no accidental '-' adjacency arises. A literal '-' is covered by U7.
+    const table = [_]PreserveItem{
+        .{ .text = "a", .bytes = "a" },
+        .{ .text = "Z", .bytes = "Z" },
+        .{ .text = "_", .bytes = "_" },
+        .{ .text = "?", .bytes = "?" },
+        .{ .text = "}", .bytes = "}" },
+        .{ .text = " ", .bytes = " " },
+        .{ .text = "a-z", .lo = 'a', .hi = 'z' },
+        .{ .text = "A-Z", .lo = 'A', .hi = 'Z' },
+        .{ .text = "0-9", .lo = '0', .hi = '9' },
+        .{ .text = "!-~", .lo = 0x21, .hi = 0x7E },
+        .{ .text = "0-?", .lo = '0', .hi = '?' },
+    };
+    const idx_gen = comptime gen.list(u8, gen.intRange(u8, 0, table.len - 1), 0, 12);
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idxs: []const u8) !void {
+            var items: [12]PreserveItem = undefined;
+            for (idxs, 0..) |ix, k| items[k] = table[ix];
+            try expectPreserveModel(items[0..idxs.len]);
+        }
+    }.prop, .{});
+}
+
+test "property: P-preserve-nonascii-literals non-ASCII literals match the item model" {
+    const table = [_]PreserveItem{
+        .{ .text = "a", .bytes = "a" },
+        .{ .text = "0", .bytes = "0" },
+        .{ .text = "_", .bytes = "_" },
+        .{ .text = "a-z", .lo = 'a', .hi = 'z' },
+        .{ .text = "0-9", .lo = '0', .hi = '9' },
+        .{ .text = "A-F", .lo = 'A', .hi = 'F' },
+        .{ .text = "\xC3", .bytes = "\xC3" },
+        .{ .text = "\xA9", .bytes = "\xA9" },
+        .{ .text = "\xD0\x80", .bytes = "\xD0\x80" },
+        .{ .text = "\xE4\xB8\xAD", .bytes = "\xE4\xB8\xAD" },
+    };
+    const idx_gen = comptime gen.list(u8, gen.intRange(u8, 0, table.len - 1), 0, 8);
+    try minish.check(testing.allocator, idx_gen, struct {
+        fn prop(idxs: []const u8) !void {
+            var items: [8]PreserveItem = undefined;
+            for (idxs, 0..) |ix, k| items[k] = table[ix];
+            try expectPreserveModel(items[0..idxs.len]);
+        }
+    }.prop, .{});
+}
+
+// --- charset-escape-and-nonascii-ranges: unit tests U3-U13 ---
+
+/// Asserts the compiled set holds exactly `members` and no other byte.
+fn expectExactSet(spec: []const u8, members: []const u8) !void {
+    const cc = try compileCharSet(spec);
+    for (cc.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        try testing.expectEqual(std.mem.indexOfScalar(u8, members, c) != null, b);
+    }
+}
+
+/// Asserts the compiled set is exactly the inclusive byte range `lo..hi`.
+fn expectExactRange(spec: []const u8, lo: u8, hi: u8) !void {
+    const cc = try compileCharSet(spec);
+    for (cc.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        try testing.expectEqual(c >= lo and c <= hi, b);
+    }
+}
+
+test "char-set U3: escaped '-' is a lone literal" {
+    try expectExactSet("\\-", "-");
+    try expectExactSet("a\\-z", "a-z");
+    const cc = try compileCharSet("a\\-z");
+    try testing.expect(!cc.contains('b'));
+    try testing.expect(!cc.contains('y'));
+}
+
+test "char-set U4: escaped backslash and escaped range endpoints" {
+    try expectExactSet("\\\\", "\\");
+    try expectExactRange("\\\\-a", 0x5C, 0x61);
+    try expectExactRange("\\--z", '-', 'z');
+}
+
+test "char-set U5: malformed escapes are rejected" {
+    for ([_][]const u8{ "\\", "abc\\", "\\x", "\\a-z", "a-\\x", "a-\\" }) |spec| {
+        try testing.expectError(error.InvalidCharSet, compileCharSet(spec));
+    }
+}
+
+test "char-set U6: non-ASCII range endpoints are rejected" {
+    for ([_][]const u8{ "Ѐ-ӿ", "a-é", "é-z", "é-a" }) |spec| {
+        try testing.expectError(error.InvalidCharSet, compileCharSet(spec));
+    }
+}
+
+test "char-set U7 additions: escaped and doubled '-'" {
+    try expectExactSet("\\-a", "-a");
+    try expectExactSet("a\\-", "a-");
+    try expectExactRange("--a", '-', 'a');
+}
+
+test "char-set U8 addition: non-ASCII literal followed by trailing '-'" {
+    try expectExactSet("é-", "\xC3\xA9-");
+}
+
+test "char-set U9: '-?' is an ordinary range" {
+    try expectExactRange("!-?", 0x21, 0x3F);
+    const cc = try compileCharSet("0-?");
+    for (cc.bits, 0..) |b, i| {
+        const c: u8 = @intCast(i);
+        try testing.expectEqual(c >= '0' and c <= '?', b);
+    }
+    for ("0123456789:;<=>?") |c| try testing.expect(cc.contains(c));
+}
+
+test "char-set U10: 'x-?' is inverted; 'x\\-?' spells three literals" {
+    try testing.expectError(error.InvalidCharSet, compileCharSet("x-?"));
+    try testing.expectError(error.InvalidCharSet, compileCharSet("a-?"));
+    try expectExactSet("x\\-?", "x-?");
+}
+
+const charset_grammar_prefix = "[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n[tokens]\n";
+
+test "char-set U11: loader accepts an escaped '-' and rejects a malformed escape" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ok = try parseGrammar(
+        charset_grammar_prefix ++
+            "ident = { char_class_run = { start = \"a-zA-Z_\", continue = \"a-zA-Z0-9_\\\\-\" } }\n",
+        arena.allocator(),
+    );
+    const run = ok.tokens.?.kinds[0].recognizer.char_class_run;
+    try testing.expect(run.cont.contains('-'));
+    try testing.expect(!run.cont.contains('\\'));
+    try testing.expect(!run.cont.contains('}'));
+
+    try expectGrammarError(
+        charset_grammar_prefix ++ "ident = { char_class_run = { start = \"\\\\x\" } }\n",
+        error.InvalidCharSet,
+    );
+}
+
+test "char-set U13: start and continue both reject a malformed escape" {
+    try expectGrammarError(
+        charset_grammar_prefix ++ "ident = { char_class_run = { start = \"\\\\x\" } }\n",
+        error.InvalidCharSet,
+    );
+    try expectGrammarError(
+        charset_grammar_prefix ++ "ident = { char_class_run = { start = \"a-z\", continue = \"\\\\x\" } }\n",
+        error.InvalidCharSet,
+    );
+}
+
+// --- charset-escape-and-nonascii-ranges: properties against an independent item model ---
+
+const ModelItem = struct { lo: u8, hi: u8, is_range: bool };
+const max_model_items = 8;
+
+/// Decodes random bytes (3 per item) into well-formed items: literal bytes
+/// 0x01..0x7F, or ASCII ranges with lo <= hi.
+fn decodeModelItems(bytes: []const u8, out: *[max_model_items]ModelItem) usize {
+    var n: usize = 0;
+    var k: usize = 0;
+    while (k + 2 < bytes.len and n < max_model_items) : (k += 3) {
+        const lo: u8 = bytes[k + 1] % 0x7F + 1; // 0x01..0x7F
+        if (bytes[k] % 2 == 0) {
+            out[n] = .{ .lo = lo, .hi = lo, .is_range = false };
+        } else {
+            const span: u16 = 0x7F - @as(u16, lo) + 1;
+            const hi: u8 = @intCast(@as(u16, lo) + bytes[k + 2] % span);
+            out[n] = .{ .lo = lo, .hi = hi, .is_range = true };
+        }
+        n += 1;
+    }
+    return n;
+}
+
+fn appendEscaped(buf: []u8, n: *usize, c: u8) void {
+    if (c == '-' or c == '\\') {
+        buf[n.*] = '\\';
+        n.* += 1;
+    }
+    buf[n.*] = c;
+    n.* += 1;
+}
+
+/// Renders items to a spec: a literal '-' or '\\' is escaped, as are range endpoints.
+fn renderModelItems(items: []const ModelItem, buf: []u8) []const u8 {
+    var n: usize = 0;
+    for (items) |it| {
+        appendEscaped(buf, &n, it.lo);
+        if (it.is_range) {
+            buf[n] = '-';
+            n += 1;
+            appendEscaped(buf, &n, it.hi);
+        }
+    }
+    return buf[0..n];
+}
+
+fn inModel(items: []const ModelItem, c: u8) bool {
+    for (items) |it| {
+        if (c >= it.lo and c <= it.hi) return true;
+    }
+    return false;
+}
+
+const model_gen = gen.list(u8, gen.intRange(u8, 0, 255), 0, max_model_items * 3);
+
+test "property: P-truth compileCharSet equals the bitset computed from the items" {
+    try minish.check(testing.allocator, comptime model_gen, struct {
+        fn prop(bytes: []const u8) !void {
+            var items: [max_model_items]ModelItem = undefined;
+            const n = decodeModelItems(bytes, &items);
+            var buf: [max_model_items * 6]u8 = undefined;
+            const spec = renderModelItems(items[0..n], &buf);
+            const cc = try compileCharSet(spec);
+            for (cc.bits, 0..) |b, i| {
+                try testing.expectEqual(inModel(items[0..n], @intCast(i)), b);
+            }
+        }
+    }.prop, .{});
+}
+
+test "property: P-no-leak no byte outside the declared items is in the set" {
+    try minish.check(testing.allocator, comptime model_gen, struct {
+        fn prop(bytes: []const u8) !void {
+            var items: [max_model_items]ModelItem = undefined;
+            const n = decodeModelItems(bytes, &items);
+            var buf: [max_model_items * 6]u8 = undefined;
+            const spec = renderModelItems(items[0..n], &buf);
+            const cc = try compileCharSet(spec);
+            for (cc.bits, 0..) |b, i| {
+                if (b) try testing.expect(inModel(items[0..n], @intCast(i)));
+            }
+        }
+    }.prop, .{});
+}
+
+test "property: P-nonascii-reject a range with a raw non-ASCII endpoint is rejected" {
+    const tails = [_][]const u8{ "é-z", "a-é", "Ѐ-ӿ", "\xFF-\xFF", "a-\x80", "\x80-a" };
+    const g = comptime gen.tuple2(
+        []const u8,
+        u8,
+        gen.list(u8, gen.intRange(u8, 0, 255), 0, max_model_items * 3),
+        gen.intRange(u8, 0, tails.len - 1),
+    );
+    try minish.check(testing.allocator, g, struct {
+        fn prop(arg: struct { []const u8, u8 }) !void {
+            var items: [max_model_items]ModelItem = undefined;
+            const n = decodeModelItems(arg[0], &items);
+            var buf: [max_model_items * 6 + 8]u8 = undefined;
+            const head = renderModelItems(items[0..n], &buf);
+            const tail = tails[arg[1]];
+            @memcpy(buf[head.len .. head.len + tail.len], tail);
+            try testing.expectError(error.InvalidCharSet, compileCharSet(buf[0 .. head.len + tail.len]));
+        }
+    }.prop, .{});
+}
+
+test "property: P-escape-reject a trailing '\\' or '\\' before another byte is rejected" {
+    const g = comptime gen.tuple2(
+        []const u8,
+        u8,
+        gen.list(u8, gen.intRange(u8, 0, 255), 0, max_model_items * 3),
+        gen.intRange(u8, 0, 255),
+    );
+    try minish.check(testing.allocator, g, struct {
+        fn prop(arg: struct { []const u8, u8 }) !void {
+            var items: [max_model_items]ModelItem = undefined;
+            const n = decodeModelItems(arg[0], &items);
+            var buf: [max_model_items * 6 + 2]u8 = undefined;
+            const head = renderModelItems(items[0..n], &buf);
+            // arg[1] % 129 == 128 selects the trailing-lone-'\\' case; anything else
+            // picks a byte that is neither '-' nor '\\'.
+            const sel = arg[1] % 129;
+            var len = head.len;
+            buf[len] = '\\';
+            len += 1;
+            if (sel != 128) {
+                var c: u8 = sel;
+                if (c == '-' or c == '\\') c = 'x';
+                buf[len] = c;
+                len += 1;
+            }
+            try testing.expectError(error.InvalidCharSet, compileCharSet(buf[0..len]));
+        }
+    }.prop, .{});
 }
 
 fn expectGrammarError(source: []const u8, expected: anyerror) !void {
