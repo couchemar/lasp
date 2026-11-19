@@ -1,0 +1,39 @@
+# Markdown task-list checkboxes (`- [ ]` open, `- [x]` done).
+#
+# Finds every checklist item in a Markdown file, at any indentation, including
+# the optional-task form `- [ ]*`. Each event carries the item's line number, so
+# unfinished work can be listed without reading the files:
+#
+#   lasp parse-dir .kiro/specs --grammar-dir examples/grammars --jsonl \
+#     | jq -r 'select(.type == "task_open") | "\(.file):\(.line)"'
+#
+#   lasp query 'task_open' .kiro/specs/foo/tasks.md -g examples/grammars/markdown_tasks.toml
+#
+# `extensions` makes `parse-dir` apply this grammar to every `.md` file. Narrow
+# it (for example to ["tasks.md"]) when only some Markdown files should match.
+#
+# Prose is not source code, so this grammar opts out of the default C-style
+# tokenizer. Without `[tokens]` and `[comments]`, a stray `"` or `'` in the
+# text opens a string token that swallows the lines after it (checklist items
+# are then missed), and `#` headings would be treated as comments.
+
+[language]
+name = "markdown-tasks"
+extensions = [".md"]
+
+# No comment syntax in Markdown prose.
+[comments]
+line = []
+
+# Only the characters a checkbox needs: words (for the `x`) and `- [ ]`.
+[tokens]
+word = { char_class_run = { start = "a-zA-Z0-9_" } }
+mark = { literal_set = ["-", "[", "]"] }
+
+[[patterns]]
+type = "task_open"
+sequence = ["-", "[", "]"]
+
+[[patterns]]
+type = "task_done"
+sequence = ["-", "[", "x:word", "]"]
