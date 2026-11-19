@@ -1,0 +1,20 @@
+# Fixture for the tokenizer-line-tracking spec: `position = "start"` and a
+# terminator extent with `at_column = 0` both read Token.col, which must be
+# correct after a multi-line `delimited_span`.
+[language]
+name = "multiline-span-position"
+
+[tokens]
+word = { char_class_run = { start = "a-zA-Z_" } }
+q = { delimited_span = { open = "'", close = "'", escape = "\\" } }
+dot = { literal_set = ["."] }
+
+[[patterns]]
+type = "decl"
+sequence = ["$name:word"]
+position = "start"
+
+[[patterns.extent]]
+field = "region"
+terminator = "."
+at_column = 0

@@ -94,26 +94,16 @@ pub const KindVocabulary = struct {
     kinds: []const KindDefinition,
 };
 
-/// Result of a comment match attempt
-const CommentMatch = struct {
-    /// End position (exclusive) of the comment
-    end: usize,
-    /// True if this was a block comment (spans multiple lines)
-    is_block: bool,
-    /// Number of newline characters within the comment
-    newline_count: usize,
-};
-
 /// Try to match a comment starting at position `start` in `source`.
-/// Returns `null` if no comment matches at this position, or a `CommentMatch`
-/// with the end position (exclusive) and whether it's a block comment.
+/// Returns `null` if no comment matches at this position, or the end position
+/// (exclusive) of the comment.
 /// Implements longest-match semantics: returns the match with longest prefix.
 /// For ties of equal length, prefers line prefixes over block delimiter.
-fn tryMatchComment(source: []const u8, start: usize, config: CommentConfig) ?CommentMatch {
+fn tryMatchComment(source: []const u8, start: usize, config: CommentConfig) ?usize {
     // Short-circuit if we're at EOF
     if (start >= source.len) return null;
 
-    var best_match: ?CommentMatch = null;
+    var best_match: ?usize = null;
     var best_len: usize = 0;
     var best_priority: u32 = 0; // Lower number = higher priority (0=line[0], 1=line[1], ..., large=block)
 
@@ -136,11 +126,7 @@ fn tryMatchComment(source: []const u8, start: usize, config: CommentConfig) ?Com
             if (is_better) {
                 best_len = prefix.len;
                 best_priority = priority;
-                best_match = CommentMatch{
-                    .end = end,
-                    .is_block = false,
-                    .newline_count = 0,
-                };
+                best_match = end;
             }
         }
     }
@@ -151,15 +137,11 @@ fn tryMatchComment(source: []const u8, start: usize, config: CommentConfig) ?Com
             const open_len = open.len;
             const open_end = start + open_len;
             var pos = open_end;
-            var newline_count: usize = 0;
             var found_close = false;
 
             if (config.block_close) |close| {
                 // Find matching close delimiter
                 while (pos <= source.len - close.len) {
-                    if (source[pos] == '\n') {
-                        newline_count += 1;
-                    }
                     if (std.mem.startsWith(u8, source[pos..], close)) {
                         // Found closing delimiter
                         const end = pos + close.len;
@@ -175,11 +157,7 @@ fn tryMatchComment(source: []const u8, start: usize, config: CommentConfig) ?Com
                         if (is_better) {
                             best_len = open_len;
                             best_priority = priority;
-                            best_match = CommentMatch{
-                                .end = end,
-                                .is_block = true,
-                                .newline_count = newline_count,
-                            };
+                            best_match = end;
                         }
                         break;
                     }
@@ -189,22 +167,13 @@ fn tryMatchComment(source: []const u8, start: usize, config: CommentConfig) ?Com
 
             if (!found_close) {
                 // No closing delimiter found - extend to EOF
-                // Count any newlines that we scanned before giving up
-                while (pos < source.len) {
-                    if (source[pos] == '\n') newline_count += 1;
-                    pos += 1;
-                }
                 const end = source.len;
                 const priority = @as(u32, @intCast(config.line_prefixes.len)) + 1;
 
                 if (open_len > best_len or (open_len == best_len and priority < best_priority)) {
                     best_len = open_len;
                     best_priority = priority;
-                    best_match = CommentMatch{
-                        .end = end,
-                        .is_block = true,
-                        .newline_count = newline_count,
-                    };
+                    best_match = end;
                 }
             }
         }
@@ -259,6 +228,114 @@ fn isKeyword(text: []const u8, keyword_table: []const []const u8) bool {
     return false;
 }
 
+/// Single source of truth for `line`/`col`. Bytes `[0, scanned)` have been
+/// folded in; `advance` scans only the bytes consumed since the last call.
+/// Only `\n` ends a line.
+const PositionTracker = struct {
+    line: usize = 1,
+    line_start: usize = 0,
+    scanned: usize = 0,
+
+    fn advance(self: *PositionTracker, source: []const u8, to: usize) void {
+        std.debug.assert(to >= self.scanned and to <= source.len);
+        var p = self.scanned;
+        while (p < to) : (p += 1) {
+            if (source[p] == '\n') {
+                self.line += 1;
+                self.line_start = p + 1;
+            }
+        }
+        self.scanned = to;
+    }
+
+    /// Position of a token that starts at `start`. Catches the tracker up over
+    /// any skipped bytes (whitespace, unknown bytes) first.
+    fn stampAt(self: *PositionTracker, source: []const u8, start: usize) struct { line: usize, col: usize } {
+        self.advance(source, start);
+        return .{ .line = self.line, .col = start - self.line_start };
+    }
+};
+
+/// Shared scanning state for both tokenizer profiles. `emit` is the only place
+/// a Token is built; `stepStructural` is the one implementation of newline,
+/// indent, whitespace and comment handling.
+const Scanner = struct {
+    source: []const u8,
+    comments: CommentConfig,
+    allocator: std.mem.Allocator,
+    tokens: std.ArrayList(Token) = .empty,
+    tracker: PositionTracker = .{},
+    i: usize = 0,
+    at_line_start: bool = true,
+
+    fn init(source: []const u8, comments: CommentConfig, allocator: std.mem.Allocator) Scanner {
+        return .{ .source = source, .comments = comments, .allocator = allocator };
+    }
+
+    fn done(self: *const Scanner) bool {
+        return self.i >= self.source.len;
+    }
+
+    /// Stamps line/col from `start`, folds the token's bytes into the tracker
+    /// and moves the cursor to `end`.
+    fn emit(self: *Scanner, kind: TokenKind, start: usize, end: usize, kind_id: usize) !void {
+        std.debug.assert(start <= end and end <= self.source.len);
+        const pos = self.tracker.stampAt(self.source, start);
+        try self.tokens.append(self.allocator, .{
+            .kind = kind,
+            .start = start,
+            .end = end,
+            .line = pos.line,
+            .col = pos.col,
+            .kind_id = kind_id,
+        });
+        self.tracker.advance(self.source, end);
+        self.i = end;
+    }
+
+    /// Returns true when it consumed input (the caller `continue`s); false means
+    /// the cursor sits on a content byte and `at_line_start` has been cleared.
+    fn stepStructural(self: *Scanner) !bool {
+        const source = self.source;
+        const c = source[self.i];
+
+        if (c == '\n') {
+            try self.emit(.newline, self.i, self.i + 1, 0);
+            self.at_line_start = true;
+            const indent_start = self.i;
+            var j = indent_start;
+            while (j < source.len and isWhitespace(source[j])) : (j += 1) {}
+            if (j > indent_start) try self.emit(.indent, indent_start, j, 0);
+            return true;
+        }
+
+        if (isWhitespace(c)) {
+            if (self.at_line_start) {
+                const indent_start = self.i;
+                var j = indent_start;
+                while (j < source.len and isWhitespace(source[j])) : (j += 1) {}
+                try self.emit(.indent, indent_start, j, 0);
+                self.at_line_start = false;
+            } else {
+                self.i += 1;
+            }
+            return true;
+        }
+
+        self.at_line_start = false;
+
+        if (tryMatchComment(source, self.i, self.comments)) |end| {
+            try self.emit(.comment, self.i, end, 0);
+            return true;
+        }
+        return false;
+    }
+
+    fn finish(self: *Scanner) ![]Token {
+        return self.tokens.toOwnedSlice(self.allocator);
+    }
+};
+
 /// Tokenizes source bytes into an array of Tokens.
 /// Keywords are recognized via the optional keyword_table.
 /// Comment recognition uses the provided CommentConfig.
@@ -271,150 +348,75 @@ pub fn tokenize(
 ) ![]Token {
     if (source.len == 0) return &[_]Token{};
 
-    var tokens: std.ArrayList(Token) = .empty;
-    var i: usize = 0;
-    var at_line_start = true;
-    var current_line: usize = 1;
-    var line_start: usize = 0;
+    var sc = Scanner.init(source, comments, allocator);
 
-    while (i < source.len) {
+    while (!sc.done()) {
+        if (try sc.stepStructural()) continue;
+
+        const i = sc.i;
         const c = source[i];
-
-        // Newline
-        if (c == '\n') {
-            try tokens.append(allocator, .{ .kind = .newline, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
-            i += 1;
-            at_line_start = true;
-            current_line += 1;
-            line_start = i;
-
-            // Check for indent after newline
-            const indent_start = i;
-            while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
-            if (i > indent_start) {
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
-            }
-            continue;
-        }
-
-        // Skip non-indentation whitespace
-        if (isWhitespace(c)) {
-            if (at_line_start) {
-                const indent_start = i;
-                while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
-                at_line_start = false;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        at_line_start = false;
-
-        // Try to match a comment (configurable)
-        if (tryMatchComment(source, i, comments)) |match| {
-            const start = i;
-            i = match.end;
-
-            // Save the original line start and current line BEFORE updating them
-            const token_line_start = line_start;
-            const token_line = current_line;
-
-            // Update line tracking for block comments spanning multiple lines
-            if (match.is_block) {
-                current_line += match.newline_count;
-                // Need to find the start of the current line after the comment
-                // Start scanning from end of comment
-                var scan_pos = i;
-                line_start = i;
-                // Scan backwards to find the last newline before end of comment
-                while (scan_pos > 0) {
-                    scan_pos -= 1;
-                    if (source[scan_pos] == '\n') {
-                        line_start = scan_pos + 1;
-                        break;
-                    }
-                }
-                // If we didn't find a newline, line_start stays at i (start of line after comment)
-            }
-
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = token_line, .col = start - token_line_start });
-            continue;
-        }
 
         // String literals: "..." or '...'
         if (c == '"' or c == '\'') {
-            const start = i;
-            const quote = c;
-            i += 1;
-            while (i < source.len) {
-                if (source[i] == '\\') {
-                    i += 2; // skip escaped char
+            var j = i + 1;
+            while (j < source.len) {
+                if (source[j] == '\\') {
+                    j = @min(j + 2, source.len); // skip escaped char; never past EOF
                     continue;
                 }
-                if (source[i] == quote) {
-                    i += 1;
+                if (source[j] == c) {
+                    j += 1;
                     break;
                 }
-                i += 1;
+                j += 1;
             }
-            // If we exited without finding closing quote, i == source.len (unclosed string)
-            try tokens.append(allocator, .{ .kind = .string, .start = start, .end = i, .line = current_line, .col = start - line_start });
+            // If we exited without finding closing quote, j == source.len (unclosed string)
+            try sc.emit(.string, i, j, 0);
             continue;
         }
 
         // Numbers: [0-9]+ with optional single '.'
         if (isDigit(c)) {
-            const start = i;
-            while (i < source.len and isDigit(source[i])) : (i += 1) {}
-            if (i < source.len and source[i] == '.') {
-                i += 1;
-                while (i < source.len and isDigit(source[i])) : (i += 1) {}
+            var j = i;
+            while (j < source.len and isDigit(source[j])) : (j += 1) {}
+            if (j < source.len and source[j] == '.') {
+                j += 1;
+                while (j < source.len and isDigit(source[j])) : (j += 1) {}
             }
-            try tokens.append(allocator, .{ .kind = .number, .start = start, .end = i, .line = current_line, .col = start - line_start });
+            try sc.emit(.number, i, j, 0);
             continue;
         }
 
         // Identifiers and keywords: [a-zA-Z_][a-zA-Z0-9_]*
         if (isAlpha(c) or c == '_') {
-            const start = i;
-            while (i < source.len and isAlphaNum(source[i])) : (i += 1) {}
-            const text = source[start..i];
+            var j = i;
+            while (j < source.len and isAlphaNum(source[j])) : (j += 1) {}
             const kind: TokenKind = if (keyword_table) |kt|
-                (if (isKeyword(text, kt)) TokenKind.keyword else TokenKind.identifier)
+                (if (isKeyword(source[i..j], kt)) TokenKind.keyword else TokenKind.identifier)
             else
                 .identifier;
-            try tokens.append(allocator, .{ .kind = kind, .start = start, .end = i, .line = current_line, .col = start - line_start });
+            try sc.emit(kind, i, j, 0);
             continue;
         }
 
-        // Operators
         if (isOperator(c)) {
-            try tokens.append(allocator, .{ .kind = .operator, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
-            i += 1;
+            try sc.emit(.operator, i, i + 1, 0);
             continue;
         }
-
-        // Delimiters
         if (isDelimiter(c)) {
-            try tokens.append(allocator, .{ .kind = .delimiter, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
-            i += 1;
+            try sc.emit(.delimiter, i, i + 1, 0);
             continue;
         }
-
-        // Symbols
         if (isSymbol(c)) {
-            try tokens.append(allocator, .{ .kind = .symbol, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
-            i += 1;
+            try sc.emit(.symbol, i, i + 1, 0);
             continue;
         }
 
         // Unknown bytes — skip
-        i += 1;
+        sc.i += 1;
     }
 
-    return tokens.toOwnedSlice(allocator);
+    return sc.finish();
 }
 
 // --- Vocabulary-driven scan ([tokens] grammars) ---
@@ -485,64 +487,12 @@ pub fn tokenizeWithVocab(
 ) ![]Token {
     if (source.len == 0) return &[_]Token{};
 
-    var tokens: std.ArrayList(Token) = .empty;
-    var i: usize = 0;
-    var at_line_start = true;
-    var current_line: usize = 1;
-    var line_start: usize = 0;
+    var sc = Scanner.init(source, comments, allocator);
 
-    while (i < source.len) {
-        const c = source[i];
+    while (!sc.done()) {
+        if (try sc.stepStructural()) continue;
 
-        if (c == '\n') {
-            try tokens.append(allocator, .{ .kind = .newline, .start = i, .end = i + 1, .line = current_line, .col = i - line_start });
-            i += 1;
-            at_line_start = true;
-            current_line += 1;
-            line_start = i;
-            const indent_start = i;
-            while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
-            if (i > indent_start) {
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
-            }
-            continue;
-        }
-
-        if (isWhitespace(c)) {
-            if (at_line_start) {
-                const indent_start = i;
-                while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
-                try tokens.append(allocator, .{ .kind = .indent, .start = indent_start, .end = i, .line = current_line, .col = indent_start - line_start });
-                at_line_start = false;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        at_line_start = false;
-
-        if (tryMatchComment(source, i, comments)) |match| {
-            const start = i;
-            i = match.end;
-            const token_line_start = line_start;
-            const token_line = current_line;
-            if (match.is_block) {
-                current_line += match.newline_count;
-                var scan_pos = i;
-                line_start = i;
-                while (scan_pos > 0) {
-                    scan_pos -= 1;
-                    if (source[scan_pos] == '\n') {
-                        line_start = scan_pos + 1;
-                        break;
-                    }
-                }
-            }
-            try tokens.append(allocator, .{ .kind = .comment, .start = start, .end = i, .line = token_line, .col = start - token_line_start });
-            continue;
-        }
-
+        const i = sc.i;
         var matched = false;
         for (vocab.kinds, 0..) |def, id| {
             if (tryRecognizer(def.recognizer, source, i)) |end| {
@@ -554,25 +504,17 @@ pub fn tokenizeWithVocab(
                         if (isKeyword(source[i..end], kt)) kind = .keyword;
                     }
                 }
-                try tokens.append(allocator, .{
-                    .kind = kind,
-                    .start = i,
-                    .end = end,
-                    .line = current_line,
-                    .col = i - line_start,
-                    .kind_id = id,
-                });
-                i = end;
+                try sc.emit(kind, i, end, id);
                 matched = true;
                 break;
             }
         }
         if (matched) continue;
 
-        i += 1; // unknown byte advances by one
+        sc.i += 1; // unknown byte advances by one
     }
 
-    return tokens.toOwnedSlice(allocator);
+    return sc.finish();
 }
 
 // --- Unit Tests ---
@@ -1909,4 +1851,263 @@ test "property: vocab scan is single-pass and total" {
             try testing.expect(tokens.len == 0 or tokens[tokens.len - 1].end <= source.len);
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// --- Bug condition exploration tests (spec: tokenizer-line-tracking, task 1) ---
+// These encode the EXPECTED post-fix behavior and FAIL on the unfixed tokenizers.
+
+fn findTokenByText(source: []const u8, tokens: []const Token, text: []const u8) ?Token {
+    for (tokens) |t| {
+        if (std.mem.eql(u8, source[t.start..@min(t.end, source.len)], text)) return t;
+    }
+    return null;
+}
+
+fn exploreVocab() KindVocabulary {
+    const S = struct {
+        const kinds = [_]KindDefinition{
+            .{ .name = "word", .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlpha() } } },
+            .{ .name = "q", .recognizer = .{ .delimited_span = .{ .open = "'", .close = "'", .escape = null } } },
+        };
+    };
+    return KindVocabulary{ .kinds = &S.kinds };
+}
+
+// Counterexample (unfixed): `x` reports line 2; true line 4.
+test "line tracking: Repro 1 default string" {
+    const src = "\"a\nb\nc\"\nx\n";
+    const tokens = try tokenize(src, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    const x = findTokenByText(src, tokens, "x") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 4), x.line);
+    try testing.expectEqual(@as(usize, 0), x.col);
+}
+
+// Counterexample (unfixed): `x` reports line 1, col 7; true line 2, col 4.
+test "line tracking: Repro 1b col after multi-line string" {
+    const src = "\"a\nb\"  x";
+    const tokens = try tokenize(src, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    const x = findTokenByText(src, tokens, "x") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), x.line);
+    try testing.expectEqual(@as(usize, 4), x.col);
+}
+
+// Counterexample (unfixed): `x` reports line 2; true line 4.
+test "line tracking: Repro 2 vocab delimited_span" {
+    const src = "'a\nb\nc'\nx\n";
+    const tokens = try tokenizeWithVocab(src, exploreVocab(), null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    const x = findTokenByText(src, tokens, "x") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 4), x.line);
+    try testing.expectEqual(@as(usize, 0), x.col);
+}
+
+// Unterminated span variant: the span token spans to EOF and starts at its true line/col.
+// (Expected to pass on unfixed code: the span start is stamped before any newline inside it.)
+test "line tracking: Repro 2 vocab unterminated delimited_span" {
+    const src = "ab\n  'a\nb\nc";
+    const tokens = try tokenizeWithVocab(src, exploreVocab(), null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    const sp = tokens[tokens.len - 1];
+    try testing.expectEqual(src.len, sp.end);
+    try testing.expectEqual(@as(usize, 5), sp.start);
+    try testing.expectEqual(@as(usize, 2), sp.line);
+    try testing.expectEqual(@as(usize, 2), sp.col);
+}
+
+// Counterexample (unfixed): `x` col 0, true col 7; newline token col 1, true col 8.
+test "column tracking: block comment on first line" {
+    const src = "/* a */x\n";
+    const dtokens = try tokenize(src, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(dtokens);
+    const dx = findTokenByText(src, dtokens, "x") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), dx.line);
+    try testing.expectEqual(@as(usize, 7), dx.col);
+    try testing.expectEqual(TokenKind.newline, dtokens[dtokens.len - 1].kind);
+    try testing.expectEqual(@as(usize, 8), dtokens[dtokens.len - 1].col);
+
+    const vtokens = try tokenizeWithVocab(src, exploreVocab(), null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(vtokens);
+    const vx = findTokenByText(src, vtokens, "x") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), vx.line);
+    try testing.expectEqual(@as(usize, 7), vx.col);
+    try testing.expectEqual(TokenKind.newline, vtokens[vtokens.len - 1].kind);
+    try testing.expectEqual(@as(usize, 8), vtokens[vtokens.len - 1].col);
+}
+
+// Counterexample (unfixed): string token end is 6, source length 5.
+// Tokenizer-level only: the unfixed engine aborts on the out-of-bounds slice.
+test "end clamp: trailing backslash in string" {
+    const src = "\"abc\\";
+    try testing.expectEqual(@as(usize, 5), src.len);
+    const tokens = try tokenize(src, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expect(tokens.len >= 1);
+    try testing.expectEqual(@as(usize, 5), tokens[0].end);
+    for (tokens) |t| try testing.expect(t.end <= src.len);
+}
+
+test "PositionTracker: advance and stampAt on a multi-line string" {
+    const source = "\"a\nb\"  x";
+    var t: PositionTracker = .{};
+    const p0 = t.stampAt(source, 0);
+    try testing.expectEqual(@as(usize, 1), p0.line);
+    try testing.expectEqual(@as(usize, 0), p0.col);
+    t.advance(source, 5);
+    try testing.expectEqual(@as(usize, 2), t.line);
+    try testing.expectEqual(@as(usize, 3), t.line_start);
+    const px = t.stampAt(source, 7);
+    try testing.expectEqual(@as(usize, 2), px.line);
+    try testing.expectEqual(@as(usize, 4), px.col);
+}
+
+test "Scanner: emit stamps position and moves the cursor" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var sc = Scanner.init("a\nb", CommentConfig.default, arena.allocator());
+    try sc.emit(.identifier, 0, 1, 0);
+    _ = try sc.stepStructural();
+    try sc.emit(.identifier, 2, 3, 0);
+    const toks = try sc.finish();
+    try testing.expectEqual(@as(usize, 3), toks.len);
+    try testing.expectEqual(@as(usize, 2), toks[2].line);
+    try testing.expect(sc.done());
+}
+
+// --- Additional tests (spec: tokenizer-line-tracking, task 4) ---
+
+/// Independent ground truth: a plain loop over `source[0..start]`, not the tracker.
+fn expectedPos(source: []const u8, start: usize) struct { line: usize, col: usize } {
+    var line: usize = 1;
+    var line_start: usize = 0;
+    for (source[0..start], 0..) |b, k| {
+        if (b == '\n') {
+            line += 1;
+            line_start = k + 1;
+        }
+    }
+    return .{ .line = line, .col = start - line_start };
+}
+
+/// Every token: ground-truth line/col, bounds, ordered non-overlapping spans,
+/// non-decreasing line.
+fn checkGroundTruth(source: []const u8, tokens: []const Token) !void {
+    for (tokens, 0..) |t, k| {
+        const want = expectedPos(source, t.start);
+        try testing.expectEqual(want.line, t.line);
+        try testing.expectEqual(want.col, t.col);
+        try testing.expect(t.start <= t.end);
+        try testing.expect(t.end <= source.len);
+        if (k > 0) {
+            try testing.expect(t.start >= tokens[k - 1].end);
+            try testing.expect(t.line >= tokens[k - 1].line);
+        }
+    }
+}
+
+const block_comment_config = CommentConfig{ .line_prefixes = &.{"//"}, .block_open = "/*", .block_close = "*/" };
+const gt_keywords = [_][]const u8{ "ab", "x" };
+
+fn groundTruthVocab() KindVocabulary {
+    const S = struct {
+        const kinds = [_]KindDefinition{
+            .{ .name = "word", .recognizer = .{ .char_class_run = .{ .start = ccAlpha(), .cont = ccAlpha() } } },
+            .{ .name = "q", .recognizer = .{ .delimited_span = .{ .open = "'", .close = "'", .escape = '\\' } } },
+            .{ .name = "dq", .recognizer = .{ .delimited_span = .{ .open = "\"", .close = "\"", .escape = '\\' } } },
+        };
+    };
+    return KindVocabulary{ .kinds = &S.kinds };
+}
+
+// minish draws each character index uniformly, so repeated characters in
+// `custom_chars` weight the alphabet toward quotes, escapes and newlines.
+test "property: default tokenizer positions are ground truth" {
+    const src_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .custom, .custom_chars = "\"\"''\\\\\n\nab (x" });
+    try minish.check(testing.allocator, src_gen, struct {
+        fn prop(source: []const u8) !void {
+            const kts = [_]?[]const []const u8{ null, &gt_keywords };
+            for (kts) |kt| {
+                const tokens = try tokenize(source, kt, CommentConfig.default, testing.allocator);
+                defer testing.allocator.free(tokens);
+                try checkGroundTruth(source, tokens);
+            }
+        }
+    }.prop, .{ .num_runs = 500 });
+}
+
+test "property: default tokenizer positions with block comments" {
+    const src_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .custom, .custom_chars = "/*/*\n\n\"ab " });
+    try minish.check(testing.allocator, src_gen, struct {
+        fn prop(source: []const u8) !void {
+            const tokens = try tokenize(source, null, block_comment_config, testing.allocator);
+            defer testing.allocator.free(tokens);
+            try checkGroundTruth(source, tokens);
+        }
+    }.prop, .{ .num_runs = 500 });
+}
+
+test "property: vocab tokenizer positions are ground truth" {
+    const src_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .custom, .custom_chars = "\"\"''\\\\\n\nab (x" });
+    try minish.check(testing.allocator, src_gen, struct {
+        fn prop(source: []const u8) !void {
+            const kts = [_]?[]const []const u8{ null, &gt_keywords };
+            for (kts) |kt| {
+                const tokens = try tokenizeWithVocab(source, groundTruthVocab(), kt, CommentConfig.default, testing.allocator);
+                defer testing.allocator.free(tokens);
+                try checkGroundTruth(source, tokens);
+            }
+        }
+    }.prop, .{ .num_runs = 500 });
+}
+
+test "property: vocab tokenizer positions with block comments" {
+    const src_gen = gen.string(.{ .min_len = 0, .max_len = 64, .charset = .custom, .custom_chars = "/*/*\n\n\"'ab " });
+    try minish.check(testing.allocator, src_gen, struct {
+        fn prop(source: []const u8) !void {
+            const tokens = try tokenizeWithVocab(source, groundTruthVocab(), null, block_comment_config, testing.allocator);
+            defer testing.allocator.free(tokens);
+            try checkGroundTruth(source, tokens);
+        }
+    }.prop, .{ .num_runs = 500 });
+}
+
+// Guard (passes before and after the fix): the recognizer returns `source.len`
+// when the escape skip runs past the end.
+test "end clamp: delimited_span trailing escape" {
+    const src = "'abc\\";
+    const tokens = try tokenizeWithVocab(src, groundTruthVocab(), null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expect(tokens.len >= 1);
+    try testing.expectEqual(src.len, tokens[0].end);
+    for (tokens) |t| try testing.expect(t.end <= src.len);
+}
+
+test "empty source returns an empty slice from both tokenizers" {
+    const d = try tokenize("", null, CommentConfig.default, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), d.len);
+    const v = try tokenizeWithVocab("", groundTruthVocab(), null, CommentConfig.default, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), v.len);
+}
+
+test "escaped quote stays one string token with unchanged positions" {
+    const src = "\"he\\\"llo\" x";
+    const tokens = try tokenize(src, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    try testing.expectEqual(TokenKind.string, tokens[0].kind);
+    try testing.expectEqual(@as(usize, 0), tokens[0].start);
+    try testing.expectEqual(@as(usize, 9), tokens[0].end);
+    try testing.expectEqual(@as(usize, 1), tokens[1].line);
+    try testing.expectEqual(@as(usize, 10), tokens[1].col);
+}
+
+test "carriage return is not a line break" {
+    const src = "a\r\nb\rc";
+    const tokens = try tokenize(src, null, CommentConfig.default, testing.allocator);
+    defer testing.allocator.free(tokens);
+    const c = findTokenByText(src, tokens, "c") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), c.line);
+    try testing.expectEqual(@as(usize, 2), c.col);
+    try checkGroundTruth(src, tokens);
 }

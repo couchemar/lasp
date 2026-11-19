@@ -1067,21 +1067,21 @@ fn refMatchesCondition(event: StructuralEvent, cond: AttributeCondition) bool {
     };
 }
 
-fn eventFromSeed(seed: u8, idx: usize) !StructuralEvent {
+fn eventFromSeed(alloc: std.mem.Allocator, seed: u8, idx: usize) !StructuralEvent {
     const tn = type_pool[(seed +% @as(u8, @intCast(idx * 3))) % type_pool.len];
     const confidence: f32 = @as(f32, @floatFromInt(seed % 11)) / 10.0;
     // Deterministic capture/int presence from seed bits.
     const have_cap = (@as(u16, seed) >> @intCast(@as(u4, @intCast((idx % 8) + 1)))) & 1 == 1;
     const have_int = (@as(u16, seed) >> @intCast(@as(u4, @intCast(idx % 8)))) & 1 == 1;
-    var caps: [1]CaptureEntry = undefined;
-    var ints: [1]IntegerField = undefined;
     const caps_slice = if (have_cap) blk: {
+        const caps = try alloc.alloc(CaptureEntry, 1);
         caps[0] = .{ .field_name = cap_names_pool[idx % cap_names_pool.len], .value = string_pool[(seed +% @as(u8, @intCast(idx))) % string_pool.len] };
-        break :blk caps[0..1];
+        break :blk caps;
     } else &[_]CaptureEntry{};
     const ints_slice = if (have_int) blk: {
+        const ints = try alloc.alloc(IntegerField, 1);
         ints[0] = .{ .field_name = int_names_pool[idx % int_names_pool.len], .value = seed };
-        break :blk ints[0..1];
+        break :blk ints;
     } else &[_]IntegerField{};
     return makeEventFull(tn, caps_slice, ints_slice, confidence);
 }
@@ -1123,7 +1123,7 @@ test "property: refactor is behavior-preserving for existing operators (P1)" {
             const n_events: usize = @as(usize, seed % 5) + 1;
             const n_conds: usize = @as(usize, (seed >> 3) % 4);
             const events = try alloc.alloc(StructuralEvent, n_events);
-            for (0..n_events) |i| events[i] = try eventFromSeed(seed, i);
+            for (0..n_events) |i| events[i] = try eventFromSeed(alloc, seed, i);
 
             if (n_conds == 0) return;
             const conds = try alloc.alloc(AttributeCondition, n_conds);
@@ -1184,7 +1184,7 @@ test "property: contains semantics (P2)" {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            var ev = try eventFromSeed(7, 2);
+            var ev = try eventFromSeed(alloc, 7, 2);
             const caps = if (vals[2]) blk: {
                 const c = try alloc.alloc(CaptureEntry, 1);
                 c[0] = .{ .field_name = "f", .value = vals[0] };
@@ -1219,7 +1219,7 @@ test "property: prefix and suffix semantics (P3)" {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            var ev = try eventFromSeed(7, 2);
+            var ev = try eventFromSeed(alloc, 7, 2);
             const caps = if (vals[2]) blk: {
                 const c = try alloc.alloc(CaptureEntry, 1);
                 c[0] = .{ .field_name = "f", .value = vals[0] };
@@ -1257,7 +1257,7 @@ test "property: field resolution is single-sourced (P7)" {
 
             // Scenario: 0=string capture, 1=integer field, 2=confidence,
             // 3=absent.
-            var ev = try eventFromSeed(7, 2);
+            var ev = try eventFromSeed(alloc, 7, 2);
             switch (vals[0]) {
                 0 => {
                     const caps = try alloc.alloc(CaptureEntry, 1);

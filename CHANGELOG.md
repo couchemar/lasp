@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tokenizer `line`/`col` are now correct after a multi-line string (default profile) or `delimited_span` (`[tokens]` profile) token. Previously every later token reported a too-small `line` and a `col` measured from a stale line start (`"a\nb\nc"\nx` reported `x` on line 2, true line 4). Position is now computed in one place: a shared `PositionTracker` stamps every token through a single `Scanner.emit`, and newline/indent/whitespace/comment handling is one shared structural step used by both tokenizers. This also fixes the column of tokens that follow a block comment ending on the first line of the source (`/* a */x` reported `x` at col 0, now col 7), and clamps a string token whose last byte is a trailing escape `\` to the source length (it used to end at `len + 1`, aborting the engine with `index out of bounds` when a grammar was supplied). Only `line`/`col` of affected events and the trailing-escape token `end` change; all other output is byte-identical. (Spec: tokenizer-line-tracking)
 - `--names-only` now prints the first string capture even when the event also has a count or extent integer field; the leading integer is printed only for events with no string capture. Amends the plain-toml-capture-tables 'leading integer first' rule. Shared helper `writeNamesOnlyLine` now delegates to the pure selector `namesOnlyValue`. (Spec: names-only-prefer-string-capture)
 
 ### Added

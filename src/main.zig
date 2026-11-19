@@ -1181,10 +1181,12 @@ test "property: single-file parse/query is deterministic and well-formed (P2)" {
             const tmp_path = "test_parsedir_prop.tmp";
             const io = std.testing.io;
             const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+            defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             var wbuf: [4096]u8 = undefined;
             var writer = file.writer(io, &wbuf);
             try writer.interface.writeAll(src);
             try writer.interface.flush();
+            file.close(io);
             const args: []const []const u8 = switch (flag) {
                 0 => &.{ "parse", tmp_path },
                 1 => &.{ "parse", tmp_path, "-g", "examples/grammars/zig.toml" },
@@ -3965,4 +3967,170 @@ test "integration: parse without --resemble is unchanged for resemblance fixture
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, plain.term);
     try std.testing.expect(std.mem.indexOf(u8, plain.stdout, "alternatives") == null);
     try std.testing.expect(std.mem.indexOf(u8, plain.stdout, "source") == null);
+}
+
+// --- tokenizer-line-tracking regressions (spec: tokenizer-line-tracking, task 4.4) ---
+
+/// Independent ground truth for a byte offset: 1-based line and 0-based col.
+fn truthLineCol(source: []const u8, start: usize) struct { line: i64, col: i64 } {
+    var line: i64 = 1;
+    var line_start: usize = 0;
+    for (source[0..start], 0..) |b, k| {
+        if (b == '\n') {
+            line += 1;
+            line_start = k + 1;
+        }
+    }
+    return .{ .line = line, .col = @intCast(start - line_start) };
+}
+
+fn expectEventsGroundTruth(source: []const u8, evs: []const std.json.Value) !void {
+    for (evs) |ev| {
+        const o = ev.object;
+        const start: usize = @intCast(o.get("start").?.integer);
+        const t = truthLineCol(source, start);
+        try std.testing.expectEqual(t.line, o.get("line").?.integer);
+        try std.testing.expectEqual(t.col, o.get("col").?.integer);
+    }
+}
+
+test "integration: default tokenizer reports true line after multi-line string (Repro 1)" {
+    const allocator = std.testing.allocator;
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "--jsonl" }, "\"a\nb\nc\"\nx\n");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    var found = false;
+    var it = std.mem.splitScalar(u8, r.stdout, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object;
+        if (std.mem.eql(u8, o.get("type").?.string, "identifier")) {
+            found = true;
+            try std.testing.expectEqual(@as(i64, 4), o.get("line").?.integer);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "integration: trailing backslash with a grammar does not abort" {
+    const allocator = std.testing.allocator;
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "examples/grammars/zig.toml" }, "\"abc\\");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "index out of bounds") == null);
+}
+
+test "integration: events after a multi-line delimited_span have ground-truth line/col" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, "tests/fixtures/multiline_span.txt", allocator, .limited(1 << 20));
+    defer allocator.free(source);
+
+    // Wrapped JSON.
+    const w = try runLasp(allocator, &.{ "parse", "tests/fixtures/multiline_span.txt", "-g", "tests/fixtures/grammars/multiline_span.toml" });
+    defer {
+        allocator.free(w.stdout);
+        allocator.free(w.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, w.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, w.stdout, .{});
+    defer parsed.deinit();
+    const evs = parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 5), evs.len);
+    try expectEventsGroundTruth(source, evs);
+    // "delta" follows a two-line span on the line it ends.
+    try std.testing.expectEqual(@as(i64, 5), evs[3].object.get("line").?.integer);
+
+    // NDJSON.
+    const j = try runLasp(allocator, &.{ "parse", "tests/fixtures/multiline_span.txt", "-g", "tests/fixtures/grammars/multiline_span.toml", "--jsonl" });
+    defer {
+        allocator.free(j.stdout);
+        allocator.free(j.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, j.term);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, j.stdout, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const p = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer p.deinit();
+        try expectEventsGroundTruth(source, &.{p.value});
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), n);
+}
+
+// Regression guard: passes before AND after the fix. markdown_tasks.toml has no
+// string kind, so a stray quote is an unknown byte and never swallows lines.
+test "integration: markdown_tasks reports true lines with stray quotes in prose" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "tests/fixtures/markdown_stray_quotes.md";
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
+    defer allocator.free(source);
+
+    const r = try runLasp(allocator, &.{ "parse", path, "-g", "examples/grammars/markdown_tasks.toml" });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+    defer parsed.deinit();
+    const evs = parsed.value.object.get("events").?.array.items;
+    try expectEventsGroundTruth(source, evs);
+
+    // Expected open-task lines come from the fixture bytes, not from lasp.
+    var want: std.ArrayList(i64) = .empty;
+    defer want.deinit(allocator);
+    var line_no: i64 = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |l| {
+        line_no += 1;
+        if (std.mem.indexOf(u8, l, "- [ ]") != null) try want.append(allocator, line_no);
+    }
+    var got: std.ArrayList(i64) = .empty;
+    defer got.deinit(allocator);
+    for (evs) |ev| {
+        if (std.mem.eql(u8, ev.object.get("type").?.string, "task_open"))
+            try got.append(allocator, ev.object.get("line").?.integer);
+    }
+    try std.testing.expectEqualSlices(i64, want.items, got.items);
+    try std.testing.expectEqual(@as(usize, 3), got.items.len);
+}
+
+test "integration: position=start and extent at_column see true columns after a multi-line span" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "tests/fixtures/multiline_span_position.txt";
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
+    defer allocator.free(source);
+
+    const r = try runLasp(allocator, &.{ "parse", path, "-g", "tests/fixtures/grammars/multiline_span_position.toml" });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+    defer parsed.deinit();
+    const evs = parsed.value.object.get("events").?.array.items;
+
+    // `bar` and `qux` start at true column 0; `baz` (col 8) is rejected.
+    try std.testing.expectEqual(@as(usize, 2), evs.len);
+    try std.testing.expectEqualStrings("bar", evs[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("qux", evs[1].object.get("name").?.string);
+    try expectEventsGroundTruth(source, evs);
+
+    // The extent stops at the column-0 `.` on its own line, not the mid-line one.
+    const dot_line = std.mem.indexOf(u8, source, "\n.\n").? + 2;
+    try std.testing.expectEqual(@as(i64, @intCast(dot_line)), evs[0].object.get("region").?.integer);
 }

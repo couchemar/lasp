@@ -1,0 +1,12 @@
+# Fixture for the tokenizer-line-tracking spec: a `delimited_span` kind whose
+# tokens can span lines, plus a pattern that reports every `word` token.
+[language]
+name = "multiline-span"
+
+[tokens]
+word = { char_class_run = { start = "a-zA-Z_" } }
+q = { delimited_span = { open = "'", close = "'", escape = "\\" } }
+
+[[patterns]]
+type = "word"
+sequence = ["$name:word"]
