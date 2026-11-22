@@ -216,16 +216,16 @@ diff <(.bin/lasp parse a.zig -g examples/grammars/zig.toml --node function --nam
 Output for a released build:
 
 ```
-lasp 0.3.0
+lasp 0.5.0
 ```
 
 Output for a development build (the working tree, or any build whose version or tree does not match the latest release):
 
 ```
-lasp 0.3.0-dev+a2ff0ae
+lasp 0.5.0-dev+a2ff0ae
 ```
 
-The version is embedded at build time. A build is **released** (plain `X.Y.Z`) only when the current commit carries a **git release tag matching the version** (`v0.3.0` or `0.3.0` for `0.3.0`) AND `build.zig.zon`'s version equals the latest dated `CHANGELOG.md` release AND the source tree is clean (git). Any other build reports `X.Y.Z-dev+<short-commit>` — including a clean commit past a release that carries no tag (the previously misreported mid-cycle case). When no git facts are available (no `.git`, no flake revision — e.g. a tarball build) it falls back to the plain version. The rule lives in `build.zig`; the Nix flake supplies commit/dirty hermetically from the flake revision (no `git` in the sandbox). The flake's default outputs (`packages.default`, `packages.lasp`) pass `-Dgit_tagged=false`, so an ordinary `nix build` reports dev. A released Nix build is produced by building the dedicated `packages.released` output (`nix build .#released`) from the tagged, clean release commit — it passes `-Dgit_tagged=true`, making it the Nix equivalent of the local tagged `zig build`. The clean-tree and changelog-match conditions still apply, so a dirty or version-mismatched `nix build .#released` still reports dev. To release: tag the release commit (`git tag vX.Y.Z`), bump `version` in `build.zig.zon`, and add a `CHANGELOG.md` entry (Keep a Changelog format). `--version`/`-V` is also accepted among other flags and exits before reading any file.
+The version is embedded at build time. A build is **released** (plain `X.Y.Z`) only when the current commit carries a **git release tag matching the version** (`v0.5.0` or `0.5.0` for `0.5.0`) AND `build.zig.zon`'s version equals the latest dated `CHANGELOG.md` release AND the source tree is clean (git). Any other build reports `X.Y.Z-dev+<short-commit>` — including a clean commit past a release that carries no tag (the previously misreported mid-cycle case). When no git facts are available (no `.git`, no flake revision — e.g. a tarball build) it falls back to the plain version. The rule lives in `build.zig`; the Nix flake supplies commit/dirty hermetically from the flake revision (no `git` in the sandbox). The flake's default outputs (`packages.default`, `packages.lasp`) pass `-Dgit_tagged=false`, so an ordinary `nix build` reports dev. A released Nix build is produced by building the dedicated `packages.released` output (`nix build .#released`) from the tagged, clean release commit — it passes `-Dgit_tagged=true`, making it the Nix equivalent of the local tagged `zig build`. The clean-tree and changelog-match conditions still apply, so a dirty or version-mismatched `nix build .#released` still reports dev. To release: tag the release commit (`git tag vX.Y.Z`), bump `version` in `build.zig.zon`, and add a `CHANGELOG.md` entry (Keep a Changelog format). `--version`/`-V` is also accepted among other flags and exits before reading any file.
 
 ### Help
 

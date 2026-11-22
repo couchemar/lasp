@@ -59,7 +59,7 @@
               inherit version;
               src = ./.;
 
-              nativeBuildInputs = [ pkgs.zig ];
+              nativeBuildInputs = [ pkgs.zig_0_16 ];
 
               dontConfigure = true;
 
@@ -92,7 +92,7 @@
           };
 
           devShells.default = pkgs.mkShell {
-            buildInputs = [ pkgs.zig ];
+            buildInputs = [ pkgs.zig_0_16 ];
           };
 
           formatter = pkgs.nixfmt-tree;

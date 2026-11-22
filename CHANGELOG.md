@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Toolchain pinned to `pkgs.zig_0_16` in `flake.nix` (devShell and `mkLasp`) and `flake.lock` updated, so the nixpkgs default `zig` (0.17) cannot silently replace Zig 0.16. Dependencies: `minish` v0.3.0-era pin to v0.4.0, `toml` v0.1.6 to v0.1.16 (adds the transitive `thread_pool` v0.2.11 dependency).
 ### Fixed
 - Fatal error output printed `error:` two or three times (for example `error: error: error: [tokens] invalid char set: ...`). The prefix is now added in exactly one place, the shared error reporter in `src/main.zig` (`errorLineFormat`, used by `reportError`/`fatalError`), and the message strings (`formatCliError`, `grammarErrorMessage`, `selectorErrorMessage`, inline literals) carry none, so every error line prints `error: ` once. A comptime guard rejects format literals that start with `error:`. Message bodies, exit codes, and stdout are unchanged. The three duplicated grammar-error switches and two selector-error switches collapsed into single message tables. (Spec: grammar-error-prefix-fix)
 
