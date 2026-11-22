@@ -11,8 +11,103 @@ pub const query_filter = @import("query/filter.zig");
 pub const query_parser = @import("query/parser.zig");
 pub const query_evaluator = @import("query/evaluator.zig");
 const build_options = @import("build_options");
+
+/// The one place the `error: ` prefix is spliced in. Message strings carry none.
+const error_prefix = "error: ";
+
+/// Comptime line format: prefix + `fmt` + newline. Rejects a `fmt` that already
+/// starts with `error:` so a second prefix cannot be written by accident.
+fn errorLineFormat(comptime fmt: []const u8) []const u8 {
+    comptime if (std.mem.startsWith(u8, fmt, "error:"))
+        @compileError("error format must not start with \"error:\": " ++ fmt);
+    return error_prefix ++ fmt ++ "\n";
+}
+
+/// Pure formatter for one error line into any writer (shares `errorLineFormat`
+/// with the real reporter; used by tests).
+fn writeErrorLine(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) std.Io.Writer.Error!void {
+    try w.print(errorLineFormat(fmt), args);
+}
+
+/// Prints one prefixed error line to stderr and returns.
+fn reportError(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(errorLineFormat(fmt), args);
+}
+
+/// Prints one prefixed error line to stderr and exits with code 1.
+fn fatalError(comptime fmt: []const u8, args: anytype) noreturn {
+    reportError(fmt, args);
+    std.process.exit(1);
+}
 /// Single message for `error.InvalidCharSet` (empty, inverted, non-ASCII endpoint, or bad escape).
-const invalid_char_set_message = "error: [tokens] invalid char set: ranges must have ASCII endpoints and run low-to-high, use \\- for a literal '-' and \\\\ for a literal '\\' (other escapes are not allowed)";
+const invalid_char_set_message = "[tokens] invalid char set: ranges must have ASCII endpoints and run low-to-high, use \\- for a literal '-' and \\\\ for a literal '\\' (other escapes are not allowed)";
+
+/// Prefix-free message body for an error from `parseGrammar`.
+fn grammarErrorMessage(err: grammar_loader.GrammarError) []const u8 {
+    return switch (err) {
+        error.InvalidToml => "invalid TOML syntax in grammar file",
+        error.MissingPatterns => "grammar file missing required [[patterns]] section",
+        error.EmptyPatternSequence => "pattern has empty sequence",
+        error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
+        error.InvalidPositionValue => "invalid position value, expected 'start'",
+        error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
+        error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
+        error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
+        error.InvalidConstraintType => "invalid constraint type",
+        error.InvalidConstraintDepth => "invalid constraint depth",
+        error.InvalidConstraintField => "invalid constraint field",
+        error.InvalidConstraintValues => "invalid constraint values",
+        error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
+        error.InvalidCommentLineType => "[comments] line must be an array of strings",
+        error.InvalidCommentBlockType => "[comments] block_open/block_close must be strings",
+        error.UnpairedBlockDelimiter => "[comments] block_open and block_close must both be present or both absent",
+        error.CommentPrefixTooLong => "[comments] line prefix too long (max 8 characters)",
+        error.TooManyLinePrefixes => "[comments] too many line prefixes (max 16)",
+        error.BlockDelimiterTooLong => "[comments] block delimiter too long (max 8 characters)",
+        error.InvalidTokenSection => "[tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
+        error.DuplicateKindName => "[tokens] duplicate kind name",
+        error.EmptyKindName => "[tokens] kind name must not be empty",
+        error.InvalidRecognizer => "[tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
+        error.InvalidCharSet => invalid_char_set_message,
+        error.EmptyLiteralSet => "[tokens] literal_set must contain non-empty strings",
+        error.InvalidCountTable => "[[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)",
+        error.TooManyCountTables => "too many [[patterns.count]] tables (max 16)",
+        error.DuplicateCountField => "[[patterns.count]] field duplicates a capture or earlier count field",
+        error.InvalidCaptureTable => "[[patterns.capture]] must declare a non-empty field and at least one of separator/suffix (1-8 bytes)",
+        error.UnknownCaptureField => "[[patterns.capture]] field is not a declared capture",
+        error.DuplicateCaptureField => "[[patterns.capture]] duplicate table for the same field",
+        error.ParenthesizedCaptureParam => "parenthesized capture parameters are removed; use [[patterns.capture]] tables",
+        error.ExtentModeConflict => "[[patterns.extent]] cannot combine terminator with open/close",
+        error.ExtentNoMode => "[[patterns.extent]] must declare balanced open/close or a terminator",
+        error.ExtentIncompleteBalanced => "[[patterns.extent]] balanced mode requires both open and close",
+        error.InvalidExtentField => "[[patterns.extent]] field must be 1-64 bytes",
+        error.InvalidExtentDelimiter => "[[patterns.extent]] open/close/terminator must be 1-8 bytes",
+        error.DuplicateExtentField => "[[patterns.extent]] field duplicates a capture or count field",
+        error.ExtentAtColumnWithoutTerminator => "[[patterns.extent]] at_column requires terminator mode",
+        error.InvalidExtentAtColumn => "[[patterns.extent]] at_column must be an integer in 0..65535",
+        error.TooManyExtentTables => "at most one [[patterns.extent]] table per pattern",
+        error.InvalidExtensionsList => "[language] extensions must be an array of non-empty strings",
+        error.OutOfMemory => "out of memory",
+        else => "unknown grammar error",
+    };
+}
+
+/// Prefix-free message body for an error from `query_parser.parse`.
+fn selectorErrorMessage(err: query_parser.ParseError) []const u8 {
+    return switch (err) {
+        error.EmptySelector => "empty selector string",
+        error.UnclosedBracket => "unclosed bracket in selector",
+        error.MissingFieldName => "missing field name in attribute condition",
+        error.MissingOperator => "missing or invalid operator in attribute condition",
+        error.MissingValue => "missing value in attribute condition",
+        error.UnclosedQuote => "unclosed quote in attribute value",
+        error.InvalidOperator => "invalid operator, expected '=', '!=', '>', '~=', '^=', or '$='",
+        error.ExpectedQuotedValue => "substring operators (~=, ^=, $=) require a quoted string value",
+        error.InvalidNumericValue => "invalid numeric value for '>' operator",
+        error.UnexpectedCharacter => "unexpected character in selector",
+        error.OutOfMemory => "out of memory",
+    };
+}
 
 /// Reads entire file into arena-allocated buffer.
 /// Returns the file content as a byte slice.
@@ -21,11 +116,11 @@ fn readSourceFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         switch (err) {
             error.FileNotFound => {
-                std.debug.print("error: file not found: {s}\n", .{path});
+                reportError("file not found: {s}", .{path});
                 return err;
             },
             error.AccessDenied => {
-                std.debug.print("error: access denied: {s}\n", .{path});
+                reportError("access denied: {s}", .{path});
                 return err;
             },
             else => return err,
@@ -57,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 3. Parse CLI args
     const parsed = cli.parseArgs(arg_list.items) catch |err| {
-        std.process.fatal("{s}", .{cli.formatCliError(err)});
+        fatalError("{s}", .{cli.formatCliError(err)});
     };
 
     // 4. Stdout setup
@@ -71,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
             // expected event in shell pipelines: exit quietly and successfully.
             // Any other write failure (or an unknown cause) stays fatal.
             if (shouldCleanExitOnWriteFailed(stdout_writer.err)) return;
-            std.process.fatal("{s}", .{@errorName(err)});
+            fatalError("{s}", .{@errorName(err)});
         },
         else => return err,
     };
@@ -131,44 +226,16 @@ fn run(
             if (parsed.grammar_path) |gp| {
                 // Source read (moved from the shared step-6): stdin or file.
                 const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
-                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                    fatalError("failed to read file: {s}", .{parsed.target_path});
                 };
 
                 // Parse grammar, compile automaton, tokenize, run engine
                 const grammar_source = readSourceFile(io, allocator, gp) catch {
-                    std.process.fatal("failed to read grammar file: {s}", .{gp});
+                    fatalError("failed to read grammar file: {s}", .{gp});
                 };
                 const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
-                    const msg: []const u8 = switch (err) {
-                        error.InvalidToml => "invalid TOML syntax in grammar file",
-                        error.MissingPatterns => "grammar file missing required [[patterns]] section",
-                        error.EmptyPatternSequence => "pattern has empty sequence",
-                        error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
-                        error.InvalidPositionValue => "invalid position value, expected 'start'",
-                        error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
-                        error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
-                        error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
-                        error.InvalidConstraintType => "invalid constraint type",
-                        error.InvalidConstraintDepth => "invalid constraint depth",
-                        error.InvalidConstraintField => "invalid constraint field",
-                        error.InvalidConstraintValues => "invalid constraint values",
-                        error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
-                        error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
-                        error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
-                        error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
-                        error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
-                        error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
-                        error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
-                        error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
-                        error.DuplicateKindName => "error: [tokens] duplicate kind name",
-                        error.EmptyKindName => "error: [tokens] kind name must not be empty",
-                        error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
-                        error.InvalidCharSet => invalid_char_set_message,
-                        error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
-                        error.OutOfMemory => "out of memory",
-                        else => "unknown grammar error",
-                    };
-                    std.process.fatal("error: {s}: {s}", .{ msg, gp });
+                    const msg: []const u8 = grammarErrorMessage(err);
+                    fatalError("{s}: {s}", .{ msg, gp });
                 };
                 const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
                 const tokens = if (grammar.tokens) |vocab|
@@ -179,23 +246,11 @@ fn run(
 
                 // Parse selector string into QueryFilter
                 const selector = parsed.query_selector orelse {
-                    std.process.fatal("error: query command requires a selector string", .{});
+                    fatalError("query command requires a selector string", .{});
                 };
                 const filter = query_parser.parse(selector, allocator) catch |err| {
-                    const msg: []const u8 = switch (err) {
-                        error.EmptySelector => "error: empty selector string",
-                        error.UnclosedBracket => "error: unclosed bracket in selector",
-                        error.MissingFieldName => "error: missing field name in attribute condition",
-                        error.MissingOperator => "error: missing or invalid operator in attribute condition",
-                        error.MissingValue => "error: missing value in attribute condition",
-                        error.UnclosedQuote => "error: unclosed quote in attribute value",
-                        error.InvalidOperator => "error: invalid operator, expected '=', '!=', '>', '~=', '^=', or '$='",
-                        error.ExpectedQuotedValue => "error: substring operators (~=, ^=, $=) require a quoted string value",
-                        error.InvalidNumericValue => "error: invalid numeric value for '>' operator",
-                        error.UnexpectedCharacter => "error: unexpected character in selector",
-                        error.OutOfMemory => "error: out of memory",
-                    };
-                    std.process.fatal("{s}", .{msg});
+                    const msg: []const u8 = selectorErrorMessage(err);
+                    fatalError("{s}", .{msg});
                 };
 
                 // Evaluate filter against structural events
@@ -215,34 +270,22 @@ fn run(
             } else {
                 // Default grammar resolution (nullable: absent dir or stdin).
                 const resolved = resolved_default orelse {
-                    std.process.fatal("error: query command requires --grammar/-g flag", .{});
+                    fatalError("query command requires --grammar/-g flag", .{});
                 };
                 if (resolved.len == 0) {
-                    std.process.fatal("error: query command requires --grammar/-g flag", .{});
+                    fatalError("query command requires --grammar/-g flag", .{});
                 }
 
                 const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
-                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                    fatalError("failed to read file: {s}", .{parsed.target_path});
                 };
 
                 const selector = parsed.query_selector orelse {
-                    std.process.fatal("error: query command requires a selector string", .{});
+                    fatalError("query command requires a selector string", .{});
                 };
                 const filter = query_parser.parse(selector, allocator) catch |err| {
-                    const msg: []const u8 = switch (err) {
-                        error.EmptySelector => "error: empty selector string",
-                        error.UnclosedBracket => "error: unclosed bracket in selector",
-                        error.MissingFieldName => "error: missing field name in attribute condition",
-                        error.MissingOperator => "error: missing or invalid operator in attribute condition",
-                        error.MissingValue => "error: missing value in attribute condition",
-                        error.UnclosedQuote => "error: unclosed quote in attribute value",
-                        error.InvalidOperator => "error: invalid operator, expected '=', '!=', '>', '~=', '^=', or '$='",
-                        error.ExpectedQuotedValue => "error: substring operators (~=, ^=, $=) require a quoted string value",
-                        error.InvalidNumericValue => "error: invalid numeric value for '>' operator",
-                        error.UnexpectedCharacter => "error: unexpected character in selector",
-                        error.OutOfMemory => "error: out of memory",
-                    };
-                    std.process.fatal("{s}", .{msg});
+                    const msg: []const u8 = selectorErrorMessage(err);
+                    fatalError("{s}", .{msg});
                 };
 
                 if (resolved.len == 1) {
@@ -263,7 +306,7 @@ fn run(
                 } else {
                     // Multi-grammar default: one array entry per matching grammar.
                     if (parsed.names_only) {
-                        std.process.fatal("error: --names-only requires a single grammar (pass -g/--grammar)", .{});
+                        fatalError("--names-only requires a single grammar (pass -g/--grammar)", .{});
                     }
                     var entries: std.ArrayList(json.DirResult) = .empty;
                     for (resolved) |lg| {
@@ -291,59 +334,15 @@ fn run(
             if (parsed.grammar_path) |gp| {
                 // Source read (moved from the shared step-6): stdin or file.
                 const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
-                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                    fatalError("failed to read file: {s}", .{parsed.target_path});
                 };
                 // Phase 2: TOML grammar → structural events
                 const grammar_source = readSourceFile(io, allocator, gp) catch {
-                    std.process.fatal("failed to read grammar file: {s}", .{gp});
+                    fatalError("failed to read grammar file: {s}", .{gp});
                 };
                 const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
-                    const msg: []const u8 = switch (err) {
-                        error.InvalidToml => "invalid TOML syntax in grammar file",
-                        error.MissingPatterns => "grammar file missing required [[patterns]] section",
-                        error.EmptyPatternSequence => "pattern has empty sequence",
-                        error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
-                        error.InvalidPositionValue => "invalid position value, expected 'start'",
-                        error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
-                        error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
-                        error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
-                        error.InvalidConstraintDepth => "invalid constraint depth",
-                        error.InvalidConstraintField => "invalid constraint field",
-                        error.InvalidConstraintValues => "invalid constraint values",
-                        error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
-                        error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
-                        error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
-                        error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
-                        error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
-                        error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
-                        error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
-                        error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
-                        error.DuplicateKindName => "error: [tokens] duplicate kind name",
-                        error.EmptyKindName => "error: [tokens] kind name must not be empty",
-                        error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
-                        error.InvalidCharSet => invalid_char_set_message,
-                        error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
-                        error.InvalidCountTable => "error: [[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)",
-                        error.TooManyCountTables => "error: too many [[patterns.count]] tables (max 16)",
-                        error.DuplicateCountField => "error: [[patterns.count]] field duplicates a capture or earlier count field",
-                        error.InvalidCaptureTable => "error: [[patterns.capture]] must declare a non-empty field and at least one of separator/suffix (1-8 bytes)",
-                        error.UnknownCaptureField => "error: [[patterns.capture]] field is not a declared capture",
-                        error.DuplicateCaptureField => "error: [[patterns.capture]] duplicate table for the same field",
-                        error.ParenthesizedCaptureParam => "error: parenthesized capture parameters are removed; use [[patterns.capture]] tables",
-                        error.ExtentModeConflict => "error: [[patterns.extent]] cannot combine terminator with open/close",
-                        error.ExtentNoMode => "error: [[patterns.extent]] must declare balanced open/close or a terminator",
-                        error.ExtentIncompleteBalanced => "error: [[patterns.extent]] balanced mode requires both open and close",
-                        error.InvalidExtentField => "error: [[patterns.extent]] field must be 1-64 bytes",
-                        error.InvalidExtentDelimiter => "error: [[patterns.extent]] open/close/terminator must be 1-8 bytes",
-                        error.DuplicateExtentField => "error: [[patterns.extent]] field duplicates a capture or count field",
-                        error.ExtentAtColumnWithoutTerminator => "error: [[patterns.extent]] at_column requires terminator mode",
-                        error.InvalidExtentAtColumn => "error: [[patterns.extent]] at_column must be an integer in 0..65535",
-                        error.TooManyExtentTables => "error: at most one [[patterns.extent]] table per pattern",
-                        error.InvalidExtensionsList => "error: [language] extensions must be an array of non-empty strings",
-                        error.OutOfMemory => "out of memory",
-                        else => "unknown grammar error",
-                    };
-                    std.process.fatal("error: {s}: {s}", .{ msg, gp });
+                    const msg: []const u8 = grammarErrorMessage(err);
+                    fatalError("{s}: {s}", .{ msg, gp });
                 };
                 const collect_alternatives = parsed.alternatives or parsed.resemble;
                 const structural_events = try parseOneFile(io, allocator, grammar, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
@@ -361,7 +360,7 @@ fn run(
                 }
             } else if (resolved_default) |resolved| {
                 const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
-                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                    fatalError("failed to read file: {s}", .{parsed.target_path});
                 };
                 if (resolved.len == 0) {
                     // Default dir present but no grammar matches: raw token output.
@@ -388,7 +387,7 @@ fn run(
                     // Multi-grammar default: one array entry per matching grammar
                     // (user choice), reusing the existing DirResult schema.
                     if (parsed.names_only) {
-                        std.process.fatal("error: --names-only requires a single grammar (pass -g/--grammar)", .{});
+                        fatalError("--names-only requires a single grammar (pass -g/--grammar)", .{});
                     }
                     const collect_alternatives = parsed.alternatives or parsed.resemble;
                     var entries: std.ArrayList(json.DirResult) = .empty;
@@ -408,7 +407,7 @@ fn run(
             } else {
                 // No grammar: raw token output
                 const source = readSourceOrStdin(io, allocator, parsed.target_path) catch {
-                    std.process.fatal("failed to read file: {s}", .{parsed.target_path});
+                    fatalError("failed to read file: {s}", .{parsed.target_path});
                 };
                 const tokens = try tokenizer.tokenize(source, null, .{}, allocator);
                 if (parsed.jsonl)
@@ -423,7 +422,7 @@ fn run(
             var loaded: []LoadedGrammar = &.{};
             if (parsed.grammar_dir) |gdir| {
                 loaded = loadGrammarsFromDir(io, allocator, gdir) catch {
-                    std.process.fatal("grammar directory not found: {s}", .{gdir});
+                    fatalError("grammar directory not found: {s}", .{gdir});
                 };
             } else {
                 // Default grammar dir: absent is silent (empty → [] output).
@@ -436,7 +435,7 @@ fn run(
             // Open the target directory for walking. A non-directory or missing
             // target is an error (Req 2.8).
             var root = std.Io.Dir.cwd().openDir(io, parsed.target_path, .{ .iterate = true }) catch {
-                std.process.fatal("directory not found: {s}", .{parsed.target_path});
+                fatalError("directory not found: {s}", .{parsed.target_path});
             };
             defer root.close(io);
 
@@ -444,7 +443,7 @@ fn run(
             var entries: std.ArrayList(json.DirResult) = .empty;
 
             var walker = root.walk(allocator) catch {
-                std.process.fatal("directory not found: {s}", .{parsed.target_path});
+                fatalError("directory not found: {s}", .{parsed.target_path});
             };
             defer walker.deinit();
             while (walker.next(io) catch null) |entry| {
@@ -464,7 +463,7 @@ fn run(
                     // work (same readSourceFile as single-file mode).
                     const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parsed.target_path, entry.path });
                     const source = readSourceFile(io, allocator, full_path) catch {
-                        std.process.fatal("failed to read file: {s}", .{full_path});
+                        fatalError("failed to read file: {s}", .{full_path});
                     };
                     const events_list = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
                     // The walker reuses its path buffers on the next `next()`
@@ -974,56 +973,11 @@ fn loadGrammarsFromDir(io: std.Io, allocator: std.mem.Allocator, gdir: []const u
     for (names.items) |name| {
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ gdir, name });
         const grammar_source = readSourceFile(io, allocator, path) catch {
-            std.process.fatal("failed to read grammar file: {s}", .{path});
+            fatalError("failed to read grammar file: {s}", .{path});
         };
         const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
-            const msg: []const u8 = switch (err) {
-                error.InvalidToml => "invalid TOML syntax in grammar file",
-                error.MissingPatterns => "grammar file missing required [[patterns]] section",
-                error.EmptyPatternSequence => "pattern has empty sequence",
-                error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
-                error.InvalidPositionValue => "invalid position value, expected 'start'",
-                error.InvalidWeightValue => "invalid weight value, weights must be non-negative",
-                error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
-                error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
-                error.InvalidConstraintType => "invalid constraint type",
-                error.InvalidConstraintDepth => "invalid constraint depth",
-                error.InvalidConstraintField => "invalid constraint field",
-                error.InvalidConstraintValues => "invalid constraint values",
-                error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
-                error.InvalidCommentLineType => "error: [comments] line must be an array of strings",
-                error.InvalidCommentBlockType => "error: [comments] block_open/block_close must be strings",
-                error.UnpairedBlockDelimiter => "error: [comments] block_open and block_close must both be present or both absent",
-                error.CommentPrefixTooLong => "error: [comments] line prefix too long (max 8 characters)",
-                error.TooManyLinePrefixes => "error: [comments] too many line prefixes (max 16)",
-                error.BlockDelimiterTooLong => "error: [comments] block delimiter too long (max 8 characters)",
-                error.InvalidTokenSection => "error: [tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)",
-                error.DuplicateKindName => "error: [tokens] duplicate kind name",
-                error.EmptyKindName => "error: [tokens] kind name must not be empty",
-                error.InvalidRecognizer => "error: [tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set",
-                error.InvalidCharSet => invalid_char_set_message,
-                error.EmptyLiteralSet => "error: [tokens] literal_set must contain non-empty strings",
-                error.InvalidCountTable => "error: [[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)",
-                error.TooManyCountTables => "error: too many [[patterns.count]] tables (max 16)",
-                error.DuplicateCountField => "error: [[patterns.count]] field duplicates a capture or earlier count field",
-                error.InvalidCaptureTable => "error: [[patterns.capture]] must declare a non-empty field and at least one of separator/suffix (1-8 bytes)",
-                error.UnknownCaptureField => "error: [[patterns.capture]] field is not a declared capture",
-                error.DuplicateCaptureField => "error: [[patterns.capture]] duplicate table for the same field",
-                error.ParenthesizedCaptureParam => "error: parenthesized capture parameters are removed; use [[patterns.capture]] tables",
-                error.ExtentModeConflict => "error: [[patterns.extent]] cannot combine terminator with open/close",
-                error.ExtentNoMode => "error: [[patterns.extent]] must declare balanced open/close or a terminator",
-                error.ExtentIncompleteBalanced => "error: [[patterns.extent]] balanced mode requires both open and close",
-                error.InvalidExtentField => "error: [[patterns.extent]] field must be 1-64 bytes",
-                error.InvalidExtentDelimiter => "error: [[patterns.extent]] open/close/terminator must be 1-8 bytes",
-                error.DuplicateExtentField => "error: [[patterns.extent]] field duplicates a capture or count field",
-                error.ExtentAtColumnWithoutTerminator => "error: [[patterns.extent]] at_column requires terminator mode",
-                error.InvalidExtentAtColumn => "error: [[patterns.extent]] at_column must be an integer in 0..65535",
-                error.TooManyExtentTables => "error: at most one [[patterns.extent]] table per pattern",
-                error.InvalidExtensionsList => "error: [language] extensions must be an array of non-empty strings",
-                error.OutOfMemory => "out of memory",
-                else => "unknown grammar error",
-            };
-            std.process.fatal("error: {s}: {s}", .{ msg, path });
+            const msg: []const u8 = grammarErrorMessage(err);
+            fatalError("{s}: {s}", .{ msg, path });
         };
         try loaded.append(allocator, .{
             .name = name,
@@ -1358,6 +1312,8 @@ test "property: directory and grammar errors exit non-zero (P4)" {
     }
     try std.testing.expect(!std.meta.eql(r1.term, std.process.Child.Term{ .exited = 0 }));
     try std.testing.expect(std.mem.indexOf(u8, r1.stderr, "directory not found") != null);
+    // Preservation (error-prefix fix): exactly one prefix, exact bytes, exit 1, empty stdout.
+    try expectFatalResultOnePrefix(r1.term, r1.stdout, r1.stderr, "error: directory not found: test_parsedir_nope\n");
 
     // Req 2.9: missing grammar dir → non-zero, descriptive stderr.
     const r2 = try runLasp(allocator, &.{ "parse-dir", tree, "--grammar-dir", "test_parsedir_nope_grammars" });
@@ -1367,6 +1323,7 @@ test "property: directory and grammar errors exit non-zero (P4)" {
     }
     try std.testing.expect(!std.meta.eql(r2.term, std.process.Child.Term{ .exited = 0 }));
     try std.testing.expect(std.mem.indexOf(u8, r2.stderr, "grammar directory not found") != null);
+    try expectFatalResultOnePrefix(r2.term, r2.stdout, r2.stderr, "error: grammar directory not found: test_parsedir_nope_grammars\n");
 
     // Req 2.10: malformed grammar names the offending path.
     const r3 = try runLasp(allocator, &.{ "parse-dir", tree, "--grammar-dir", bad_grammars });
@@ -1801,6 +1758,20 @@ test "broken pipe: query with early-closing reader exits cleanly" {
 
     const result = try runLaspEarlyClose(allocator, &.{
         "query", "*", fixture, "-g", "examples/grammars/zig.toml",
+    }, 64);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+}
+
+test "broken pipe: --jsonl with early-closing reader exits cleanly" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeLargeZigFixture(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+
+    const result = try runLaspEarlyClose(allocator, &.{
+        "parse", fixture, "-g", "examples/grammars/zig.toml", "--jsonl",
     }, 64);
     defer allocator.free(result.stderr);
 
@@ -4232,4 +4203,213 @@ test "integration: position=start and extent at_column see true columns after a 
     // The extent stops at the column-0 `.` on its own line, not the mid-line one.
     const dot_line = std.mem.indexOf(u8, source, "\n.\n").? + 2;
     try std.testing.expectEqual(@as(i64, @intCast(dot_line)), evs[0].object.get("region").?.integer);
+}
+
+// --- grammar-error-prefix-fix: Task 1, bug condition exploration (Property 1) ---
+// Every stderr error line must start with exactly one `error: `. These tests
+// encode the FIXED behavior and fail on code that repeats the prefix.
+
+/// Asserts every non-empty stderr line starts with `error: ` and that
+/// `error: error:` occurs nowhere.
+fn expectOnePrefixPerLine(stderr: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "error: error:") == null);
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(std.mem.startsWith(u8, line, "error: "));
+    }
+}
+
+/// Runs lasp and asserts: exit code 1, empty stdout, one prefix per error
+/// line, and (when given) the exact stderr bytes.
+fn expectFatalOnePrefix(allocator: std.mem.Allocator, args: []const []const u8, expected_stderr: ?[]const u8) !void {
+    const r = try runLasp(allocator, args);
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try expectFatalResultOnePrefix(r.term, r.stdout, r.stderr, expected_stderr);
+}
+
+fn expectFatalResultOnePrefix(term: std.process.Child.Term, stdout: []const u8, stderr: []const u8, expected_stderr: ?[]const u8) !void {
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+    try std.testing.expectEqual(@as(usize, 0), stdout.len);
+    try expectOnePrefixPerLine(stderr);
+    if (expected_stderr) |exp| try std.testing.expectEqualStrings(exp, stderr);
+}
+
+const err_prefix_dir = "test_errprefix_tmp";
+
+/// Recreates `test_errprefix_tmp` holding the throwaway grammars the cases use.
+fn seedErrPrefixFixtures(allocator: std.mem.Allocator) !void {
+    const io = std.testing.io;
+    removeDirTree(allocator, io, err_prefix_dir);
+    try std.Io.Dir.cwd().createDir(io, err_prefix_dir, .default_dir);
+    const pat = "[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n";
+    try writeFixtureFile(io, err_prefix_dir ++ "/bad_charset.toml", pat ++ "[tokens]\nident = { char_class_run = { start = \"z-a\" } }\n");
+    try writeFixtureFile(io, err_prefix_dir ++ "/bad_comments.toml", pat ++ "[comments]\nline = \"x\"\n");
+    try writeFixtureFile(io, err_prefix_dir ++ "/bad_toml.toml", "this is [[ not toml");
+    try writeFixtureFile(io, err_prefix_dir ++ "/good.toml", "[[patterns]]\ntype = \"function\"\nsequence = [\"fn\", \"$name:IDENTIFIER\", \"(\"]\n");
+}
+
+const err_prefix_charset_body = "error: [tokens] invalid char set: ranges must have ASCII endpoints and run low-to-high, use \\- for a literal '-' and \\\\ for a literal '\\' (other escapes are not allowed): ";
+
+test "error prefix P1: grammar charset error is one exact line (parse)" {
+    const allocator = std.testing.allocator;
+    try seedErrPrefixFixtures(allocator);
+    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    const gp = err_prefix_dir ++ "/bad_charset.toml";
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", gp }, err_prefix_charset_body ++ gp ++ "\n");
+}
+
+test "error prefix P1: grammar charset error is one exact line (stdin parse)" {
+    const allocator = std.testing.allocator;
+    try seedErrPrefixFixtures(allocator);
+    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    const gp = err_prefix_dir ++ "/bad_charset.toml";
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", gp }, "a\n");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try expectFatalResultOnePrefix(r.term, r.stdout, r.stderr, err_prefix_charset_body ++ gp ++ "\n");
+}
+
+test "error prefix P1: grammar charset error is one exact line (query)" {
+    const allocator = std.testing.allocator;
+    try seedErrPrefixFixtures(allocator);
+    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    const gp = err_prefix_dir ++ "/bad_charset.toml";
+    try expectFatalOnePrefix(allocator, &.{ "query", "function", "tests/fixtures/sample.zig", "-g", gp }, err_prefix_charset_body ++ gp ++ "\n");
+}
+
+test "error prefix P1: [comments] grammar error has one prefix" {
+    const allocator = std.testing.allocator;
+    try seedErrPrefixFixtures(allocator);
+    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    const gp = err_prefix_dir ++ "/bad_comments.toml";
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", gp }, "error: [comments] line must be an array of strings: " ++ gp ++ "\n");
+}
+
+test "error prefix P1: malformed TOML grammar has one prefix" {
+    const allocator = std.testing.allocator;
+    try seedErrPrefixFixtures(allocator);
+    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    const gp = err_prefix_dir ++ "/bad_toml.toml";
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", gp }, "error: invalid TOML syntax in grammar file: " ++ gp ++ "\n");
+}
+
+test "error prefix P1: unrecognized flag has one prefix" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--bogus" }, "error: unrecognized flag\n");
+}
+
+test "error prefix P1: --jsonl with --names-only has one prefix" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--jsonl", "--names-only" }, "error: --jsonl and --names-only are mutually exclusive\n");
+}
+
+test "error prefix P1: --jsonl --version has one prefix" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "--jsonl", "--version" }, "error: --jsonl is only supported on parse, parse-dir, and query commands\n");
+}
+
+test "error prefix P1: malformed query selector has one prefix" {
+    const allocator = std.testing.allocator;
+    try seedErrPrefixFixtures(allocator);
+    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    try expectFatalOnePrefix(allocator, &.{ "query", "function[", "tests/fixtures/sample.zig", "-g", err_prefix_dir ++ "/good.toml" }, "error: missing field name in attribute condition\n");
+}
+
+test "error prefix P1: query without a grammar has one prefix" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "query", "function", "tests/fixtures/sample.zig" }, "error: query command requires --grammar/-g flag\n");
+}
+
+test "error prefix P1: --alternatives on query has one prefix" {
+    const allocator = std.testing.allocator;
+    try seedErrPrefixFixtures(allocator);
+    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    try expectFatalOnePrefix(allocator, &.{ "query", "function", "tests/fixtures/sample.zig", "-g", err_prefix_dir ++ "/good.toml", "--alternatives" }, "error: --alternatives is supported on the parse command only\n");
+}
+
+test "error prefix P1: malformed default grammar has one prefix" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{.{ .name = "bad.toml", .content = "[language]\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n[tokens]\nident = { char_class_run = { start = \"z-a\" } }\n" }});
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl" }, null);
+    try expectFatalOnePrefix(allocator, &.{ "parse-dir", "tests/fixtures/dir_sample" }, err_prefix_charset_body ++ ".lasp/grammars/bad.toml\n");
+}
+
+test "error prefix P1: --names-only with several default grammars has one prefix" {
+    const allocator = std.testing.allocator;
+    try seedDefaultGrammars(allocator, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
+    });
+    defer removeDirTree(allocator, std.testing.io, ".lasp");
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl", "--names-only" }, "error: --names-only requires a single grammar (pass -g/--grammar)\n");
+}
+
+test "error prefix P1: missing source file yields two lines, one prefix each" {
+    const allocator = std.testing.allocator;
+    const p = "tests/fixtures/definitely_missing_source.zig";
+    try expectFatalOnePrefix(allocator, &.{ "parse", p }, "error: file not found: " ++ p ++ "\nerror: failed to read file: " ++ p ++ "\n");
+}
+
+// --- grammar-error-prefix-fix: Task 2, preservation (Property 2) ---
+// Observed on unfixed code; these paths must stay byte-identical after the fix.
+
+test "error prefix P2: no-args prints one prefix then the help text, exit 1, empty stdout" {
+    const allocator = std.testing.allocator;
+    const r = try runLasp(allocator, &.{});
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+    try std.testing.expectEqual(@as(usize, 0), r.stdout.len);
+    try std.testing.expect(std.mem.startsWith(u8, r.stderr, "error: " ++ cli.general_help_text));
+    try std.testing.expect(std.mem.startsWith(u8, r.stderr, "error: lasp - Language-Agnostic Structural Parser\n"));
+    // The only `error: ` in the whole stream is the leading one.
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfPos(u8, r.stderr, 1, "error:"));
+}
+
+test "error prefix P2: help and version invocations write stdout only, exit 0, no error text" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const []const u8{
+        &.{"--help"},
+        &.{"-h"},
+        &.{"help"},
+        &.{"--version"},
+        &.{"-V"},
+        &.{"version"},
+        &.{ "parse", "--help" },
+        &.{ "query", "--help" },
+        &.{ "parse-dir", "--help" },
+        &.{ "--help", "--version" },
+    };
+    for (cases) |args| {
+        const r = try runLasp(allocator, args);
+        defer {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+        try std.testing.expect(r.stdout.len > 0);
+        try std.testing.expectEqual(@as(usize, 0), r.stderr.len);
+        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "error:") == null);
+    }
+}
+
+test "error prefix P2: missing grammar file yields two lines, one prefix each" {
+    const allocator = std.testing.allocator;
+    const gp = "tests/fixtures/grammars/definitely_missing.toml";
+    try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", gp }, "error: file not found: " ++ gp ++ "\nerror: failed to read grammar file: " ++ gp ++ "\n");
+}
+
+test "error prefix P2: missing source file with a valid grammar keeps the two-line structure" {
+    const allocator = std.testing.allocator;
+    const p = "tests/fixtures/definitely_missing_source.zig";
+    try expectFatalOnePrefix(allocator, &.{ "parse", p, "-g", "tests/fixtures/grammars/zig.toml" }, "error: file not found: " ++ p ++ "\nerror: failed to read file: " ++ p ++ "\n");
 }

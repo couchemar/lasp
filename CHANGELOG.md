@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- Fatal error output printed `error:` two or three times (for example `error: error: error: [tokens] invalid char set: ...`). The prefix is now added in exactly one place, the shared error reporter in `src/main.zig` (`errorLineFormat`, used by `reportError`/`fatalError`), and the message strings (`formatCliError`, `grammarErrorMessage`, `selectorErrorMessage`, inline literals) carry none, so every error line prints `error: ` once. A comptime guard rejects format literals that start with `error:`. Message bodies, exit codes, and stdout are unchanged. The three duplicated grammar-error switches and two selector-error switches collapsed into single message tables. (Spec: grammar-error-prefix-fix)
 
 ## [0.5.0] - 2026-11-19
 

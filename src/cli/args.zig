@@ -123,16 +123,16 @@ pub fn helpText(topic: ?Command) []const u8 {
 pub fn formatCliError(err: CliError) []const u8 {
     return switch (err) {
         error.NoCommand => general_help_text,
-        error.UnrecognizedCommand => "error: unrecognized command",
-        error.UnrecognizedFlag => "error: unrecognized flag",
-        error.MissingFilePath => "error: command requires a file path",
-        error.MissingDirectoryPath => "error: parse-dir command requires a directory path",
-        error.MissingFlagValue => "error: flag requires a value",
-        error.MissingSelectorString => "error: query command requires a selector string",
-        error.AlternativesOnQuery => "error: --alternatives is supported on the parse command only",
-        error.ResembleOnQuery => "error: --resemble is supported on the parse command only",
-        error.JsonlWithNamesOnly => "error: --jsonl and --names-only are mutually exclusive",
-        error.JsonlOnNonOutputCommand => "error: --jsonl is only supported on parse, parse-dir, and query commands",
+        error.UnrecognizedCommand => "unrecognized command",
+        error.UnrecognizedFlag => "unrecognized flag",
+        error.MissingFilePath => "command requires a file path",
+        error.MissingDirectoryPath => "parse-dir command requires a directory path",
+        error.MissingFlagValue => "flag requires a value",
+        error.MissingSelectorString => "query command requires a selector string",
+        error.AlternativesOnQuery => "--alternatives is supported on the parse command only",
+        error.ResembleOnQuery => "--resemble is supported on the parse command only",
+        error.JsonlWithNamesOnly => "--jsonl and --names-only are mutually exclusive",
+        error.JsonlOnNonOutputCommand => "--jsonl is only supported on parse, parse-dir, and query commands",
     };
 }
 
@@ -1180,7 +1180,7 @@ test "--alternatives composes with other flags" {
 }
 
 test "formatCliError: AlternativesOnQuery message" {
-    try testing.expectEqualStrings("error: --alternatives is supported on the parse command only", formatCliError(error.AlternativesOnQuery));
+    try testing.expectEqualStrings("--alternatives is supported on the parse command only", formatCliError(error.AlternativesOnQuery));
 }
 
 // Feature: grammar-projected-resemblance, Unit: flag parsing
@@ -1205,7 +1205,7 @@ test "--resemble composes with -g and --node" {
 }
 
 test "formatCliError: ResembleOnQuery message" {
-    try testing.expectEqualStrings("error: --resemble is supported on the parse command only", formatCliError(error.ResembleOnQuery));
+    try testing.expectEqualStrings("--resemble is supported on the parse command only", formatCliError(error.ResembleOnQuery));
 }
 
 test "help text mentions --resemble" {
@@ -1249,8 +1249,8 @@ test "--jsonl on version/help is a usage error" {
 }
 
 test "formatCliError: jsonl messages" {
-    try testing.expectEqualStrings("error: --jsonl and --names-only are mutually exclusive", formatCliError(error.JsonlWithNamesOnly));
-    try testing.expectEqualStrings("error: --jsonl is only supported on parse, parse-dir, and query commands", formatCliError(error.JsonlOnNonOutputCommand));
+    try testing.expectEqualStrings("--jsonl and --names-only are mutually exclusive", formatCliError(error.JsonlWithNamesOnly));
+    try testing.expectEqualStrings("--jsonl is only supported on parse, parse-dir, and query commands", formatCliError(error.JsonlOnNonOutputCommand));
 }
 
 test "help texts mention --jsonl" {
