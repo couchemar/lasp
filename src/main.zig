@@ -616,18 +616,18 @@ test "property: file read round trip" {
 
     try minish.check(std.testing.allocator, bytes_gen, struct {
         fn prop(data: []const u8) !void {
-            const tmp_path = "test_prop4_roundtrip.tmp";
-
-            // Write random bytes to temp file
             const io = std.testing.io;
+            var sb = try Sandbox.init(std.testing.allocator);
+            defer sb.deinit();
+            const tmp_path = try sb.join("roundtrip.tmp");
+            defer std.testing.allocator.free(tmp_path);
+            // Write random bytes to temp file
             const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
             var wbuf: [256]u8 = undefined;
             var writer = file.writer(io, &wbuf);
             try writer.interface.writeAll(data);
             try writer.interface.flush();
             file.close(io);
-            defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-
             // Read back with readSourceFile
             const content = try readSourceFile(std.testing.io, std.testing.allocator, tmp_path);
             defer std.testing.allocator.free(content);
@@ -829,16 +829,17 @@ test "integration: no extent table ⇒ no extent field (P9 at CLI level)" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"body\"") != null);
 
     // Same grammar without the extent table → no body field anywhere.
-    const tmp_path = "test_extent_noextent.toml";
     const io = std.testing.io;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    const tmp_path = try sb.join("extent_noextent.toml");
+    defer allocator.free(tmp_path);
     const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
     var wbuf: [4096]u8 = undefined;
     var writer = file.writer(io, &wbuf);
     try writer.interface.writeAll("[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"$n:IDENTIFIER\", \"(\"]\n");
     try writer.interface.flush();
     file.close(io);
-    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-
     const plain = try runLasp(allocator, &.{
         "parse",
         "tests/fixtures/extent_brace_sample.txt",
@@ -858,16 +859,17 @@ test "integration: differing extent delimiters yield differing Region_Extent" {
     const allocator = std.testing.allocator;
     // Bracket-bounded variant: same source, a delimiter pair that does not occur
     // in the body (so both events report EOF = source length).
-    const tmp_path = "test_extent_variant.toml";
     const io = std.testing.io;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    const tmp_path = try sb.join("extent_variant.toml");
+    defer allocator.free(tmp_path);
     const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
     var wbuf: [4096]u8 = undefined;
     var writer = file.writer(io, &wbuf);
     try writer.interface.writeAll("[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"$n:IDENTIFIER\", \"(\"]\n\n[[patterns.extent]]\nfield = \"body\"\nopen = \"[\"\nclose = \"]\"\n");
     try writer.interface.flush();
     file.close(io);
-    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-
     const result = try runLasp(allocator, &.{
         "parse",
         "tests/fixtures/extent_brace_sample.txt",
@@ -892,13 +894,72 @@ test "integration: differing extent delimiters yield differing Region_Extent" {
 
 // --- Integration Tests ---
 
+/// Scratch directory for CLI tests that must create files (fixture trees,
+/// throwaway grammars, `.lasp/grammars`). It lives under `.zig-cache/tmp`
+/// (`std.testing.tmpDir`: unique random name, removed by `deinit`), never in the
+/// repo root. `tests` and `examples` are symlinked into it, so after `enter()`
+/// the spawned binary runs with the sandbox as its cwd and repo-relative
+/// arguments (`tests/fixtures/...`, `examples/grammars/...`) plus sandbox-relative
+/// ones (`tree/a.erl`, `.lasp/grammars`) resolve exactly as they did from the
+/// repo root, so output and error-message assertions are unchanged.
+const Sandbox = struct {
+    allocator: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    /// Absolute sandbox path.
+    abs: []u8,
+    /// Absolute path of the binary under test (the child's cwd is not the repo root).
+    bin: []u8,
+
+    fn init(allocator: std.mem.Allocator) !Sandbox {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const abs = try allocator.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
+        errdefer allocator.free(abs);
+        const repo = buf[0..try std.Io.Dir.cwd().realPathFile(io, ".", &buf)];
+        const bin = try std.fmt.allocPrint(allocator, "{s}/zig-out/bin/lasp", .{repo});
+        errdefer allocator.free(bin);
+        for ([_][]const u8{ "tests", "examples" }) |name| {
+            const target = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo, name });
+            defer allocator.free(target);
+            try tmp.dir.symLink(io, target, name, .{ .is_directory = true });
+        }
+        return .{ .allocator = allocator, .tmp = tmp, .abs = abs, .bin = bin };
+    }
+
+    /// Makes `runLasp`/`runLaspWithStdin`/`runLaspEarlyClose` spawn with this
+    /// sandbox as cwd until `deinit`. Tests run serially, so one active at a time.
+    fn enter(self: *const Sandbox) void {
+        active_sandbox = .{ .cwd = self.abs, .bin = self.bin };
+    }
+
+    fn deinit(self: *Sandbox) void {
+        active_sandbox = null;
+        self.tmp.cleanup();
+        self.allocator.free(self.abs);
+        self.allocator.free(self.bin);
+    }
+
+    /// Caller-owned absolute path of `rel` inside the sandbox.
+    fn join(self: *const Sandbox, rel: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.abs, rel });
+    }
+};
+const ActiveSandbox = struct { cwd: []const u8, bin: []const u8 };
+var active_sandbox: ?ActiveSandbox = null;
+fn laspBinary() []const u8 {
+    return if (active_sandbox) |a| a.bin else "zig-out/bin/lasp";
+}
+fn laspCwd() std.process.Child.Cwd {
+    return if (active_sandbox) |a| .{ .path = a.cwd } else .inherit;
+}
 fn runLasp(allocator: std.mem.Allocator, args: []const []const u8) !struct { stdout: []u8, stderr: []u8, term: std.process.Child.Term } {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.append(allocator, "zig-out/bin/lasp");
+    try argv.append(allocator, laspBinary());
     for (args) |a| try argv.append(allocator, a);
-
-    const result = try std.process.run(allocator, std.testing.io, .{ .argv = argv.items });
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = argv.items, .cwd = laspCwd() });
     return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
 }
 
@@ -907,8 +968,8 @@ fn runLasp(allocator: std.mem.Allocator, args: []const []const u8) !struct { std
 // MUST fail on the unfixed binary (the directory-read abort), Property 2 MUST
 // pass (single-file baseline captured).
 
-fn writeFixtureFile(io: std.Io, path: []const u8, content: []const u8) !void {
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+fn writeFixtureFile(dir: std.Io.Dir, io: std.Io, path: []const u8, content: []const u8) !void {
+    const file = try dir.createFile(io, path, .{});
     var buf: [4096]u8 = undefined;
     var w = file.writer(io, &buf);
     try w.interface.writeAll(content);
@@ -918,8 +979,8 @@ fn writeFixtureFile(io: std.Io, path: []const u8, content: []const u8) !void {
 
 /// Best-effort removal of a fixture directory tree (two passes: files, then
 /// directories — walk order is undefined).
-fn removeDirTree(allocator: std.mem.Allocator, io: std.Io, path: []const u8) void {
-    var root = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+fn removeDirTree(dir: std.Io.Dir, allocator: std.mem.Allocator, io: std.Io, path: []const u8) void {
+    var root = dir.openDir(io, path, .{ .iterate = true }) catch return;
     defer root.close(io);
 
     var walker = root.walk(allocator) catch return;
@@ -932,7 +993,7 @@ fn removeDirTree(allocator: std.mem.Allocator, io: std.Io, path: []const u8) voi
     while (walker2.next(io) catch null) |entry| {
         if (entry.kind == .directory) root.deleteDir(io, entry.path) catch {};
     }
-    std.Io.Dir.cwd().deleteDir(io, path) catch {};
+    dir.deleteDir(io, path) catch {};
 }
 /// Suffix match test in `--grammar-dir` extension matching. The dot-less form
 /// (e.g. `erl`) is the broader documented suffix.
@@ -1016,7 +1077,7 @@ fn resolveDefaultGrammars(io: std.Io, allocator: std.mem.Allocator, target_path:
     return try matches.toOwnedSlice(allocator);
 }
 
-/// Creates a temp dir tree with a `.erl`, a `.py`, an unmatched `.txt`, a
+/// Creates (inside the given sandbox) a dir tree with a `.erl`, a `.py`, an unmatched `.txt`, a
 /// recursive `.erl` in a subdirectory, and a grammar dir where the Erlang
 /// grammar declares `.erl` and the Python grammar `.py`.
 const ParseDirFixture = struct {
@@ -1024,26 +1085,23 @@ const ParseDirFixture = struct {
     grammars: []const u8,
 };
 
-fn makeParseDirFixture(allocator: std.mem.Allocator) !ParseDirFixture {
+fn makeParseDirFixture(allocator: std.mem.Allocator, sb: *const Sandbox) !ParseDirFixture {
     const io = std.testing.io;
+    const dir = sb.tmp.dir;
     const tree = "test_parsedir_tree";
     const grammars = "test_parsedir_grammars";
-    removeDirTree(allocator, io, tree);
-    removeDirTree(allocator, io, grammars);
-
-    try std.Io.Dir.cwd().createDir(io, tree, .default_dir);
-    try std.Io.Dir.cwd().createDir(io, tree ++ "/sub", .default_dir);
-    try std.Io.Dir.cwd().createDir(io, grammars, .default_dir);
-
-    try writeFixtureFile(io, tree ++ "/a.erl", "foo() -> 1.\n");
-    try writeFixtureFile(io, tree ++ "/b.py", "bar()\n");
-    try writeFixtureFile(io, tree ++ "/notes.txt", "irrelevant\n");
-    try writeFixtureFile(io, tree ++ "/sub/c.erl", "baz() -> 2.\n");
+    try dir.createDir(io, tree, .default_dir);
+    try dir.createDir(io, tree ++ "/sub", .default_dir);
+    try dir.createDir(io, grammars, .default_dir);
+    try writeFixtureFile(dir, io, tree ++ "/a.erl", "foo() -> 1.\n");
+    try writeFixtureFile(dir, io, tree ++ "/b.py", "bar()\n");
+    try writeFixtureFile(dir, io, tree ++ "/notes.txt", "irrelevant\n");
+    try writeFixtureFile(dir, io, tree ++ "/sub/c.erl", "baz() -> 2.\n");
 
     const erlang = try std.fmt.allocPrint(allocator, "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n", .{});
     const python = try std.fmt.allocPrint(allocator, "[language]\nname = \"python\"\nextensions = [\".py\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\", \")\"]\n", .{});
-    try writeFixtureFile(io, grammars ++ "/erlang.toml", erlang);
-    try writeFixtureFile(io, grammars ++ "/python.toml", python);
+    try writeFixtureFile(dir, io, grammars ++ "/erlang.toml", erlang);
+    try writeFixtureFile(dir, io, grammars ++ "/python.toml", python);
     allocator.free(erlang);
     allocator.free(python);
 
@@ -1076,19 +1134,13 @@ fn expectParseDirOk(result: anytype, allocator: std.mem.Allocator) !void {
 // parses matching files (bug condition). MUST FAIL on the unfixed code.
 test "parse-dir: walks tree, parses matching files, skips unmatched (P1)" {
     const allocator = std.testing.allocator;
-    const fixture = try makeParseDirFixture(allocator);
-    defer {
-        removeDirTree(allocator, std.testing.io, fixture.tree);
-        removeDirTree(allocator, std.testing.io, fixture.grammars);
-    }
-    // The no-grammar-dir form below expects [] (Req 2.12); that only holds
-    // when no default .lasp/grammars exists (a LASP-owned convention dir).
-    removeDirTree(allocator, std.testing.io, ".lasp");
-
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd_ptr = std.posix.system.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
-    const cwd = std.mem.sliceTo(cwd_ptr, 0);
-    const abs_tree = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, fixture.tree });
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const fixture = try makeParseDirFixture(allocator, &sb);
+    // The no-grammar-dir form below expects [] (Req 2.12); that holds because
+    // the sandbox cwd has no default .lasp/grammars.
+    const abs_tree = try sb.join(fixture.tree);
     defer allocator.free(abs_tree);
     const slash_tree = try std.fmt.allocPrint(allocator, "{s}/", .{fixture.tree});
     defer allocator.free(slash_tree);
@@ -1135,10 +1187,12 @@ test "property: single-file parse/query is deterministic and well-formed (P2)" {
             const allocator = std.testing.allocator;
             const src = vals[0];
             const flag = vals[1];
-            const tmp_path = "test_parsedir_prop.tmp";
             const io = std.testing.io;
+            var sb = try Sandbox.init(allocator);
+            defer sb.deinit();
+            const tmp_path = try sb.join("parsedir_prop.tmp");
+            defer allocator.free(tmp_path);
             const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
-            defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             var wbuf: [4096]u8 = undefined;
             var writer = file.writer(io, &wbuf);
             try writer.interface.writeAll(src);
@@ -1206,35 +1260,33 @@ test "property: parse-dir equals single-file per-grammar union (P3)" {
         fn prop(selected: []const FilePool) !void {
             const allocator = std.testing.allocator;
             const io = std.testing.io;
+            var sb = try Sandbox.init(allocator);
+            defer sb.deinit();
+            sb.enter();
+            const dir = sb.tmp.dir;
             const tree = "test_parsedir_prop3_tree";
             const grammars = "test_parsedir_prop3_grammars";
-            removeDirTree(allocator, io, tree);
-            removeDirTree(allocator, io, grammars);
-            defer {
-                removeDirTree(allocator, io, tree);
-                removeDirTree(allocator, io, grammars);
-            }
-            try std.Io.Dir.cwd().createDir(io, tree, .default_dir);
-            try std.Io.Dir.cwd().createDir(io, tree ++ "/sub", .default_dir);
-            try std.Io.Dir.cwd().createDir(io, grammars, .default_dir);
+            try dir.createDir(io, tree, .default_dir);
+            try dir.createDir(io, tree ++ "/sub", .default_dir);
+            try dir.createDir(io, grammars, .default_dir);
 
             var seen = [_]bool{false} ** 4;
             for (selected) |f| seen[@intFromEnum(f)] = true;
             if (seen[@intFromEnum(FilePool.a_erl)])
-                try writeFixtureFile(io, tree ++ "/a.erl", "foo() -> 1.\n");
+                try writeFixtureFile(dir, io, tree ++ "/a.erl", "foo() -> 1.\n");
             if (seen[@intFromEnum(FilePool.b_py)])
-                try writeFixtureFile(io, tree ++ "/b.py", "bar()\n");
+                try writeFixtureFile(dir, io, tree ++ "/b.py", "bar()\n");
             if (seen[@intFromEnum(FilePool.notes_txt)])
-                try writeFixtureFile(io, tree ++ "/notes.txt", "irrelevant\n");
+                try writeFixtureFile(dir, io, tree ++ "/notes.txt", "irrelevant\n");
             if (seen[@intFromEnum(FilePool.sub_c_erl)])
-                try writeFixtureFile(io, tree ++ "/sub/c.erl", "baz() -> 2.\n");
+                try writeFixtureFile(dir, io, tree ++ "/sub/c.erl", "baz() -> 2.\n");
 
             const erlang = "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n";
             const erlang2 = "[language]\nname = \"erlang2\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n";
             const python = "[language]\nname = \"python\"\nextensions = [\".py\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\", \")\"]\n";
-            try writeFixtureFile(io, grammars ++ "/erlang.toml", erlang);
-            try writeFixtureFile(io, grammars ++ "/erlang2.toml", erlang2);
-            try writeFixtureFile(io, grammars ++ "/python.toml", python);
+            try writeFixtureFile(dir, io, grammars ++ "/erlang.toml", erlang);
+            try writeFixtureFile(dir, io, grammars ++ "/erlang2.toml", erlang2);
+            try writeFixtureFile(dir, io, grammars ++ "/python.toml", python);
 
             const args = [_][]const u8{ "parse-dir", tree, "--grammar-dir", grammars };
             const result = try runLasp(allocator, &args);
@@ -1283,26 +1335,21 @@ test "property: parse-dir equals single-file per-grammar union (P3)" {
 test "property: directory and grammar errors exit non-zero (P4)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    // The no-grammar-dir case below (Req 2.12) expects [] — as with P1,
+    // only true without a default .lasp/grammars, which the sandbox cwd lacks.
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const dir = sb.tmp.dir;
     const tree = "test_parsedir_prop4_tree";
     const grammars = "test_parsedir_prop4_grammars";
     const bad_grammars = "test_parsedir_prop4_bad_grammars";
-    removeDirTree(allocator, io, tree);
-    removeDirTree(allocator, io, grammars);
-    removeDirTree(allocator, io, bad_grammars);
-    defer {
-        removeDirTree(allocator, io, tree);
-        removeDirTree(allocator, io, grammars);
-        removeDirTree(allocator, io, bad_grammars);
-    }
-    // The no-grammar-dir case below (Req 2.12) expects [] — as with P1,
-    // only true without a default .lasp/grammars (a LASP-owned convention dir).
-    removeDirTree(allocator, io, ".lasp");
-    try std.Io.Dir.cwd().createDir(io, tree, .default_dir);
-    try std.Io.Dir.cwd().createDir(io, grammars, .default_dir);
-    try std.Io.Dir.cwd().createDir(io, bad_grammars, .default_dir);
-    try writeFixtureFile(io, tree ++ "/a.erl", "foo() -> 1.\n");
-    try writeFixtureFile(io, grammars ++ "/erlang.toml", "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n");
-    try writeFixtureFile(io, bad_grammars ++ "/broken.toml", "not valid toml [");
+    try dir.createDir(io, tree, .default_dir);
+    try dir.createDir(io, grammars, .default_dir);
+    try dir.createDir(io, bad_grammars, .default_dir);
+    try writeFixtureFile(dir, io, tree ++ "/a.erl", "foo() -> 1.\n");
+    try writeFixtureFile(dir, io, grammars ++ "/erlang.toml", "[language]\nname = \"erlang\"\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"function\"\nsequence = [\"identifier\", \"(\"]\n");
+    try writeFixtureFile(dir, io, bad_grammars ++ "/broken.toml", "not valid toml [");
 
     // Req 2.8: missing target directory → non-zero, descriptive stderr.
     const r1 = try runLasp(allocator, &.{ "parse-dir", "test_parsedir_nope", "--grammar-dir", grammars });
@@ -1362,6 +1409,9 @@ test "parse-dir (integration): committed fixtures, recursion, multi-grammar, --n
     const allocator = std.testing.allocator;
     const dir = "tests/fixtures/dir_sample";
     const io = std.testing.io;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
     const gdir = "tests/fixtures/grammars_dir";
     const multi_gdir = "tests/fixtures/grammars_multi_dir";
 
@@ -1422,11 +1472,9 @@ test "parse-dir (integration): committed fixtures, recursion, multi-grammar, --n
     }
 
     // All-.txt dir ⇒ exit zero, [].
-    const txt_dir = "tests/fixtures/dir_txt_only";
-    removeDirTree(allocator, io, txt_dir);
-    try std.Io.Dir.cwd().createDir(std.testing.io, txt_dir, .default_dir);
-    defer std.Io.Dir.cwd().deleteDir(std.testing.io, txt_dir) catch {};
-    try writeFixtureFile(std.testing.io, txt_dir ++ "/notes.txt", "irrelevant\n");
+    const txt_dir = "dir_txt_only";
+    try sb.tmp.dir.createDir(io, txt_dir, .default_dir);
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, txt_dir ++ "/notes.txt", "irrelevant\n");
     const txt = try runLasp(allocator, &.{ "parse-dir", txt_dir, "--grammar-dir", gdir });
     defer {
         allocator.free(txt.stdout);
@@ -1451,24 +1499,27 @@ const SeedGrammar = struct {
     content: []const u8,
 };
 
-/// Recreates `.lasp/grammars` (removing any pre-existing `.lasp`) with the
-/// given grammar files; callers must removeDirTree(".lasp") in teardown.
-fn seedDefaultGrammars(allocator: std.mem.Allocator, seeds: []const SeedGrammar) !void {
+/// Recreates `.lasp/grammars` inside the sandbox (removing any pre-existing
+/// `.lasp` there) with the given grammar files.
+fn seedDefaultGrammars(allocator: std.mem.Allocator, sb: *const Sandbox, seeds: []const SeedGrammar) !void {
     const io = std.testing.io;
-    removeDirTree(allocator, io, ".lasp");
-    try std.Io.Dir.cwd().createDir(io, ".lasp", .default_dir);
-    try std.Io.Dir.cwd().createDir(io, ".lasp/grammars", .default_dir);
+    const dir = sb.tmp.dir;
+    removeDirTree(dir, allocator, io, ".lasp");
+    try dir.createDir(io, ".lasp", .default_dir);
+    try dir.createDir(io, ".lasp/grammars", .default_dir);
     for (seeds) |s| {
         const path = try std.fmt.allocPrint(allocator, ".lasp/grammars/{s}", .{s.name});
         defer allocator.free(path);
-        try writeFixtureFile(io, path, s.content);
+        try writeFixtureFile(dir, io, path, s.content);
     }
 }
 
 test "default grammar: parse single match is byte-identical to explicit -g" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{.{ .name = "erlang.toml", .content = erlang_grammar_toml }});
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "erlang.toml", .content = erlang_grammar_toml }});
 
     const def = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl" });
     defer {
@@ -1486,11 +1537,13 @@ test "default grammar: parse single match is byte-identical to explicit -g" {
 
 test "default grammar: parse multi-match returns one array entry per grammar, sorted" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
         .{ .name = "erlang.toml", .content = erlang_grammar_toml },
         .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
     });
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
 
     const def = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl" });
     defer {
@@ -1539,11 +1592,13 @@ test "default grammar: parse multi-match returns one array entry per grammar, so
 
 test "default grammar: --names-only + multi-match is fatal" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
         .{ .name = "erlang.toml", .content = erlang_grammar_toml },
         .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
     });
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
 
     const r = try runLasp(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl", "--names-only" });
     defer {
@@ -1556,8 +1611,10 @@ test "default grammar: --names-only + multi-match is fatal" {
 
 test "default grammar: query single match is byte-identical to explicit -g" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{.{ .name = "erlang.toml", .content = erlang_grammar_toml }});
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "erlang.toml", .content = erlang_grammar_toml }});
 
     const def = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/dir_sample/a.erl" });
     defer {
@@ -1575,11 +1632,13 @@ test "default grammar: query single match is byte-identical to explicit -g" {
 
 test "default grammar: query multi-match returns filtered array entries" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
         .{ .name = "erlang.toml", .content = erlang_grammar_toml },
         .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
     });
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
 
     const r = try runLasp(allocator, &.{ "query", "function", "tests/fixtures/dir_sample/a.erl" });
     defer {
@@ -1600,7 +1659,10 @@ test "default grammar: query multi-match returns filtered array entries" {
 
 test "default grammar: parse-dir default == explicit --grammar-dir; absent default falls back" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
         .{ .name = "erlang.toml", .content = erlang_grammar_toml },
         .{ .name = "python.toml", .content = python_grammar_toml },
     });
@@ -1621,7 +1683,7 @@ test "default grammar: parse-dir default == explicit --grammar-dir; absent defau
 
     // Absent default dir: parse-dir emits [], exit zero; query still requires
     // -g; parse falls back to raw tokens (file and stdin).
-    removeDirTree(allocator, std.testing.io, ".lasp");
+    removeDirTree(sb.tmp.dir, allocator, std.testing.io, ".lasp");
     const empty = try runLasp(allocator, &.{ "parse-dir", "tests/fixtures/dir_sample" });
     defer {
         allocator.free(empty.stdout);
@@ -1671,9 +1733,9 @@ test "default grammar: parse-dir default == explicit --grammar-dir; absent defau
 // (~64 KiB), so closing the read end early forces a real EPIPE on the child's
 // subsequent writes (deterministic bug reproduction).
 
-fn makeLargeZigFixture(io: std.Io) ![]const u8 {
-    const path = "test_broken_pipe_large.zig";
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+fn makeLargeZigFixture(io: std.Io, sb: *const Sandbox) ![]const u8 {
+    const path = "broken_pipe_large.zig";
+    const file = try sb.tmp.dir.createFile(io, path, .{});
     var buf: [4096]u8 = undefined;
     var w = file.writer(io, &buf);
     var i: usize = 0;
@@ -1694,11 +1756,11 @@ fn runLaspEarlyClose(
 ) !struct { term: std.process.Child.Term, stderr: []u8 } {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.append(allocator, "zig-out/bin/lasp");
+    try argv.append(allocator, laspBinary());
     for (args) |a| try argv.append(allocator, a);
-
     var child = try std.process.spawn(std.testing.io, .{
         .argv = argv.items,
+        .cwd = laspCwd(),
         .stdout = .pipe,
         .stderr = .pipe,
     });
@@ -1739,8 +1801,10 @@ fn runLaspEarlyClose(
 
 test "broken pipe: parse (JSON) with early-closing reader exits cleanly" {
     const allocator = std.testing.allocator;
-    const fixture = try makeLargeZigFixture(std.testing.io);
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const fixture = try makeLargeZigFixture(std.testing.io, &sb);
 
     const result = try runLaspEarlyClose(allocator, &.{
         "parse", fixture, "-g", "examples/grammars/zig.toml",
@@ -1753,8 +1817,10 @@ test "broken pipe: parse (JSON) with early-closing reader exits cleanly" {
 
 test "broken pipe: query with early-closing reader exits cleanly" {
     const allocator = std.testing.allocator;
-    const fixture = try makeLargeZigFixture(std.testing.io);
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const fixture = try makeLargeZigFixture(std.testing.io, &sb);
 
     const result = try runLaspEarlyClose(allocator, &.{
         "query", "*", fixture, "-g", "examples/grammars/zig.toml",
@@ -1767,8 +1833,10 @@ test "broken pipe: query with early-closing reader exits cleanly" {
 
 test "broken pipe: --jsonl with early-closing reader exits cleanly" {
     const allocator = std.testing.allocator;
-    const fixture = try makeLargeZigFixture(std.testing.io);
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const fixture = try makeLargeZigFixture(std.testing.io, &sb);
 
     const result = try runLaspEarlyClose(allocator, &.{
         "parse", fixture, "-g", "examples/grammars/zig.toml", "--jsonl",
@@ -1781,8 +1849,10 @@ test "broken pipe: --jsonl with early-closing reader exits cleanly" {
 
 test "broken pipe: --names-only with early-closing reader exits cleanly" {
     const allocator = std.testing.allocator;
-    const fixture = try makeLargeZigFixture(std.testing.io);
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, fixture) catch {};
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const fixture = try makeLargeZigFixture(std.testing.io, &sb);
 
     const result = try runLaspEarlyClose(allocator, &.{
         "parse", fixture, "-g", "examples/grammars/zig.toml", "--names-only",
@@ -1802,16 +1872,17 @@ test "property: full-read parse preserves complete output and exit 0" {
     try minish.check(std.testing.allocator, source_gen, struct {
         fn prop(src: []const u8) !void {
             const allocator = std.testing.allocator;
-            const tmp_path = "test_broken_pipe_prop.tmp";
             const io = std.testing.io;
+            var sb = try Sandbox.init(allocator);
+            defer sb.deinit();
+            const tmp_path = try sb.join("broken_pipe_prop.tmp");
+            defer allocator.free(tmp_path);
             const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
             var wbuf: [4096]u8 = undefined;
             var writer = file.writer(io, &wbuf);
             try writer.interface.writeAll(src);
             try writer.interface.flush();
             file.close(io);
-            defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-
             const result = try runLasp(allocator, &.{ "parse", tmp_path, "-g", "examples/grammars/zig.toml" });
             defer allocator.free(result.stdout);
             defer allocator.free(result.stderr);
@@ -2767,12 +2838,12 @@ test "integration: names-only default-grammar sites print names (parse and query
         \\separator = ","
         \\
     ;
-    try seedDefaultGrammars(allocator, &.{.{ .name = "counts.toml", .content = counts_toml }});
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
-    const src = "test_names_only_default.cnt";
-    try writeFixtureFile(std.testing.io, src, "fn add(a, b, c) {}\nfn one(x) {}\n");
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, src) catch {};
-
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "counts.toml", .content = counts_toml }});
+    const src = "names_only_default.cnt";
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, src, "fn add(a, b, c) {}\nfn one(x) {}\n");
     const p = try runLasp(allocator, &.{ "parse", src, "--names-only" });
     defer {
         allocator.free(p.stdout);
@@ -2827,11 +2898,11 @@ fn runLaspWithStdin(allocator: std.mem.Allocator, args: []const []const u8, stdi
     const io = std.testing.io;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.append(allocator, "zig-out/bin/lasp");
+    try argv.append(allocator, laspBinary());
     for (args) |a| try argv.append(allocator, a);
-
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
+        .cwd = laspCwd(),
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -4073,15 +4144,17 @@ const CharSetRun = struct { stdout: []u8, stderr: []u8, term: std.process.Child.
 
 fn runWithCharSetGrammar(allocator: std.mem.Allocator, kind_body: []const u8) !CharSetRun {
     const io = std.testing.io;
-    const path = "test_charset_tmp_grammar.toml";
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const path = "charset_tmp_grammar.toml";
     const toml_text = try std.fmt.allocPrint(
         allocator,
         "[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n[tokens]\nident = {{ char_class_run = {{ {s} }} }}\n",
         .{kind_body},
     );
     defer allocator.free(toml_text);
-    try writeFixtureFile(io, path, toml_text);
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try writeFixtureFile(sb.tmp.dir, io, path, toml_text);
     const r = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", path });
     return .{ .stdout = r.stdout, .stderr = r.stderr, .term = r.term };
 }
@@ -4239,33 +4312,36 @@ fn expectFatalResultOnePrefix(term: std.process.Child.Term, stdout: []const u8, 
 }
 
 const err_prefix_dir = "test_errprefix_tmp";
-
-/// Recreates `test_errprefix_tmp` holding the throwaway grammars the cases use.
-fn seedErrPrefixFixtures(allocator: std.mem.Allocator) !void {
+/// Creates `test_errprefix_tmp` in the sandbox, holding the throwaway grammars the cases use.
+fn seedErrPrefixFixtures(sb: *const Sandbox) !void {
     const io = std.testing.io;
-    removeDirTree(allocator, io, err_prefix_dir);
-    try std.Io.Dir.cwd().createDir(io, err_prefix_dir, .default_dir);
+    const dir = sb.tmp.dir;
+    try dir.createDir(io, err_prefix_dir, .default_dir);
     const pat = "[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n";
-    try writeFixtureFile(io, err_prefix_dir ++ "/bad_charset.toml", pat ++ "[tokens]\nident = { char_class_run = { start = \"z-a\" } }\n");
-    try writeFixtureFile(io, err_prefix_dir ++ "/bad_comments.toml", pat ++ "[comments]\nline = \"x\"\n");
-    try writeFixtureFile(io, err_prefix_dir ++ "/bad_toml.toml", "this is [[ not toml");
-    try writeFixtureFile(io, err_prefix_dir ++ "/good.toml", "[[patterns]]\ntype = \"function\"\nsequence = [\"fn\", \"$name:IDENTIFIER\", \"(\"]\n");
+    try writeFixtureFile(dir, io, err_prefix_dir ++ "/bad_charset.toml", pat ++ "[tokens]\nident = { char_class_run = { start = \"z-a\" } }\n");
+    try writeFixtureFile(dir, io, err_prefix_dir ++ "/bad_comments.toml", pat ++ "[comments]\nline = \"x\"\n");
+    try writeFixtureFile(dir, io, err_prefix_dir ++ "/bad_toml.toml", "this is [[ not toml");
+    try writeFixtureFile(dir, io, err_prefix_dir ++ "/good.toml", "[[patterns]]\ntype = \"function\"\nsequence = [\"fn\", \"$name:IDENTIFIER\", \"(\"]\n");
 }
 
 const err_prefix_charset_body = "error: [tokens] invalid char set: ranges must have ASCII endpoints and run low-to-high, use \\- for a literal '-' and \\\\ for a literal '\\' (other escapes are not allowed): ";
 
 test "error prefix P1: grammar charset error is one exact line (parse)" {
     const allocator = std.testing.allocator;
-    try seedErrPrefixFixtures(allocator);
-    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
     const gp = err_prefix_dir ++ "/bad_charset.toml";
     try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", gp }, err_prefix_charset_body ++ gp ++ "\n");
 }
 
 test "error prefix P1: grammar charset error is one exact line (stdin parse)" {
     const allocator = std.testing.allocator;
-    try seedErrPrefixFixtures(allocator);
-    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
     const gp = err_prefix_dir ++ "/bad_charset.toml";
     const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", gp }, "a\n");
     defer {
@@ -4277,24 +4353,30 @@ test "error prefix P1: grammar charset error is one exact line (stdin parse)" {
 
 test "error prefix P1: grammar charset error is one exact line (query)" {
     const allocator = std.testing.allocator;
-    try seedErrPrefixFixtures(allocator);
-    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
     const gp = err_prefix_dir ++ "/bad_charset.toml";
     try expectFatalOnePrefix(allocator, &.{ "query", "function", "tests/fixtures/sample.zig", "-g", gp }, err_prefix_charset_body ++ gp ++ "\n");
 }
 
 test "error prefix P1: [comments] grammar error has one prefix" {
     const allocator = std.testing.allocator;
-    try seedErrPrefixFixtures(allocator);
-    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
     const gp = err_prefix_dir ++ "/bad_comments.toml";
     try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", gp }, "error: [comments] line must be an array of strings: " ++ gp ++ "\n");
 }
 
 test "error prefix P1: malformed TOML grammar has one prefix" {
     const allocator = std.testing.allocator;
-    try seedErrPrefixFixtures(allocator);
-    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
     const gp = err_prefix_dir ++ "/bad_toml.toml";
     try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/sample.zig", "-g", gp }, "error: invalid TOML syntax in grammar file: " ++ gp ++ "\n");
 }
@@ -4316,8 +4398,10 @@ test "error prefix P1: --jsonl --version has one prefix" {
 
 test "error prefix P1: malformed query selector has one prefix" {
     const allocator = std.testing.allocator;
-    try seedErrPrefixFixtures(allocator);
-    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
     try expectFatalOnePrefix(allocator, &.{ "query", "function[", "tests/fixtures/sample.zig", "-g", err_prefix_dir ++ "/good.toml" }, "error: missing field name in attribute condition\n");
 }
 
@@ -4328,26 +4412,32 @@ test "error prefix P1: query without a grammar has one prefix" {
 
 test "error prefix P1: --alternatives on query has one prefix" {
     const allocator = std.testing.allocator;
-    try seedErrPrefixFixtures(allocator);
-    defer removeDirTree(allocator, std.testing.io, err_prefix_dir);
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
     try expectFatalOnePrefix(allocator, &.{ "query", "function", "tests/fixtures/sample.zig", "-g", err_prefix_dir ++ "/good.toml", "--alternatives" }, "error: --alternatives is supported on the parse command only\n");
 }
 
 test "error prefix P1: malformed default grammar has one prefix" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{.{ .name = "bad.toml", .content = "[language]\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n[tokens]\nident = { char_class_run = { start = \"z-a\" } }\n" }});
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "bad.toml", .content = "[language]\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n[tokens]\nident = { char_class_run = { start = \"z-a\" } }\n" }});
     try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl" }, null);
     try expectFatalOnePrefix(allocator, &.{ "parse-dir", "tests/fixtures/dir_sample" }, err_prefix_charset_body ++ ".lasp/grammars/bad.toml\n");
 }
 
 test "error prefix P1: --names-only with several default grammars has one prefix" {
     const allocator = std.testing.allocator;
-    try seedDefaultGrammars(allocator, &.{
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
         .{ .name = "erlang.toml", .content = erlang_grammar_toml },
         .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
     });
-    defer removeDirTree(allocator, std.testing.io, ".lasp");
     try expectFatalOnePrefix(allocator, &.{ "parse", "tests/fixtures/dir_sample/a.erl", "--names-only" }, "error: --names-only requires a single grammar (pass -g/--grammar)\n");
 }
 
