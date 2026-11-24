@@ -154,6 +154,20 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all unit and property tests");
     test_step.dependOn(&run_main_tests.step);
+
+    // Lint step (zlinter, `no_unused` only, `src/` only). zlinter is a lazy
+    // dependency, resolved only when `-Dlint=true` is passed, so ordinary
+    // `zig build`, `zig build test` and `nix build` never fetch it.
+    const lint_step = b.step("lint", "Lint src/ with zlinter (requires -Dlint=true)");
+    const lint_enabled = b.option(bool, "lint", "Resolve the lazy zlinter dependency for the lint step") orelse false;
+    if (!lint_enabled) {
+        lint_step.dependOn(&b.addFail("the lint step needs the lazy zlinter dependency: run `zig build lint -Dlint=true`").step);
+    } else if (b.lazyImport(@This(), "zlinter")) |zlinter| {
+        var builder = zlinter.builder(b, .{});
+        builder.addRule(.{ .builtin = .no_unused }, .{ .container_declaration = .@"error" });
+        builder.addPaths(.{ .include = &.{b.path("src/")} });
+        lint_step.dependOn(builder.build());
+    }
 }
 
 test "changelogLatestRelease: skips Unreleased, returns top dated release" {

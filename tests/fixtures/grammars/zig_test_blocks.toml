@@ -1,0 +1,25 @@
+# Test-region grammar for tests/scripts/dead_code.sh.
+# Emits one event per Zig `test` block; `start` .. `body_end` is the region.
+[language]
+name = "zig-test-blocks"
+extensions = [".zig"]
+
+[[patterns]]
+type = "test_block"
+sequence = ["test:IDENTIFIER", "string"]
+position = "start"
+
+[[patterns.extent]]
+field = "body_end"
+open = "{"
+close = "}"
+
+[[patterns]]
+type = "test_block_anon"
+sequence = ["test:IDENTIFIER", "{"]
+position = "start"
+
+[[patterns.extent]]
+field = "body_end"
+open = "{"
+close = "}"

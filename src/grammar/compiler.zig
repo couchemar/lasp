@@ -19,7 +19,6 @@ pub const Transition = struct {
 
 pub const EventInfo = struct {
     type_name: []const u8,
-    capture_fields: []const []const u8,
     pattern_index: usize,
 };
 
@@ -93,15 +92,8 @@ fn matchesTransition(matcher: ComposableMatcher, kind: TokenKind, text: []const 
 
 // --- Mutable builder types used during compilation ---
 
-const MutableTransition = struct {
-    matcher: ComposableMatcher,
-    next_state: usize,
-    capture: ?Capture,
-    is_optional: bool,
-};
-
 const MutableState = struct {
-    transitions: std.ArrayList(MutableTransition),
+    transitions: std.ArrayList(Transition),
     events: std.ArrayList(EventInfo),
 
     fn init() MutableState {
@@ -145,13 +137,8 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
         }
 
         // Mark terminal state
-        var cap_fields: std.ArrayList([]const u8) = .empty;
-        for (pattern.captures) |c| {
-            try cap_fields.append(allocator, c.field_name);
-        }
         try builder.items[current].events.append(allocator, .{
             .type_name = pattern.type_name,
-            .capture_fields = try cap_fields.toOwnedSlice(allocator),
             .pattern_index = pattern_index,
         });
     }
@@ -160,7 +147,7 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
     var states: std.ArrayList(State) = .empty;
     for (builder.items) |*ms| {
         try states.append(allocator, .{
-            .transitions = try freezeTransitions(ms.transitions.items, allocator),
+            .transitions = try ms.transitions.toOwnedSlice(allocator),
             .events = try ms.events.toOwnedSlice(allocator),
         });
     }
@@ -168,7 +155,7 @@ pub fn compile(patterns: []const Pattern, allocator: std.mem.Allocator) !Automat
     return .{ .states = try states.toOwnedSlice(allocator) };
 }
 
-fn findTransition(transitions: []const MutableTransition, matcher: ComposableMatcher) ?usize {
+fn findTransition(transitions: []const Transition, matcher: ComposableMatcher) ?usize {
     for (transitions) |tr| {
         if (matchersEqual(tr.matcher, matcher)) return tr.next_state;
     }
@@ -195,19 +182,6 @@ fn findCaptureAtPosition(captures: []const Capture, position: usize) ?Capture {
         if (c.position == position) return c;
     }
     return null;
-}
-
-fn freezeTransitions(mutable: []const MutableTransition, allocator: std.mem.Allocator) ![]const Transition {
-    var result: std.ArrayList(Transition) = .empty;
-    for (mutable) |mt| {
-        try result.append(allocator, .{
-            .matcher = mt.matcher,
-            .next_state = mt.next_state,
-            .capture = mt.capture,
-            .is_optional = mt.is_optional,
-        });
-    }
-    return result.toOwnedSlice(allocator);
 }
 
 // --- Unit Tests ---
@@ -750,14 +724,14 @@ test "compile: two identical-sequence patterns produce shared terminal state wit
     // Event 0: function
     try testing.expectEqualStrings("function", term.events[0].type_name);
     try testing.expectEqual(@as(usize, 0), term.events[0].pattern_index);
-    try testing.expectEqual(@as(usize, 1), term.events[0].capture_fields.len);
-    try testing.expectEqualStrings("name", term.events[0].capture_fields[0]);
+    try testing.expectEqual(@as(usize, 1), patterns[term.events[0].pattern_index].captures.len);
+    try testing.expectEqualStrings("name", patterns[term.events[0].pattern_index].captures[0].field_name);
 
     // Event 1: call
     try testing.expectEqualStrings("call", term.events[1].type_name);
     try testing.expectEqual(@as(usize, 1), term.events[1].pattern_index);
-    try testing.expectEqual(@as(usize, 1), term.events[1].capture_fields.len);
-    try testing.expectEqualStrings("callee", term.events[1].capture_fields[0]);
+    try testing.expectEqual(@as(usize, 1), patterns[term.events[1].pattern_index].captures.len);
+    try testing.expectEqualStrings("callee", patterns[term.events[1].pattern_index].captures[0].field_name);
 }
 
 test "compile: single pattern terminal carries exactly one event and root zero" {
@@ -850,10 +824,10 @@ test "compile: identical-sequence same-type alternatives land on one terminal in
     try testing.expectEqual(@as(usize, 2), term.events.len);
     try testing.expectEqualStrings("same", term.events[0].type_name);
     try testing.expectEqual(@as(usize, 0), term.events[0].pattern_index);
-    try testing.expectEqualStrings("a", term.events[0].capture_fields[0]);
+    try testing.expectEqualStrings("a", patterns[term.events[0].pattern_index].captures[0].field_name);
     try testing.expectEqualStrings("same", term.events[1].type_name);
     try testing.expectEqual(@as(usize, 1), term.events[1].pattern_index);
-    try testing.expectEqualStrings("b", term.events[1].capture_fields[0]);
+    try testing.expectEqualStrings("b", patterns[term.events[1].pattern_index].captures[0].field_name);
 }
 
 // Feature: operator-token-matching, Unit: matchesTransition punctuation matching

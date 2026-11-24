@@ -281,10 +281,6 @@ fn compileCharSet(spec: []const u8) GrammarError!tokenizer.CharClass {
     }
     return cc;
 }
-const CaptureParams = struct {
-    separator: ?[]const u8,
-    suffix_set: ?[]const u8,
-};
 
 /// Resolves a kind name against the fixed default Kind_Table. Unknown name → null.
 /// The single resolution point a later grammar-defined-token-kinds feature swaps.
@@ -315,14 +311,12 @@ fn vocabKindName(grammar: Grammar, id: usize) []const u8 {
     return "identifier";
 }
 
-/// Parses the tail of a $field:KIND... sequence element: only bare "KIND" is
-/// accepted (single-token capture). The parenthesized parameter form
-/// `KIND(sep=..., suffix=...)` was removed; any `(` is rejected.
-fn parseCaptureTail(tail: []const u8, allocator: std.mem.Allocator, vocab: ?tokenizer.KindVocabulary) GrammarError!struct { kind: KindRef, span: CaptureParams } {
-    _ = allocator;
+/// Parses the tail of a $field:KIND sequence element: only bare "KIND" is
+/// accepted (single-token capture); any `(` is rejected. Separator/suffix
+/// behavior comes from `[[patterns.capture]]` tables, not from the tail.
+fn parseCaptureTail(tail: []const u8, vocab: ?tokenizer.KindVocabulary) GrammarError!KindRef {
     if (std.mem.indexOfScalar(u8, tail, '(') != null) return error.ParenthesizedCaptureParam;
-    const kind = vocabKindRef(tail, vocab) orelse return error.InvalidKindName;
-    return .{ .kind = kind, .span = .{ .separator = null, .suffix_set = null } };
+    return vocabKindRef(tail, vocab) orelse error.InvalidKindName;
 }
 
 /// Parses and validates the optional `[[patterns.extent]]` table on a pattern.
@@ -392,10 +386,6 @@ const SequenceElementResult = struct {
     capture: ?Capture,
 };
 
-fn parseSequenceElement(raw: []const u8, position: usize, allocator: std.mem.Allocator) GrammarError!SequenceElementResult {
-    return parseSequenceElementV(raw, position, allocator, null);
-}
-
 /// Parses a single pattern sequence string into a SequenceElement.
 /// Handles trailing `?` suffix for optional elements.
 fn parseSequenceElementV(raw: []const u8, position: usize, allocator: std.mem.Allocator, vocab: ?tokenizer.KindVocabulary) GrammarError!SequenceElementResult {
@@ -407,20 +397,18 @@ fn parseSequenceElementV(raw: []const u8, position: usize, allocator: std.mem.Al
         s = s[0 .. s.len - 1];
     }
 
-    // Capture: $field:KIND[(params)] — kind resolved via resolveKind.
+    // Capture: $field:KIND — kind resolved via vocabKindRef.
     if (s.len > 0 and s[0] == '$') {
         const colon_idx = std.mem.indexOf(u8, s, ":") orelse return error.InvalidCaptureFormat;
         if (colon_idx < 2) return error.InvalidCaptureFormat; // need at least $x
         const field_name = try allocator.dupe(u8, s[1..colon_idx]);
         const tail = s[colon_idx + 1 ..];
-        const parsed = try parseCaptureTail(tail, allocator, vocab);
+        const kind = try parseCaptureTail(tail, vocab);
         const cap = Capture{
             .field_name = field_name,
             .position = position,
-            .separator = parsed.span.separator,
-            .suffix_set = parsed.span.suffix_set,
         };
-        const matcher = ComposableMatcher{ .kind = parsed.kind, .capture = cap };
+        const matcher = ComposableMatcher{ .kind = kind, .capture = cap };
         return .{ .element = .{ .matcher = matcher, .is_optional = optional }, .capture = cap };
     }
     // Kind wildcards: identifier, number (string added in task 5)
@@ -3666,7 +3654,7 @@ test "parseSequenceElement: operator characters route to symbol_literal" {
     const ops = "+-*/=<>!&|^%~";
     for (ops) |c| {
         const s = [1]u8{c};
-        const res = try parseSequenceElement(&s, 0, alloc);
+        const res = try parseSequenceElementV(&s, 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .punctuation);
         try testing.expectEqualStrings(&s, res.element.matcher.text.exact);
     }
@@ -3675,7 +3663,7 @@ test "parseSequenceElement: operator characters route to symbol_literal" {
     const sym_delim = "(){}[],;:.@?";
     for (sym_delim) |c| {
         const s = [1]u8{c};
-        const res = try parseSequenceElement(&s, 0, alloc);
+        const res = try parseSequenceElementV(&s, 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .punctuation);
         try testing.expectEqualStrings(&s, res.element.matcher.text.exact);
     }
@@ -3687,22 +3675,22 @@ test "parseSequenceElement: non-punctuation routes to non-punctuation matchers" 
     const alloc = arena.allocator();
 
     {
-        const res = try parseSequenceElement("module", 0, alloc);
+        const res = try parseSequenceElementV("module", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .keyword);
         try testing.expectEqualStrings("module", res.element.matcher.text.exact);
     }
     {
-        const res = try parseSequenceElement("$name:IDENTIFIER", 0, alloc);
+        const res = try parseSequenceElementV("$name:IDENTIFIER", 0, alloc, null);
         try testing.expect(res.element.matcher.capture != null);
         try testing.expectEqualStrings("name", res.element.matcher.capture.?.field_name);
     }
     {
-        const res = try parseSequenceElement("Config:IDENTIFIER", 0, alloc);
+        const res = try parseSequenceElementV("Config:IDENTIFIER", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier and res.element.matcher.text == .exact);
         try testing.expectEqualStrings("Config", res.element.matcher.text.exact);
     }
     {
-        const res = try parseSequenceElement("identifier", 0, alloc);
+        const res = try parseSequenceElementV("identifier", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier);
     }
 }
@@ -3712,7 +3700,7 @@ test "parseSequenceElement: optional suffix preserved on punctuation routing" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const res = try parseSequenceElement("-?", 0, alloc);
+    const res = try parseSequenceElementV("-?", 0, alloc, null);
     try testing.expect(res.element.is_optional);
     try testing.expect(res.element.matcher.kind == .punctuation);
     try testing.expectEqualStrings("-", res.element.matcher.text.exact);
@@ -3733,7 +3721,7 @@ test "property: loader routes punctuation characters to the punctuation matcher"
 
             const c = punct[idx];
             const s = [1]u8{c};
-            const res = try parseSequenceElement(&s, 0, alloc);
+            const res = try parseSequenceElementV(&s, 0, alloc, null);
             try testing.expect(res.element.matcher.kind == .punctuation);
             try testing.expectEqualStrings(&s, res.element.matcher.text.exact);
         }
@@ -3746,7 +3734,7 @@ test "property: loader routes punctuation characters to the punctuation matcher"
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            const res = try parseSequenceElement(word, 0, alloc);
+            const res = try parseSequenceElementV(word, 0, alloc, null);
             if (std.mem.eql(u8, word, "identifier")) {
                 try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier);
             } else {
@@ -3764,13 +3752,13 @@ test "parseSequenceElement: number parses to non-capturing number matcher" {
     const alloc = arena.allocator();
 
     {
-        const res = try parseSequenceElement("number", 0, alloc);
+        const res = try parseSequenceElementV("number", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
         try testing.expect(!res.element.is_optional);
         try testing.expect(res.capture == null);
     }
     {
-        const res = try parseSequenceElement("number?", 0, alloc);
+        const res = try parseSequenceElementV("number?", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
         try testing.expect(res.element.is_optional);
         try testing.expect(res.capture == null);
@@ -3784,7 +3772,7 @@ test "parseSequenceElement: near-miss number strings fall through to keyword lit
 
     const near_misses = [_][]const u8{ "numbers", "number2", "Number" };
     for (near_misses) |nm| {
-        const res = try parseSequenceElement(nm, 0, alloc);
+        const res = try parseSequenceElementV(nm, 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .keyword);
         try testing.expectEqualStrings(nm, res.element.matcher.text.exact);
     }
@@ -3856,7 +3844,7 @@ test "property: existing primitives are unaffected by the number branch" {
             };
             if (std.mem.eql(u8, form, "number")) return;
 
-            const res = try parseSequenceElement(form, 0, alloc);
+            const res = try parseSequenceElementV(form, 0, alloc, null);
             switch (vals[0]) {
                 0 => try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .identifier),
                 1 => {
@@ -3960,14 +3948,14 @@ test "parseSequenceElement: bare captures only; '(' rejected" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const res = try parseSequenceElement("$name:IDENTIFIER", 0, alloc);
+    const res = try parseSequenceElementV("$name:IDENTIFIER", 0, alloc, null);
     try testing.expect(res.element.matcher.capture != null);
     try testing.expectEqualStrings("name", res.element.matcher.capture.?.field_name);
     try testing.expect(res.element.matcher.capture.?.separator == null);
     try testing.expect(res.element.matcher.capture.?.suffix_set == null);
 
-    try testing.expectError(error.ParenthesizedCaptureParam, parseSequenceElement("$name:IDENTIFIER(sep=\".\")", 0, alloc));
-    try testing.expectError(error.ParenthesizedCaptureParam, parseSequenceElement("$name:IDENTIFIER(suffix=\"!?\")", 0, alloc));
+    try testing.expectError(error.ParenthesizedCaptureParam, parseSequenceElementV("$name:IDENTIFIER(sep=\".\")", 0, alloc, null));
+    try testing.expectError(error.ParenthesizedCaptureParam, parseSequenceElementV("$name:IDENTIFIER(suffix=\"!?\")", 0, alloc, null));
 }
 
 test "parseGrammar: Phase B capture table attaches separator/suffix" {
@@ -4338,32 +4326,32 @@ test "parseSequenceElement: typed captures and kind wildcards" {
     const alloc = arena.allocator();
 
     {
-        const res = try parseSequenceElement("$n:NUMBER", 0, alloc);
+        const res = try parseSequenceElementV("$n:NUMBER", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
         try testing.expect(res.element.matcher.capture != null);
         try testing.expectEqualStrings("n", res.element.matcher.capture.?.field_name);
     }
     {
-        const res = try parseSequenceElement("$s:STRING", 0, alloc);
+        const res = try parseSequenceElementV("$s:STRING", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .string);
         try testing.expect(res.element.matcher.capture != null);
         try testing.expectEqualStrings("s", res.element.matcher.capture.?.field_name);
     }
     {
-        const res = try parseSequenceElement("string", 0, alloc);
+        const res = try parseSequenceElementV("string", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .string);
         try testing.expect(res.element.matcher.text == .any);
         try testing.expect(res.element.matcher.capture == null);
     }
     {
-        const res = try parseSequenceElement("limit:NUMBER", 0, alloc);
+        const res = try parseSequenceElementV("limit:NUMBER", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .number);
         try testing.expect(res.element.matcher.text == .exact);
         try testing.expectEqualStrings("limit", res.element.matcher.text.exact);
         try testing.expect(res.element.matcher.capture == null);
     }
     {
-        const res = try parseSequenceElement("tag:STRING", 0, alloc);
+        const res = try parseSequenceElementV("tag:STRING", 0, alloc, null);
         try testing.expect(res.element.matcher.kind == .one and res.element.matcher.kind.one == .string);
         try testing.expect(res.element.matcher.text == .exact);
         try testing.expectEqualStrings("tag", res.element.matcher.text.exact);
@@ -4371,7 +4359,7 @@ test "parseSequenceElement: typed captures and kind wildcards" {
     {
         const bad = [_][]const u8{ "$f:BOGUS", "Name:BOGUS" };
         for (bad) |elem| {
-            try testing.expectError(error.InvalidKindName, parseSequenceElement(elem, 0, alloc));
+            try testing.expectError(error.InvalidKindName, parseSequenceElementV(elem, 0, alloc, null));
         }
     }
 }

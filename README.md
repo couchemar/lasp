@@ -424,7 +424,7 @@ Confidence scores allow agents operating autonomously over massive unknown depen
 3. Refine grammars iteratively — low confidence signals missing keywords or patterns
 
 ### Future Scoring Enhancements (Planned)
-- **Noise penalty**: Unexpected tokens between matched elements reduce confidence (infrastructure in place, capped at 0.5)
+- **Noise penalty** (planned): unexpected tokens between matched elements would reduce confidence; `computeConfidence` accepts a capped noise input, but the engine does not supply it yet
 - **Context evaluation**: Framework-aware scoring (e.g., `router.get("/users")` → endpoint detection)
 - **Frequency-based thresholds**: Repeated similar structures build dynamic confidence over a repository
 
@@ -584,7 +584,12 @@ zig build            # build the CLI into zig-out/bin/lasp
 zig build test       # unit + property + integration tests
 nix build            # ReleaseSafe build via the flake (./result/bin/lasp)
 nix run . -- --version
+zig build lint -Dlint=true   # zlinter no_unused over src/ (findings fail the step)
 ```
+
+`zig build lint -Dlint=true` runs only the zlinter `no_unused` rule over `src/`. The flag is required: plain `zig build lint` fails with a message naming the right command. zlinter is a lazy, lint-only dependency, so ordinary builds never fetch it; the first lint run needs `git` and network access (zlinter's transitive `zls` dependency is pinned via `git+https`).
+
+A dead-code report built on LASP itself: `tests/scripts/dead_code.sh [LASP_BINARY]` (see `AGENTS.md`).
 
 Note: tests must run through `zig build test`. Plain `zig test src/*.zig` fails because module imports (`minish`, `toml`, `build_options`) are wired by `build.zig`, not discoverable standalone.
 

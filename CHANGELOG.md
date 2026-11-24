@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `zig build lint -Dlint=true` step: runs zlinter's `no_unused` rule (only) over `src/`; findings fail the step. zlinter is a lazy, lint-only dependency pinned to an immutable commit archive, so `zig build`, `zig build test`, and `nix build` never fetch it. The `-Dlint` option guards the lazy dependency (plain `zig build lint` fails and names the right command). The first run needs `git` and network because zlinter's transitive `zls` dependency is pinned via `git+https`. (Spec: dead-code-removal)
+- `tests/scripts/dead_code.sh [LASP_BINARY]` and `tests/fixtures/grammars/zig_test_blocks.toml`: a LASP dogfooding report over `src/**/*.zig` listing unreferenced production functions (exit 1 outside the allowlist) and production functions used only by tests (informational). It is name-based and cannot see same-name collisions, write-only locals, test-only fields, transitively dead types, discarded parameters, or duplicate shapes. (Spec: dead-code-removal)
+### Removed
+- Dead code, found by the lint step and the dead-code report: the engine `noise_count`/`delim_depth` state, `findPatternIndex`, `findPatternMaxScore`, `events.weightForKind`, `events.evidence_weights` (`loader.EvidenceWeights` is the only default), `EventInfo.capture_fields`, `MutableTransition`, `freezeTransitions`, `CaptureParams` (`parseCaptureTail` now returns a `KindRef`), the `parseSequenceElement` wrapper, `hasHelpFlag`, the unused `io` parameters of `parseWithAutomaton`/`parseOneFile`, `writeErrorLine`, and `ccSpec`. CLI output is unchanged. (Spec: dead-code-removal)
 ### Changed
 - Toolchain pinned to `pkgs.zig_0_16` in `flake.nix` (devShell and `mkLasp`) and `flake.lock` updated, so the nixpkgs default `zig` (0.17) cannot silently replace Zig 0.16. Dependencies: `minish` v0.3.0-era pin to v0.4.0, `toml` v0.1.6 to v0.1.16 (adds the transitive `thread_pool` v0.2.11 dependency).
 ### Fixed

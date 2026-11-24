@@ -77,23 +77,6 @@ fn ccOf(spec: []const u8) CharClass {
     return cc;
 }
 
-/// Compiles a char-set spec supporting inclusive ranges ("a-z", "0-9").
-fn ccSpec(spec: []const u8) CharClass {
-    var cc = CharClass{};
-    var i: usize = 0;
-    while (i < spec.len) {
-        if (i + 2 < spec.len and spec[i + 1] == '-') {
-            var ch = spec[i];
-            while (ch <= spec[i + 2]) : (ch += 1) cc.set(ch);
-            i += 3;
-        } else {
-            cc.set(spec[i]);
-            i += 1;
-        }
-    }
-    return cc;
-}
-
 test "membership: no membership is 0.0" {
     const start = ccOf("ab");
     const cont = ccOf("ab");

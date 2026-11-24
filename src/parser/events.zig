@@ -44,26 +44,6 @@ pub const StructuralEvent = struct {
     int_fields: []const IntegerField = &.{},
 };
 
-/// Evidence weights for confidence scoring.
-pub const evidence_weights = struct {
-    pub const keyword: f32 = 0.5;
-    pub const identifier: f32 = 0.2;
-    pub const symbol: f32 = 0.2;
-    pub const block: f32 = 0.3;
-    pub const relaxed_keyword: f32 = 0.1;
-};
-/// Returns the evidence weight for a given token kind.
-pub fn weightForKind(kind: TokenKind) f32 {
-    return switch (kind) {
-        .keyword => evidence_weights.keyword,
-        .identifier => evidence_weights.identifier,
-        .delimiter, .symbol => evidence_weights.symbol,
-        .number => evidence_weights.symbol,
-        .string => evidence_weights.symbol,
-        else => 0.0,
-    };
-}
-
 /// Default noise penalty constants.
 pub const default_noise_penalty_per_token: f32 = 0.1;
 pub const default_max_noise_penalty: f32 = 0.5;

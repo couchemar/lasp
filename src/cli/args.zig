@@ -147,7 +147,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     // `--jsonl` conflicts with version/help output regardless of where the
     // flags appear (R5/R6) — including argv where the first token is not a
     // recognized command (e.g. `--jsonl --version`).
-    if (hasJsonl(args) and (hasVersionFlag(args) or hasHelpFlag(args))) return error.JsonlOnNonOutputCommand;
+    if (hasJsonl(args) and (hasVersionFlag(args) or helpScan(args))) return error.JsonlOnNonOutputCommand;
 
     if (helpScan(args)) {
         if (hasJsonl(args)) return error.JsonlOnNonOutputCommand;
@@ -346,13 +346,6 @@ fn hasVersionFlag(args: []const []const u8) bool {
     return false;
 }
 
-/// Returns true if any argument is a Help_Flag.
-fn hasHelpFlag(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (isHelpFlag(arg)) return true;
-    }
-    return false;
-}
 /// Maps a token to a subcommand topic (only `parse`/`parse-dir`/`query`).
 /// Returns `null` for any other input (including `help`, `version`, `--help`, etc.).
 pub fn parseSubcommand(arg: []const u8) ?Command {

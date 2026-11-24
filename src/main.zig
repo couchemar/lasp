@@ -23,12 +23,6 @@ fn errorLineFormat(comptime fmt: []const u8) []const u8 {
     return error_prefix ++ fmt ++ "\n";
 }
 
-/// Pure formatter for one error line into any writer (shares `errorLineFormat`
-/// with the real reporter; used by tests).
-fn writeErrorLine(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) std.Io.Writer.Error!void {
-    try w.print(errorLineFormat(fmt), args);
-}
-
 /// Prints one prefixed error line to stderr and returns.
 fn reportError(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(errorLineFormat(fmt), args);
@@ -291,7 +285,7 @@ fn run(
                 if (resolved.len == 1) {
                     // Single match: byte-identical to explicit -g.
                     const lg = resolved[0];
-                    const structural_events = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, null, false, false);
+                    const structural_events = try parseWithAutomaton(allocator, lg.grammar, lg.automaton, source, null, false, false);
                     const filtered = try query_evaluator.evaluate(structural_events, filter, allocator);
                     if (parsed.names_only) {
                         for (filtered) |event| {
@@ -310,7 +304,7 @@ fn run(
                     }
                     var entries: std.ArrayList(json.DirResult) = .empty;
                     for (resolved) |lg| {
-                        const structural_events = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, null, false, false);
+                        const structural_events = try parseWithAutomaton(allocator, lg.grammar, lg.automaton, source, null, false, false);
                         const filtered = try query_evaluator.evaluate(structural_events, filter, allocator);
                         try entries.append(allocator, .{
                             .file = parsed.target_path,
@@ -345,7 +339,7 @@ fn run(
                     fatalError("{s}: {s}", .{ msg, gp });
                 };
                 const collect_alternatives = parsed.alternatives or parsed.resemble;
-                const structural_events = try parseOneFile(io, allocator, grammar, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
+                const structural_events = try parseOneFile(allocator, grammar, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
 
                 // Output dispatch: names-only or JSON
                 if (parsed.names_only) {
@@ -372,7 +366,7 @@ fn run(
                 } else if (resolved.len == 1) {
                     // Single match: byte-identical to explicit -g.
                     const lg = resolved[0];
-                    const structural_events = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
+                    const structural_events = try parseWithAutomaton(allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
                     if (parsed.names_only) {
                         for (structural_events) |event| {
                             try writeNamesOnlyLine(stdout, event);
@@ -392,7 +386,7 @@ fn run(
                     const collect_alternatives = parsed.alternatives or parsed.resemble;
                     var entries: std.ArrayList(json.DirResult) = .empty;
                     for (resolved) |lg| {
-                        const events_list = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
+                        const events_list = try parseWithAutomaton(allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
                         try entries.append(allocator, .{
                             .file = parsed.target_path,
                             .grammar = lg.name,
@@ -465,7 +459,7 @@ fn run(
                     const source = readSourceFile(io, allocator, full_path) catch {
                         fatalError("failed to read file: {s}", .{full_path});
                     };
-                    const events_list = try parseWithAutomaton(io, allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
+                    const events_list = try parseWithAutomaton(allocator, lg.grammar, lg.automaton, source, parsed.node_filter, parsed.alternatives, parsed.resemble);
                     // The walker reuses its path buffers on the next `next()`
                     // call, so entries must own their strings.
                     const file_copy = try allocator.dupe(u8, entry.path);
@@ -521,7 +515,6 @@ fn writeNamesOnlyLine(stdout: *std.Io.Writer, event: events.StructuralEvent) !vo
 /// (vocab when the grammar declares `[tokens]`), `engine.parse`, then the
 /// `--node` filter loop.
 fn parseOneFile(
-    io: std.Io,
     allocator: std.mem.Allocator,
     grammar: grammar_loader.Grammar,
     source: []const u8,
@@ -530,13 +523,12 @@ fn parseOneFile(
     resemble: bool,
 ) ![]events.StructuralEvent {
     const automaton = try grammar_compiler.compile(grammar.patterns, allocator);
-    return parseWithAutomaton(io, allocator, grammar, automaton, source, node_filter, alternatives, resemble);
+    return parseWithAutomaton(allocator, grammar, automaton, source, node_filter, alternatives, resemble);
 }
 
 /// The `parseOneFile` body after automaton compilation; parse-dir reuses one
 /// compiled automaton across every file a grammar matches.
 fn parseWithAutomaton(
-    io: std.Io,
     allocator: std.mem.Allocator,
     grammar: grammar_loader.Grammar,
     automaton: grammar_compiler.Automaton,
@@ -545,7 +537,6 @@ fn parseWithAutomaton(
     alternatives: bool,
     resemble: bool,
 ) ![]events.StructuralEvent {
-    _ = io;
     const tokens = if (grammar.tokens) |vocab|
         try tokenizer.tokenizeWithVocab(source, vocab, grammar.keyword_table, grammar.comments, allocator)
     else

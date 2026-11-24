@@ -158,14 +158,6 @@ fn selectBestCandidate(candidates: []const CandidateEvent) ?CandidateEvent {
     return best;
 }
 
-/// Maps a type_name back to its index in the patterns array.
-fn findPatternIndex(patterns: []const loader.Pattern, type_name: []const u8) usize {
-    for (patterns, 0..) |p, i| {
-        if (std.mem.eql(u8, p.type_name, type_name)) return i;
-    }
-    return std.math.maxInt(usize);
-}
-
 /// Scans all patterns' constraints and returns the maximum depth value.
 /// Used to size the LookbackBuffer dynamically based on grammar needs.
 fn computeMaxConstraintDepth(patterns: []const loader.Pattern) usize {
@@ -404,10 +396,6 @@ pub fn parse(
     // that triggered the skip (keeps optional-tail and union forms equivalent).
     var last_matched_end: usize = 0;
 
-    // Phase 4: Noise penalty infrastructure
-    var noise_count: u32 = 0;
-    var delim_depth: u32 = 0;
-
     var i: usize = 0;
     const include_strings = grammarUsesString(patterns);
     while (i < tokens.len) : (i += 1) {
@@ -423,19 +411,6 @@ pub fn parse(
         if (blocks.close) |close| {
             if (std.mem.eql(u8, text, close)) {
                 block_stack.pop();
-            }
-        }
-
-        // Balanced delimiter depth tracking for noise exclusion (Phase 4)
-        if (token.kind == .delimiter) {
-            if (text.len == 1) {
-                switch (text[0]) {
-                    '(', '{', '[' => delim_depth += 1,
-                    ')', '}', ']' => {
-                        if (delim_depth > 0) delim_depth -= 1;
-                    },
-                    else => {},
-                }
             }
         }
 
@@ -457,7 +432,6 @@ pub fn parse(
                 pattern_start = token.start;
                 pattern_col = token.col;
                 match_start_prev_token = saved_prev;
-                noise_count = 0;
             }
             state = step_result.next;
             try matched_kinds.append(allocator, token.kind);
@@ -510,7 +484,6 @@ pub fn parse(
                         try flushCandidates(&result, &candidates, tokens, source, vocab, resemble, collect_alternatives, allocator);
                     }
                     state = 0;
-                    noise_count = 0;
                     pending_captures.clearRetainingCapacity();
                     matched_kinds.clearRetainingCapacity();
                     matched_texts.clearRetainingCapacity();
@@ -588,7 +561,6 @@ pub fn parse(
                     try flushCandidates(&result, &candidates, tokens, source, vocab, resemble, collect_alternatives, allocator);
                 }
                 state = 0;
-                noise_count = 0;
                 pending_captures.clearRetainingCapacity();
                 matched_kinds.clearRetainingCapacity();
                 matched_texts.clearRetainingCapacity();
@@ -599,7 +571,6 @@ pub fn parse(
                     pattern_start = token.start;
                     pattern_col = token.col;
                     match_start_prev_token = saved_prev;
-                    noise_count = 0;
                     state = retry_result.next;
                     try matched_kinds.append(allocator, token.kind);
                     try matched_texts.append(allocator, text);
@@ -647,7 +618,6 @@ pub fn parse(
 
                         if (!any_buffered) {
                             state = 0;
-                            noise_count = 0;
                             pending_captures.clearRetainingCapacity();
                             matched_kinds.clearRetainingCapacity();
                             matched_texts.clearRetainingCapacity();
@@ -688,7 +658,6 @@ pub fn parse(
                             try flushCandidates(&result, &candidates, tokens, source, vocab, resemble, collect_alternatives, allocator);
                         }
                         state = 0;
-                        noise_count = 0;
                         pending_captures.clearRetainingCapacity();
                         matched_kinds.clearRetainingCapacity();
                         matched_texts.clearRetainingCapacity();
@@ -1117,11 +1086,6 @@ fn findPattern(patterns: []const loader.Pattern, type_name: []const u8) ?loader.
         if (std.mem.eql(u8, p.type_name, type_name)) return p;
     }
     return null;
-}
-
-fn findPatternMaxScore(patterns: []const loader.Pattern, type_name: []const u8, weights: loader.EvidenceWeights) f32 {
-    if (findPattern(patterns, type_name)) |p| return patternMaxScore(p.sequence, weights);
-    return 1.0; // fallback
 }
 
 // --- Unit Tests ---
@@ -1972,11 +1936,12 @@ test "property: confidence computation correctness" {
             // Build a pattern of all keywords → each contributes 0.5
             const expected_score: f32 = 1.0; // all match perfectly
 
+            const w = loader.EvidenceWeights{};
             var max: f32 = 0.0;
             var matched_weights: f32 = 0.0;
             for (0..pattern_len) |_| {
-                max += events_mod.evidence_weights.keyword;
-                matched_weights += events_mod.evidence_weights.keyword;
+                max += w.keyword;
+                matched_weights += w.keyword;
             }
 
             const confidence = events_mod.computeConfidence(matched_weights, max, 0, events_mod.default_noise_penalty_per_token, events_mod.default_max_noise_penalty);
@@ -3008,8 +2973,8 @@ test "property: noise penalty is bounded and monotonic" {
 // Feature: probabilistic-confidence-scoring, Property 8: Noise exclusion in balanced delimiters
 // **Validates: Requirements 4.5**
 // NOTE: This tests the computeConfidence formula with noise_count parameter.
-// Balanced delimiter depth tracking is infrastructure in the engine (delim_depth variable).
-// When mismatch tolerance is added, tokens inside balanced delimiters will not increment noise_count.
+// The engine does not supply the noise inputs of the formula; it passes none.
+// If the engine ever counts noise, tokens inside balanced delimiters would be excluded from noise_count.
 // For now, we verify that the formula correctly handles noise_count = 0 (as if excluded).
 test "property: noise exclusion in balanced delimiters (formula infrastructure)" {
     const weight_gen = gen.intRange(u16, 1, 100);

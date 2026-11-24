@@ -15,8 +15,11 @@ nix develop          # dev shell (Zig 0.16.0)
 zig build            # binary at zig-out/bin/lasp
 zig build test       # ALL tests — bare `zig test src/*.zig` does NOT work
 nix build            # ReleaseSafe build at ./result/bin/lasp
+zig build lint -Dlint=true   # zlinter `no_unused` over src/; findings fail the step
 lasp --version       # semver, sourced from build.zig.zon
 ```
+
+`zig build lint -Dlint=true` runs only the zlinter `no_unused` rule over `src/`. The `-Dlint=true` flag is required (plain `zig build lint` fails and names the right command) because Zig 0.16 build scripts cannot see the requested step name, so the flag guards the lazy zlinter dependency. The first run needs `git` and network (zlinter's transitive `zls` dependency is pinned via `git+https`); ordinary `zig build`, `zig build test`, and `nix build` never fetch it.
 
 `.bin/lasp` is a prebuilt snapshot; after changing parser/grammar/query code, exercise the freshly built `zig-out/bin/lasp`, not the stale copy.
 
@@ -47,6 +50,12 @@ diff /tmp/before.txt <($L parse src/foo.zig -g examples/grammars/zig.toml --node
 ```
 
 Node-type note: private fns emit as `function`, `pub fn` as `pub_function` — prefer `*` selectors when you don't care about the type. Confidence filtering (`[confidence>0.8]`) helps separate real matches from relaxed guesses.
+
+**Dead-code report (LASP on its own `src/**/*.zig`):**
+```bash
+tests/scripts/dead_code.sh zig-out/bin/lasp   # default binary: .bin/lasp
+```
+Section 1 `Unreferenced functions` lists production functions nothing mentions; exit 1 means section 1 is non-empty (outside the script's `ALLOWLIST`, initially `main`). Section 2 `Test-only functions` lists production functions mentioned only inside test blocks (informational). Exit 2 is a usage or tool failure (missing or failing binary). It uses `tests/fixtures/grammars/zig_test_blocks.toml` to find test blocks. The report is name-based, so it cannot see same-name collisions, write-only locals, test-only fields, transitively dead types, discarded parameters, or duplicate shapes.
 
 **After changing tokenizer, engine, loader, compiler, or query modules:** don't stop at `zig build test`. Smoke-test observable behavior end-to-end:
 

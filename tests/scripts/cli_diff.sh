@@ -23,6 +23,19 @@ trap 'rm -rf "$tmp"' EXIT
 total=0
 diffs=0
 
+# Progress goes to stderr every PROGRESS_EVERY cases so stdout (DIFF lines and
+# the final count) stays unchanged. On a terminal the line is rewritten in
+# place; otherwise one line per step is printed. PROGRESS_EVERY=0 disables it.
+PROGRESS_EVERY=${PROGRESS_EVERY:-100}
+progress() {
+  [ "$PROGRESS_EVERY" -gt 0 ] || return 0
+  if [ -t 2 ]; then
+    printf '\r... %d cases, %d differing' "$total" "$diffs" >&2
+  else
+    printf '... %d cases, %d differing\n' "$total" "$diffs" >&2
+  fi
+}
+
 # run_case <label> <args...>: runs both binaries with the same args.
 run_case() {
   local label=$1
@@ -35,8 +48,11 @@ run_case() {
   local nc=$?
   if [ $oc -ne $nc ] || ! cmp -s "$tmp/old.out" "$tmp/new.out"; then
     diffs=$((diffs + 1))
+    # Clear an in-place progress line so the DIFF line starts at column 0.
+    if [ "$PROGRESS_EVERY" -gt 0 ] && [ -t 2 ]; then printf '\r\033[K' >&2; fi
     echo "DIFF (exit $oc vs $nc): $label"
   fi
+  if [ "$PROGRESS_EVERY" -gt 0 ] && [ $((total % PROGRESS_EVERY)) -eq 0 ]; then progress; fi
 }
 
 grammars=()
@@ -74,5 +90,6 @@ for g in tests/fixtures/grammars_dir tests/fixtures/grammars_multi_dir; do
   [ -d "$g" ] && run_case "parse-dir tests/fixtures --grammar-dir $g" parse-dir tests/fixtures --grammar-dir "$g" --jsonl
 done
 
+if [ "$PROGRESS_EVERY" -gt 0 ] && [ -t 2 ]; then printf '\n' >&2; fi
 echo "cases: $total, differing: $diffs (inputs listed in $LIST)"
 [ "$diffs" -eq 0 ]

@@ -10,6 +10,11 @@
             .url = "https://gitlab.com/devnw/zig/toml/-/archive/204bdeec0e88caaeb23876ab9746b31a6f633711/toml-204bdeec0e88caaeb23876ab9746b31a6f633711.tar.gz",
             .hash = "toml-0.1.16-MHnShwN5GQBYxI1w_gSsmUnNFOSD01kD32H2auSV9yM0",
         },
+        .zlinter = .{
+            .url = "https://github.com/KurtWagner/zlinter/archive/871072b93777fe33e3523834268f0d87cc321266.tar.gz",
+            .hash = "zlinter-0.0.1-OjQ08ZZTDABnKR5Gt_L0m9KYrYVHz8VS3FWc4xDoF5z0",
+            .lazy = true,
+        },
     },
     .paths = .{""},
     .fingerprint = 0x4db66db9ad3e800d,
