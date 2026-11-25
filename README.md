@@ -553,8 +553,13 @@ The exact problem this tool solves is empowering AI agents to understand sprawli
 ```text
 src/
  ├─ main.zig
+ ├─ main_test.zig
+ ├─ test_support.zig
  ├─ cli/
- │   └─ args.zig
+ │   ├─ args.zig
+ │   ├─ diagnostics.zig
+ │   ├─ source.zig
+ │   └─ grammar_set.zig
  ├─ grammar/
  │   ├─ loader.zig
  │   └─ compiler.zig
