@@ -3292,6 +3292,21 @@ fn nonEmptyLineCount(out: []const u8) usize {
 // CRITICAL: This test MUST FAIL on the current unfixed code — its failure confirms
 // the bug (an unconditional end-of-main `writeAll("\n")` adds one extra newline in
 // names-only mode). DO NOT fix the code to make it pass; the fix lands in a later task.
+test "names-only on a multi-line string capture is plain unescaped text" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, "str.toml", explore_str_grammar);
+    sb.enter();
+    const input = "\"a\nb\tc\"";
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "str.toml", "--names-only" }, input);
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expectEqualStrings(input ++ "\n", r.stdout);
+}
 test "exploration: names-only output has no trailing blank line" {
     const allocator = std.testing.allocator;
 
@@ -4493,4 +4508,86 @@ test "error prefix P2: missing source file with a valid grammar keeps the two-li
     const allocator = std.testing.allocator;
     const p = "tests/fixtures/definitely_missing_source.zig";
     try expectFatalOnePrefix(allocator, &.{ "parse", p, "-g", "tests/fixtures/grammars/zig.toml" }, "error: file not found: " ++ p ++ "\nerror: failed to read file: " ++ p ++ "\n");
+}
+
+// --- Bug condition exploration tests (spec: json-string-escaping, task 1) ---
+// Encode the EXPECTED (fixed) behavior; MUST FAIL on unfixed code.
+
+const explore_str_grammar =
+    \\[tokens]
+    \\str = { delimited_span = { open = "\"", close = "\"" } }
+    \\
+    \\[[patterns]]
+    \\type = "lit"
+    \\sequence = ["$s:str"]
+    \\
+;
+
+test "exploration: multi-line string capture, parse --jsonl is one parseable line" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, "str.toml", explore_str_grammar);
+    sb.enter();
+
+    const input = "\"a\nb\tc\"";
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "str.toml", "--jsonl" }, input);
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stdout, "\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(input, parsed.value.object.get("s").?.string);
+}
+
+test "exploration: multi-line string capture, wrapped parse and query parse" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, "str.toml", explore_str_grammar);
+    sb.enter();
+
+    const input = "\"a\nb\tc\"";
+    const cmds = [_][]const []const u8{
+        &.{ "parse", "-", "-g", "str.toml" },
+        &.{ "query", "lit", "-", "-g", "str.toml" },
+    };
+    for (cmds) |args| {
+        const r = try runLaspWithStdin(allocator, args, input);
+        defer {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+        defer parsed.deinit();
+        const ev = parsed.value.object.get("events").?.array.items[0].object;
+        try std.testing.expectEqualStrings(input, ev.get("s").?.string);
+    }
+}
+
+test "exploration: grammar type name containing a quote yields parseable output" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, "q.toml",
+        \\[[patterns]]
+        \\type = "a\"b"
+        \\sequence = ["fn", "$name:IDENTIFIER"]
+        \\
+    );
+    sb.enter();
+
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "q.toml", "--jsonl" }, "fn foo");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a\"b", parsed.value.object.get("type").?.string);
 }

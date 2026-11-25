@@ -41,9 +41,9 @@ pub fn serializeTokens(tokens: []const Token, writer: anytype) !void {
 /// "line": N, "col": N }`. No surrounding array spaces, no comma. Single
 /// source of token-object bytes (shared by the wrapped and NDJSON framings).
 fn writeTokenObject(tok: Token, writer: anytype) !void {
-    try writer.writeAll("{ \"type\": \"");
-    try writer.writeAll(tokenKindToString(tok.kind));
-    try writer.writeAll("\", \"start\": ");
+    try writer.writeAll("{ \"type\": ");
+    try writeJsonString(writer, tokenKindToString(tok.kind));
+    try writer.writeAll(", \"start\": ");
     try writer.print("{d}", .{tok.start});
     try writer.writeAll(", \"end\": ");
     try writer.print("{d}", .{tok.end});
@@ -53,15 +53,52 @@ fn writeTokenObject(tok: Token, writer: anytype) !void {
     try writer.print("{d}", .{tok.col});
     try writer.writeAll(" }");
 }
-// Writes a string with JSON escaping (backslash and double quote).
-fn writeJsonEscaped(w: anytype, s: []const u8) !void {
+/// Writes `s` as a complete JSON string: opening quote, escaped body, closing
+/// quote. Every string the serializer emits (values, names, file, grammar,
+/// token kinds) must go through here. Bytes are treated as raw bytes, not
+/// decoded.
+fn writeJsonString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    const hex = "0123456789abcdef";
     for (s) |c| {
         switch (c) {
             '\\' => try w.writeAll("\\\\"),
             '"' => try w.writeAll("\\\""),
+            0x08 => try w.writeAll("\\b"),
+            0x09 => try w.writeAll("\\t"),
+            0x0A => try w.writeAll("\\n"),
+            0x0C => try w.writeAll("\\f"),
+            0x0D => try w.writeAll("\\r"),
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                try w.writeAll("\\u00");
+                try w.writeByte(hex[c >> 4]);
+                try w.writeByte(hex[c & 0x0F]);
+            },
             else => try w.writeByte(c),
         }
     }
+    try w.writeByte('"');
+}
+
+/// Writes `, "name": "value"` with both strings escaped.
+fn writeStringField(w: anytype, name: []const u8, value: []const u8) !void {
+    try w.writeAll(", ");
+    try writeJsonString(w, name);
+    try w.writeAll(": ");
+    try writeJsonString(w, value);
+}
+
+/// Writes every capture as a `, "field": "value"` pair (events and alternatives).
+fn writeCaptureFields(w: anytype, captures: []const CaptureEntry) !void {
+    for (captures) |cap| try writeStringField(w, cap.field_name, cap.value);
+}
+
+/// Writes `"file": S, "grammar": S`; callers supply the surrounding punctuation.
+fn writeEnvelopeFields(w: anytype, file: []const u8, grammar: []const u8) !void {
+    try w.writeAll("\"file\": ");
+    try writeJsonString(w, file);
+    try w.writeAll(", \"grammar\": ");
+    try writeJsonString(w, grammar);
 }
 
 const events_mod = @import("../parser/events.zig");
@@ -105,15 +142,13 @@ fn writeEventObject(
 ) !void {
     try writer.writeAll("{");
     if (envelope) |env| {
-        try writer.writeAll(" \"file\": \"");
-        try writeJsonEscaped(writer, env.file);
-        try writer.writeAll("\", \"grammar\": \"");
-        try writeJsonEscaped(writer, env.grammar);
-        try writer.writeAll("\",");
+        try writer.writeAll(" ");
+        try writeEnvelopeFields(writer, env.file, env.grammar);
+        try writer.writeAll(",");
     }
-    try writer.writeAll(" \"type\": \"");
-    try writer.writeAll(event.type_name);
-    try writer.writeAll("\", \"start\": ");
+    try writer.writeAll(" \"type\": ");
+    try writeJsonString(writer, event.type_name);
+    try writer.writeAll(", \"start\": ");
     try writer.print("{d}", .{event.start});
     try writer.writeAll(", \"end\": ");
     try writer.print("{d}", .{event.end});
@@ -139,45 +174,33 @@ fn writeEventObject(
     }
 
     // Include capture fields
-    for (event.captures) |cap| {
-        try writer.writeAll(", \"");
-        try writer.writeAll(cap.field_name);
-        try writer.writeAll("\": \"");
-        try writeJsonEscaped(writer, cap.value);
-        try writer.writeAll("\"");
-    }
+    try writeCaptureFields(writer, event.captures);
 
     // Integer fields render as bare JSON numbers — never quoted (Req 7.1).
     for (event.int_fields) |f| {
-        try writer.writeAll(", \"");
-        try writer.writeAll(f.field_name);
-        try writer.writeAll("\": ");
+        try writer.writeAll(", ");
+        try writeJsonString(writer, f.field_name);
+        try writer.writeAll(": ");
         try writer.print("{d}", .{f.value});
     }
     if (include_alternatives) {
         try writer.writeAll(", \"alternatives\": [");
         for (event.alternatives, 0..) |alt, j| {
             if (j > 0) try writer.writeAll(",");
-            try writer.writeAll(" { \"type\": \"");
-            try writer.writeAll(alt.type_name);
-            try writer.writeAll("\", \"confidence\": ");
+            try writer.writeAll(" { \"type\": ");
+            try writeJsonString(writer, alt.type_name);
+            try writer.writeAll(", \"confidence\": ");
             try writer.print("{d:.2}", .{alt.confidence});
             if (alt.source == .resemblance) {
                 // Advisory grammar-projected resemblance: mark the source and
                 // repeat the resembled kind name + membership score (the
                 // score IS the confidence).
-                try writer.writeAll(", \"source\": \"resemblance\", \"resembled_kind\": \"");
-                try writer.writeAll(alt.type_name);
-                try writer.writeAll("\", \"membership\": ");
+                try writer.writeAll(", \"source\": \"resemblance\", \"resembled_kind\": ");
+                try writeJsonString(writer, alt.type_name);
+                try writer.writeAll(", \"membership\": ");
                 try writer.print("{d:.2}", .{alt.confidence});
             }
-            for (alt.captures) |cap| {
-                try writer.writeAll(", \"");
-                try writer.writeAll(cap.field_name);
-                try writer.writeAll("\": \"");
-                try writeJsonEscaped(writer, cap.value);
-                try writer.writeAll("\"");
-            }
+            try writeCaptureFields(writer, alt.captures);
             try writer.writeAll(" }");
         }
         if (event.alternatives.len > 0) try writer.writeAll(" ");
@@ -218,11 +241,9 @@ pub fn serializeDirResults(entries: []const DirResult, include_alternatives: boo
     try writer.writeAll("[");
     for (entries, 0..) |entry, i| {
         if (i > 0) try writer.writeAll(",");
-        try writer.writeAll(" { \"file\": \"");
-        try writeJsonEscaped(writer, entry.file);
-        try writer.writeAll("\", \"grammar\": \"");
-        try writeJsonEscaped(writer, entry.grammar);
-        try writer.writeAll("\", \"events\": [");
+        try writer.writeAll(" { ");
+        try writeEnvelopeFields(writer, entry.file, entry.grammar);
+        try writer.writeAll(", \"events\": [");
         try writeEventArray(entry.events, include_alternatives, writer);
         try writer.writeAll("] }");
     }
@@ -1198,10 +1219,19 @@ fn appendFmt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt
 }
 
 fn appendEscaped(out: *std.ArrayList(u8), s: []const u8, allocator: std.mem.Allocator) !void {
+    // Independent literal table (RFC 8259), deliberately not derived from
+    // production `writeJsonString`.
+    const control = [32][]const u8{
+        "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007",
+        "\\b",     "\\t",     "\\n",     "\\u000b", "\\f",     "\\r",     "\\u000e", "\\u000f",
+        "\\u0010", "\\u0011", "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+        "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d", "\\u001e", "\\u001f",
+    };
     for (s) |c| {
         switch (c) {
             '\\' => try out.appendSlice(allocator, "\\\\"),
             '"' => try out.appendSlice(allocator, "\\\""),
+            0...0x1f => try out.appendSlice(allocator, control[c]),
             else => try out.append(allocator, c),
         }
     }
@@ -1214,7 +1244,7 @@ fn referenceEventArrayBody(events_list: []const StructuralEvent, include_alts: b
         if (i > 0) try out.appendSlice(allocator, ",");
         try out.append(allocator, ' ');
         try out.appendSlice(allocator, "{ \"type\": \"");
-        try out.appendSlice(allocator, ev.type_name);
+        try appendEscaped(&out, ev.type_name, allocator);
         try out.appendSlice(allocator, "\", \"start\": ");
         try appendFmt(&out, allocator, "{d}", .{ev.start});
         try out.appendSlice(allocator, ", \"end\": ");
@@ -1235,14 +1265,14 @@ fn referenceEventArrayBody(events_list: []const StructuralEvent, include_alts: b
         }
         for (ev.captures) |cap| {
             try out.appendSlice(allocator, ", \"");
-            try out.appendSlice(allocator, cap.field_name);
+            try appendEscaped(&out, cap.field_name, allocator);
             try out.appendSlice(allocator, "\": \"");
             try appendEscaped(&out, cap.value, allocator);
             try out.appendSlice(allocator, "\"");
         }
         for (ev.int_fields) |f| {
             try out.appendSlice(allocator, ", \"");
-            try out.appendSlice(allocator, f.field_name);
+            try appendEscaped(&out, f.field_name, allocator);
             try out.appendSlice(allocator, "\": ");
             try appendFmt(&out, allocator, "{d}", .{f.value});
         }
@@ -1251,18 +1281,18 @@ fn referenceEventArrayBody(events_list: []const StructuralEvent, include_alts: b
             for (ev.alternatives, 0..) |alt, j| {
                 if (j > 0) try out.appendSlice(allocator, ",");
                 try out.appendSlice(allocator, " { \"type\": \"");
-                try out.appendSlice(allocator, alt.type_name);
+                try appendEscaped(&out, alt.type_name, allocator);
                 try out.appendSlice(allocator, "\", \"confidence\": ");
                 try appendFmt(&out, allocator, "{d:.2}", .{alt.confidence});
                 if (alt.source == .resemblance) {
                     try out.appendSlice(allocator, ", \"source\": \"resemblance\", \"resembled_kind\": \"");
-                    try out.appendSlice(allocator, alt.type_name);
+                    try appendEscaped(&out, alt.type_name, allocator);
                     try out.appendSlice(allocator, "\", \"membership\": ");
                     try appendFmt(&out, allocator, "{d:.2}", .{alt.confidence});
                 }
                 for (alt.captures) |cap| {
                     try out.appendSlice(allocator, ", \"");
-                    try out.appendSlice(allocator, cap.field_name);
+                    try appendEscaped(&out, cap.field_name, allocator);
                     try out.appendSlice(allocator, "\": \"");
                     try appendEscaped(&out, cap.value, allocator);
                     try out.appendSlice(allocator, "\"");
@@ -1296,7 +1326,7 @@ fn referenceWrappedTokens(tokens: []const Token, allocator: std.mem.Allocator) !
     for (tokens, 0..) |tok, i| {
         if (i > 0) try out.appendSlice(allocator, ",");
         try out.appendSlice(allocator, " { \"type\": \"");
-        try out.appendSlice(allocator, tokenKindToString(tok.kind));
+        try appendEscaped(&out, tokenKindToString(tok.kind), allocator);
         try out.appendSlice(allocator, "\", \"start\": ");
         try appendFmt(&out, allocator, "{d}", .{tok.start});
         try out.appendSlice(allocator, ", \"end\": ");
@@ -1419,30 +1449,83 @@ const ndjson_token_gen = gen.structure(Token, .{
     .kind_id = gen.intRange(usize, 0, 3),
 });
 
+/// Adversarial byte pool: every control byte 0x00..0x1F, `"`, `\`, `/`, 0x7F,
+/// all bytes >= 0x80 (invalid UTF-8 included), plus a few printable letters.
+const adversarial_chars: []const u8 = blk: {
+    var buf: [32 + 4 + 128 + 3]u8 = undefined;
+    var n: usize = 0;
+    for (0..32) |c| {
+        buf[n] = @intCast(c);
+        n += 1;
+    }
+    for ("\"\\/\x7f") |c| {
+        buf[n] = c;
+        n += 1;
+    }
+    for (0x80..0x100) |c| {
+        buf[n] = @intCast(c);
+        n += 1;
+    }
+    for ("abz") |c| {
+        buf[n] = c;
+        n += 1;
+    }
+    const final = buf;
+    break :blk &final;
+};
+
+/// Adversarial salt appended to generated strings (empty allowed).
+const adv_salt_gen = gen.string(.{ .min_len = 0, .max_len = 8, .charset = .custom, .custom_chars = adversarial_chars });
+
+/// `base ++ salt[rot..]` when salted, otherwise `base` unchanged. Callers keep
+/// a unique `base` per JSON key, so adversarial suffixes never create
+/// duplicate keys.
+fn saltedString(allocator: std.mem.Allocator, base: []const u8, salt: ?[]const u8, rot: usize) ![]const u8 {
+    const s = salt orelse return base;
+    const tail = if (s.len == 0) s else s[rot % s.len ..];
+    return std.mem.concat(allocator, u8, &.{ base, tail });
+}
+
+/// Value strings: the salt itself (rotated) when salted, otherwise `plain`.
+fn saltedValue(plain: []const u8, salt: ?[]const u8, rot: usize) []const u8 {
+    const s = salt orelse return plain;
+    return if (s.len == 0) s else s[rot % s.len ..];
+}
+
 fn buildEventAlloc(m: EventModel, alts: []const AltModel, allocator: std.mem.Allocator) !StructuralEvent {
+    return buildEventSalted(m, alts, null, allocator);
+}
+
+fn buildEventSalted(m: EventModel, alts: []const AltModel, salt: ?[]const u8, allocator: std.mem.Allocator) !StructuralEvent {
     const caps = try allocator.alloc(CaptureEntry, m.n_captures);
     for (0..m.n_captures) |j| {
-        caps[j] = .{ .field_name = cap_names[j], .value = "v" };
+        caps[j] = .{
+            .field_name = try saltedString(allocator, cap_names[j], salt, j + 1),
+            .value = saltedValue("v", salt, j),
+        };
     }
     const ints = try allocator.alloc(IntegerField, m.n_int_fields);
     for (0..m.n_int_fields) |j| {
-        ints[j] = .{ .field_name = int_names[j], .value = 7 };
+        ints[j] = .{ .field_name = try saltedString(allocator, int_names[j], salt, j + 2), .value = 7 };
     }
     const altbuf = try allocator.alloc(Alternative, alts.len);
     for (alts, 0..) |a, j| {
         const acaps = try allocator.alloc(CaptureEntry, a.n_captures);
         for (0..a.n_captures) |k| {
-            acaps[k] = .{ .field_name = altcap_names[k], .value = "w" };
+            acaps[k] = .{
+                .field_name = try saltedString(allocator, altcap_names[k], salt, k + j + 3),
+                .value = saltedValue("w", salt, k + j + 1),
+            };
         }
         altbuf[j] = .{
-            .type_name = a.type_name,
+            .type_name = try saltedString(allocator, a.type_name, salt, j + 4),
             .confidence = a.confidence,
             .captures = acaps,
             .source = if (a.resemblance) .resemblance else .grammar,
         };
     }
     return .{
-        .type_name = m.type_name,
+        .type_name = try saltedString(allocator, m.type_name, salt, 0),
         .captures = caps,
         .start = m.start,
         .end = m.end,
@@ -1457,18 +1540,30 @@ fn buildEventAlloc(m: EventModel, alts: []const AltModel, allocator: std.mem.All
 }
 
 fn buildEventsAlloc(pairs: []const EventPair, allocator: std.mem.Allocator) ![]StructuralEvent {
+    return buildEventsSalted(pairs, null, allocator);
+}
+
+fn buildEventsSalted(pairs: []const EventPair, salt: ?[]const u8, allocator: std.mem.Allocator) ![]StructuralEvent {
     const events = try allocator.alloc(StructuralEvent, pairs.len);
     for (pairs, 0..) |p, i| {
-        events[i] = try buildEventAlloc(p.model, p.alts, allocator);
+        events[i] = try buildEventSalted(p.model, p.alts, salt, allocator);
     }
     return events;
 }
 
 fn buildDirResultsAlloc(models: []const DirModel, allocator: std.mem.Allocator) ![]DirResult {
+    return buildDirResultsSalted(models, null, allocator);
+}
+
+fn buildDirResultsSalted(models: []const DirModel, salt: ?[]const u8, allocator: std.mem.Allocator) ![]DirResult {
     const entries = try allocator.alloc(DirResult, models.len);
     for (models, 0..) |m, i| {
-        const evs = try buildEventsAlloc(m.events, allocator);
-        entries[i] = .{ .file = m.file, .grammar = m.grammar, .events = evs };
+        const evs = try buildEventsSalted(m.events, salt, allocator);
+        entries[i] = .{
+            .file = try saltedString(allocator, m.file, salt, i),
+            .grammar = try saltedString(allocator, m.grammar, salt, i + 1),
+            .events = evs,
+        };
     }
     return entries;
 }
@@ -1504,6 +1599,52 @@ test "property: byte-identical output when the flag is off (refactor guard)" {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const entries = try buildDirResultsAlloc(models, arena.allocator());
+            const actual = try serializeDirResultsToString(entries, true);
+            defer testing.allocator.free(actual);
+            const expected = try referenceWrappedDirResults(entries, true, testing.allocator);
+            defer testing.allocator.free(expected);
+            try testing.expectEqualStrings(expected, actual);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Same comparison as Property 1, with adversarial bytes (control bytes, `"`,
+// `\`, `/`, 0x7F, >= 0x80) appended to every string slot: type, capture and
+// integer field names, alternative type, capture values, file, grammar. Each
+// field name keeps its unique base, so keys stay distinct. Compared byte for
+// byte against the independent reference only (no std.json parse, since the
+// bytes may be invalid UTF-8).
+test "property: reference comparison holds with adversarial strings" {
+    const events_gen = comptime gen.tuple2(
+        []const EventPair,
+        []const u8,
+        pair_list_gen,
+        adv_salt_gen,
+    );
+    try minish.check(testing.allocator, events_gen, struct {
+        fn prop(v: struct { []const EventPair, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const events = try buildEventsSalted(v[0], v[1], arena.allocator());
+            const actual = try serializeEventsToStringWithAlternatives(events, true);
+            defer testing.allocator.free(actual);
+            const expected = try referenceWrappedEvents(events, true, testing.allocator);
+            defer testing.allocator.free(expected);
+            try testing.expectEqualStrings(expected, actual);
+        }
+    }.prop, .{ .num_runs = 100 });
+
+    const dir_gen = comptime gen.tuple2(
+        []const DirModel,
+        []const u8,
+        dir_list_gen,
+        adv_salt_gen,
+    );
+    try minish.check(testing.allocator, dir_gen, struct {
+        fn prop(v: struct { []const DirModel, []const u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const entries = try buildDirResultsSalted(v[0], v[1], arena.allocator());
             const actual = try serializeDirResultsToString(entries, true);
             defer testing.allocator.free(actual);
             const expected = try referenceWrappedDirResults(entries, true, testing.allocator);
@@ -1703,4 +1844,373 @@ test "property: No added field names in Single_File_Mode" {
             }
         }
     }.prop, .{ .num_runs = 100 });
+}
+
+// --- Bug condition exploration tests (spec: json-string-escaping, task 1) ---
+// These encode the EXPECTED (fixed) behavior and MUST FAIL on unfixed code.
+
+fn explorationEvent(type_name: []const u8, captures: []const CaptureEntry) StructuralEvent {
+    return .{ .type_name = type_name, .captures = captures, .start = 0, .end = 1, .line = 1, .col = 0, .confidence = 1.0 };
+}
+
+fn explorationFirstEvent(parsed: std.json.Parsed(std.json.Value)) std.json.ObjectMap {
+    return parsed.value.object.get("events").?.array.items[0].object;
+}
+
+test "exploration: control bytes in capture value are escaped" {
+    const value = "a\nb\tc\x00\x1f\r\x08\x0c\x01";
+    const ev = explorationEvent("t", &.{.{ .field_name = "s", .value = value }});
+    const out = try serializeEventsToString(&.{ev});
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"s\": \"a\\nb\\tc\\u0000\\u001f\\r\\b\\f\\u0001\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(value, explorationFirstEvent(parsed).get("s").?.string);
+}
+
+test "exploration: quote and backslash in type, capture field, and integer field names" {
+    const ev = StructuralEvent{
+        .type_name = "a\"b",
+        .captures = &.{.{ .field_name = "x\\y", .value = "v" }},
+        .int_fields = &.{.{ .field_name = "i\"j", .value = 7 }},
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+    };
+    const out = try serializeEventsToString(&.{ev});
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\": \"a\\\"b\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = explorationFirstEvent(parsed);
+    try testing.expectEqualStrings("a\"b", obj.get("type").?.string);
+    try testing.expectEqualStrings("v", obj.get("x\\y").?.string);
+    try testing.expectEqual(@as(i64, 7), obj.get("i\"j").?.integer);
+}
+
+test "exploration: alternative type, capture field name, and capture value are escaped" {
+    const ev = StructuralEvent{
+        .type_name = "t",
+        .captures = &.{},
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .alternatives = &.{.{
+            .type_name = "o\"p",
+            .confidence = 0.5,
+            .captures = &.{.{ .field_name = "x\"y", .value = "l1\nl2" }},
+        }},
+    };
+    const out = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+    defer testing.allocator.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const alt = explorationFirstEvent(parsed).get("alternatives").?.array.items[0].object;
+    try testing.expectEqualStrings("o\"p", alt.get("type").?.string);
+    try testing.expectEqualStrings("l1\nl2", alt.get("x\"y").?.string);
+}
+
+test "exploration: resembled_kind with backslash is escaped" {
+    const ev = StructuralEvent{
+        .type_name = "t",
+        .captures = &.{},
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .alternatives = &.{.{ .type_name = "n\\um", .confidence = 0.83, .captures = &.{}, .source = .resemblance }},
+    };
+    const out = try serializeEventsToStringWithAlternatives(&.{ev}, true);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"resembled_kind\": \"n\\\\um\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const alt = explorationFirstEvent(parsed).get("alternatives").?.array.items[0].object;
+    try testing.expectEqualStrings("n\\um", alt.get("resembled_kind").?.string);
+}
+
+test "exploration: parse-dir envelope control bytes, wrapped" {
+    const entries = [_]DirResult{.{
+        .file = "a\nb",
+        .grammar = "g\x01",
+        .events = &.{explorationEvent("t", &.{})},
+    }};
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try serializeDirResults(&entries, false, &aw.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const obj = parsed.value.array.items[0].object;
+    try testing.expectEqualStrings("a\nb", obj.get("file").?.string);
+    try testing.expectEqualStrings("g\x01", obj.get("grammar").?.string);
+}
+
+test "exploration: parse-dir envelope control bytes, NDJSON" {
+    const entries = [_]DirResult{.{
+        .file = "a\nb",
+        .grammar = "g\x01",
+        .events = &.{explorationEvent("t", &.{})},
+    }};
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try serializeDirResultsNdjson(&entries, false, &aw.writer);
+    const out = aw.written();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out[0 .. out.len - 1], .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a\nb", parsed.value.object.get("file").?.string);
+    try testing.expectEqualStrings("g\x01", parsed.value.object.get("grammar").?.string);
+}
+
+test "exploration: jsonl newline count equals record count with LF and CR in captures" {
+    const evs = [_]StructuralEvent{
+        explorationEvent("t", &.{.{ .field_name = "s", .value = "a\nb" }}),
+        explorationEvent("t", &.{.{ .field_name = "s", .value = "c\rd\ne" }}),
+    };
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try serializeEventsNdjson(&evs, false, &aw.writer);
+    const out = aw.written();
+    try testing.expectEqual(@as(usize, evs.len), std.mem.count(u8, out, "\n"));
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "\r"));
+}
+
+// --- Ground-truth and byte-level tests (spec: json-string-escaping, task 5) ---
+// Property 1: adversarial VALID UTF-8 in every string slot must parse with
+// std.json and round-trip exactly, in every framing. std.json is the oracle,
+// independent of the production writer and of the reference serializer.
+const ctrl_bytes: [32]u8 = blk: {
+    var b: [32]u8 = undefined;
+    for (0..32) |i| b[i] = @intCast(i);
+    break :blk b;
+};
+const non_ctrl_atoms = [_][]const u8{
+    "\"", "\\", "/", "\x7f", "a", "Z", " ", "\u{e9}", "\u{20ac}", "\u{1f600}", "\u{10ffff}",
+};
+const n_atoms: u8 = 32 + non_ctrl_atoms.len;
+const atom_gen = gen.intRange(u8, 0, n_atoms - 1);
+const atoms_gen = gen.list(u8, atom_gen, 0, 48);
+fn atomBytes(idx: u8) []const u8 {
+    if (idx < 32) return ctrl_bytes[idx .. idx + 1];
+    return non_ctrl_atoms[idx - 32];
+}
+/// Deterministic adversarial string for a slot: 0..5 atoms from a slot-specific
+/// window of the generated atom list.
+fn slotString(allocator: std.mem.Allocator, atoms: []const u8, slot: usize) ![]const u8 {
+    if (atoms.len == 0) return "";
+    const len = (slot * 5 + atoms.len) % 6;
+    var out: std.ArrayList(u8) = .empty;
+    for (0..len) |k| {
+        try out.appendSlice(allocator, atomBytes(atoms[(slot * 7 + k) % atoms.len]));
+    }
+    return out.items;
+}
+/// `"<prefix>:"` ++ adversarial suffix. The prefix is unique per slot and
+/// prefix-free, so keys stay distinct and never collide with built-in keys.
+fn slotName(allocator: std.mem.Allocator, atoms: []const u8, slot: *usize, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    const prefix = try std.fmt.allocPrint(allocator, fmt, args);
+    const suffix = try slotString(allocator, atoms, slot.*);
+    slot.* += 1;
+    return std.mem.concat(allocator, u8, &.{ prefix, suffix });
+}
+fn slotValue(allocator: std.mem.Allocator, atoms: []const u8, slot: *usize) ![]const u8 {
+    const s = try slotString(allocator, atoms, slot.*);
+    slot.* += 1;
+    return s;
+}
+/// Builds `n` events, every `[]const u8` of StructuralEvent, Alternative,
+/// CaptureEntry and IntegerField being an adversarial string. A new string
+/// field added to those types must be filled here, or the round-trip below
+/// cannot cover it.
+fn buildGroundTruthEvents(allocator: std.mem.Allocator, atoms: []const u8, n: usize) ![]StructuralEvent {
+    var slot: usize = 0;
+    const events = try allocator.alloc(StructuralEvent, n);
+    for (events, 0..) |*ev, e| {
+        const caps = try allocator.alloc(CaptureEntry, 2);
+        for (caps, 0..) |*c, k| {
+            c.* = .{
+                .field_name = try slotName(allocator, atoms, &slot, "c{d}_{d}:", .{ e, k }),
+                .value = try slotValue(allocator, atoms, &slot),
+            };
+        }
+        const ints = try allocator.alloc(IntegerField, 2);
+        for (ints, 0..) |*f, k| {
+            f.* = .{ .field_name = try slotName(allocator, atoms, &slot, "i{d}_{d}:", .{ e, k }), .value = @intCast(e * 10 + k) };
+        }
+        const alts = try allocator.alloc(Alternative, 2);
+        for (alts, 0..) |*a, j| {
+            const acaps = try allocator.alloc(CaptureEntry, 2);
+            for (acaps, 0..) |*c, k| {
+                c.* = .{
+                    .field_name = try slotName(allocator, atoms, &slot, "a{d}_{d}_{d}:", .{ e, j, k }),
+                    .value = try slotValue(allocator, atoms, &slot),
+                };
+            }
+            a.* = .{
+                .type_name = try slotValue(allocator, atoms, &slot),
+                .confidence = 0.5,
+                .captures = acaps,
+                .source = if (j == 1) .resemblance else .grammar,
+            };
+        }
+        ev.* = .{
+            .type_name = try slotValue(allocator, atoms, &slot),
+            .captures = caps,
+            .start = e,
+            .end = e + 1,
+            .line = 1,
+            .col = 0,
+            .confidence = 1.0,
+            .alternatives = alts,
+            .int_fields = ints,
+        };
+    }
+    return events;
+}
+fn expectEventRoundTrip(obj: std.json.ObjectMap, ev: StructuralEvent) !void {
+    try testing.expectEqualStrings(ev.type_name, obj.get("type").?.string);
+    for (ev.captures) |c| try testing.expectEqualStrings(c.value, obj.get(c.field_name).?.string);
+    for (ev.int_fields) |f| try testing.expectEqual(@as(i64, f.value), obj.get(f.field_name).?.integer);
+    const alts = obj.get("alternatives").?.array.items;
+    try testing.expectEqual(ev.alternatives.len, alts.len);
+    for (ev.alternatives, alts) |a, av| {
+        const ao = av.object;
+        try testing.expectEqualStrings(a.type_name, ao.get("type").?.string);
+        for (a.captures) |c| try testing.expectEqualStrings(c.value, ao.get(c.field_name).?.string);
+        if (a.source == .resemblance) {
+            try testing.expectEqualStrings("resemblance", ao.get("source").?.string);
+            try testing.expectEqualStrings(a.type_name, ao.get("resembled_kind").?.string);
+        }
+    }
+}
+fn expectEventsRoundTrip(items: []const std.json.Value, events: []const StructuralEvent) !void {
+    try testing.expectEqual(events.len, items.len);
+    for (events, items) |ev, item| try expectEventRoundTrip(item.object, ev);
+}
+/// Parses each `\n`-terminated line of `out`; asserts the newline count equals
+/// the record count and that every line is one complete JSON value.
+fn parseNdjsonLines(allocator: std.mem.Allocator, out: []const u8, n_records: usize) ![]std.json.Value {
+    try testing.expectEqual(n_records, std.mem.count(u8, out, "\n"));
+    const vals = try allocator.alloc(std.json.Value, n_records);
+    var it = std.mem.splitScalar(u8, out, '\n');
+    for (vals) |*v| {
+        const line = it.next().?;
+        v.* = try std.json.parseFromSliceLeaky(std.json.Value, allocator, line, .{});
+    }
+    try testing.expectEqualStrings("", it.next().?);
+    return vals;
+}
+test "property: adversarial valid UTF-8 round-trips through std.json in every framing" {
+    const g = comptime gen.tuple2([]const u8, u8, atoms_gen, gen.intRange(u8, 0, 3));
+    try minish.check(testing.allocator, g, struct {
+        fn prop(v: struct { []const u8, u8 }) !void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const events = try buildGroundTruthEvents(a, v[0], v[1]);
+            var slot: usize = 1000;
+            const entries = [_]DirResult{
+                .{ .file = try slotValue(a, v[0], &slot), .grammar = try slotValue(a, v[0], &slot), .events = events },
+                .{ .file = try slotValue(a, v[0], &slot), .grammar = try slotValue(a, v[0], &slot), .events = events },
+            };
+
+            // Wrapped events (with alternatives).
+            {
+                var aw: std.Io.Writer.Allocating = .init(a);
+                try serializeEventsWithAlternatives(events, true, &aw.writer);
+                const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, aw.written(), .{});
+                try expectEventsRoundTrip(doc.object.get("events").?.array.items, events);
+            }
+            // --jsonl records.
+            {
+                var aw: std.Io.Writer.Allocating = .init(a);
+                try serializeEventsNdjson(events, true, &aw.writer);
+                const lines = try parseNdjsonLines(a, aw.written(), events.len);
+                for (events, lines) |ev, line| try expectEventRoundTrip(line.object, ev);
+            }
+            // parse-dir wrapped array.
+            {
+                var aw: std.Io.Writer.Allocating = .init(a);
+                try serializeDirResults(&entries, true, &aw.writer);
+                const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, aw.written(), .{});
+                try testing.expectEqual(entries.len, doc.array.items.len);
+                for (entries, doc.array.items) |en, item| {
+                    try testing.expectEqualStrings(en.file, item.object.get("file").?.string);
+                    try testing.expectEqualStrings(en.grammar, item.object.get("grammar").?.string);
+                    try expectEventsRoundTrip(item.object.get("events").?.array.items, en.events);
+                }
+            }
+            // parse-dir NDJSON records (one line per event, envelope leading).
+            {
+                var aw: std.Io.Writer.Allocating = .init(a);
+                try serializeDirResultsNdjson(&entries, true, &aw.writer);
+                const lines = try parseNdjsonLines(a, aw.written(), entries.len * events.len);
+                var i: usize = 0;
+                for (entries) |en| {
+                    for (en.events) |ev| {
+                        const obj = lines[i].object;
+                        try testing.expectEqualStrings(en.file, obj.get("file").?.string);
+                        try testing.expectEqualStrings(en.grammar, obj.get("grammar").?.string);
+                        try expectEventRoundTrip(obj, ev);
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+fn expectWrittenString(input: []const u8, expected: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJsonString(&aw.writer, input);
+    try testing.expectEqualStrings(expected, aw.written());
+}
+test "writeJsonString: exact bytes for each escape table row" {
+    try expectWrittenString("", "\"\"");
+    try expectWrittenString("\"", "\"\\\"\"");
+    try expectWrittenString("\\", "\"\\\\\"");
+    try expectWrittenString("\x08", "\"\\b\"");
+    try expectWrittenString("\x09", "\"\\t\"");
+    try expectWrittenString("\x0a", "\"\\n\"");
+    try expectWrittenString("\x0c", "\"\\f\"");
+    try expectWrittenString("\x0d", "\"\\r\"");
+    try expectWrittenString("\x00", "\"\\u0000\"");
+    try expectWrittenString("\x01", "\"\\u0001\"");
+    try expectWrittenString("\x1f", "\"\\u001f\"");
+    try expectWrittenString("\x0b", "\"\\u000b\"");
+    try expectWrittenString("\x1b", "\"\\u001b\"");
+}
+test "writeJsonString: pass-through rows and invalid UTF-8 bytes unchanged" {
+    try expectWrittenString("/", "\"/\"");
+    try expectWrittenString("\x7f", "\"\x7f\"");
+    try expectWrittenString("\u{e9}", "\"\u{e9}\"");
+    try expectWrittenString("\xff", "\"\xff\"");
+    try expectWrittenString("a\xc3(b\x80", "\"a\xc3(b\x80\"");
+}
+// --- Preservation tests (spec: json-string-escaping, task 2) ---
+
+// Feature: json-string-escaping, Unit: pinned preservation bytes (non-UTF-8,
+// DEL, `/`, and quote/backslash in a value-class string stay as today).
+// **Validates: Requirements 3.1, 2.7**
+test "preservation: value-class bytes pinned (quote, backslash, slash, DEL, high bytes)" {
+    const ev = StructuralEvent{
+        .type_name = "t",
+        .captures = &.{.{ .field_name = "s", .value = "q\"b\\/\x7f\xff\xc3\xa9" }},
+        .start = 0,
+        .end = 1,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+    };
+    const out = try serializeEventsToStringWithAlternatives(&.{ev}, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "{ \"events\": [ { \"type\": \"t\", \"start\": 0, \"end\": 1, \"line\": 1, \"confidence\": 1.00, \"col\": 0, \"s\": \"q\\\"b\\\\/\x7f\xff\xc3\xa9\" } ] }",
+        out,
+    );
 }
