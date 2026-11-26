@@ -1,0 +1,23 @@
+# Union-read grammar for tests/scripts/union_reads.sh.
+# Emits one `union_read` event per `base.field` access (`base` and `field`
+# captured) and per deref form `*.field` (as in `ptr.*.array`).
+# The script keeps only events whose field names a toml.Value tag and that lie
+# outside test blocks.
+# Cannot see: reads whose base is not a plain identifier (`x.?.string`,
+# `(expr).string`, `f().string`), reads whose base and `.` are split by a
+# comment, and enum literals written `.string` (these are skipped on purpose).
+[language]
+name = "zig-union-reads"
+extensions = [".zig"]
+
+[comments]
+line = ["//"]
+
+[[patterns]]
+type = "union_read"
+sequence = ["$base:IDENTIFIER", ".", "$field:IDENTIFIER"]
+
+# deref form: value_ptr.*.array
+[[patterns]]
+type = "union_read"
+sequence = ["*", ".", "$field:IDENTIFIER"]
