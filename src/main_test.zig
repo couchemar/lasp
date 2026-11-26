@@ -4,6 +4,7 @@ const json = @import("output/json.zig");
 const grammar_loader = @import("grammar/loader.zig");
 const events = @import("parser/events.zig");
 const cli = @import("cli/args.zig");
+const output = @import("cli/output.zig");
 const source_reader = @import("cli/source.zig");
 const grammar_set = @import("cli/grammar_set.zig");
 const support = @import("test_support.zig");
@@ -372,7 +373,7 @@ test "parse-dir: walks tree, parses matching files, skips unmatched (P1)" {
 
 // Feature: parse-dir-directory-walk, Property 2: non-parse-dir behavior is
 // byte-identical (preservation baseline). Runs on the unfixed binary today and
-// must keep passing after the parseOneFile refactor and dispatch split.
+// must keep passing across pipeline and output refactors.
 test "property: single-file parse/query is deterministic and well-formed (P2)" {
     const tuple_gen = comptime gen.tuple2(
         []const u8,
@@ -3338,6 +3339,246 @@ test "error prefix P2: missing source file with a valid grammar keeps the two-li
     try expectFatalOnePrefix(allocator, &.{ "parse", p, "-g", "tests/fixtures/grammars/zig.toml" }, "error: file not found: " ++ p ++ "\nerror: failed to read file: " ++ p ++ "\n");
 }
 
+// --- run-pipeline-output task 1: characterization tests ---
+// Pin today's error order and output framing. They pass on the unrefactored
+// code and must keep passing through the refactors (design: "Characterization cases").
+const order_bad_default_grammar = "[language]\nextensions = [\".erl\"]\n\n[[patterns]]\ntype = \"t\"\nsequence = [\"ident\"]\n\n[tokens]\nident = { char_class_run = { start = \"z-a\" } }\n";
+const order_bad_default_line = err_prefix_charset_body ++ ".lasp/grammars/bad.toml\n";
+const order_missing_source_erl = "error: file not found: missing.erl\nerror: failed to read file: missing.erl\n";
+test "order: query -g bad grammar with missing source reports the source first" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
+    try expectFatalOnePrefix(allocator, &.{ "query", "function", "missing.zig", "-g", err_prefix_dir ++ "/bad_charset.toml" }, "error: file not found: missing.zig\nerror: failed to read file: missing.zig\n");
+}
+test "order: query -g missing grammar with bad selector reports the grammar before the selector" {
+    const allocator = std.testing.allocator;
+    const gp = "tests/fixtures/grammars/definitely_missing.toml";
+    try expectFatalOnePrefix(allocator, &.{ "query", "function[", "tests/fixtures/sample.zig", "-g", gp }, "error: file not found: " ++ gp ++ "\nerror: failed to read grammar file: " ++ gp ++ "\n");
+}
+test "order: query -g bad grammar with bad selector reports the grammar before the selector" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
+    const gp = err_prefix_dir ++ "/bad_charset.toml";
+    try expectFatalOnePrefix(allocator, &.{ "query", "function[", "tests/fixtures/sample.zig", "-g", gp }, err_prefix_charset_body ++ gp ++ "\n");
+}
+test "order: query default malformed grammar with missing source reports the grammar first" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "bad.toml", .content = order_bad_default_grammar }});
+    try expectFatalOnePrefix(allocator, &.{ "query", "function", "missing.erl" }, order_bad_default_line);
+}
+test "order: query default with no matching grammar, missing source and bad selector requires -g first" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "py.toml", .content = python_grammar_toml }});
+    try expectFatalOnePrefix(allocator, &.{ "query", "function[", "missing.erl" }, "error: query command requires --grammar/-g flag\n");
+}
+test "order: query default with one match, missing source and bad selector reports the source first" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "erlang.toml", .content = erlang_grammar_toml }});
+    try expectFatalOnePrefix(allocator, &.{ "query", "function[", "missing.erl" }, order_missing_source_erl);
+}
+test "order: query default with several matches, bad selector and --names-only reports the selector before the names-only fatal" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
+    });
+    try expectFatalOnePrefix(allocator, &.{ "query", "function[", "tests/fixtures/dir_sample/a.erl", "--names-only" }, "error: missing field name in attribute condition\n");
+}
+test "order: query default with several matches and --names-only is fatal after the source read" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
+    });
+    try expectFatalOnePrefix(allocator, &.{ "query", "function", "missing.erl", "--names-only" }, order_missing_source_erl);
+    try expectFatalOnePrefix(allocator, &.{ "query", "function", "tests/fixtures/dir_sample/a.erl", "--names-only" }, "error: --names-only requires a single grammar (pass -g/--grammar)\n");
+}
+test "order: parse -g bad grammar with missing source reports the source first" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedErrPrefixFixtures(&sb);
+    try expectFatalOnePrefix(allocator, &.{ "parse", "missing.zig", "-g", err_prefix_dir ++ "/bad_charset.toml" }, "error: file not found: missing.zig\nerror: failed to read file: missing.zig\n");
+}
+test "order: parse default malformed grammar with missing source reports the grammar first" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "bad.toml", .content = order_bad_default_grammar }});
+    try expectFatalOnePrefix(allocator, &.{ "parse", "missing.erl" }, order_bad_default_line);
+}
+test "order: parse default several matches with missing source reports the source before the names-only fatal" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{
+        .{ .name = "erlang.toml", .content = erlang_grammar_toml },
+        .{ .name = "erlang2.toml", .content = erlang2_grammar_toml },
+    });
+    try expectFatalOnePrefix(allocator, &.{ "parse", "missing.erl", "--names-only" }, order_missing_source_erl);
+}
+test "order: parse stdin ignores a malformed default grammar and emits raw tokens" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "bad.toml", .content = order_bad_default_grammar }});
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-" }, "a\n");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expectEqual(@as(usize, 0), r.stderr.len);
+    try expectValidJsonSingleTrailingNewline(allocator, r.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "\"type\": \"identifier\"") != null);
+}
+test "order: parse-dir missing target with malformed default grammar reports the grammar first" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "bad.toml", .content = order_bad_default_grammar }});
+    try expectFatalOnePrefix(allocator, &.{ "parse-dir", "nope" }, order_bad_default_line);
+}
+test "order: parse-dir missing target with missing --grammar-dir reports the grammar directory first" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "parse-dir", "nope", "--grammar-dir", "nope2" }, "error: grammar directory not found: nope2\n");
+}
+test "order: parse-dir missing target with a valid grammar dir reports the directory" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "parse-dir", "nope", "--grammar-dir", "tests/fixtures/grammars_dir" }, "error: directory not found: nope\n");
+}
+test "framing: query wrapped stdout is one literal line ending in exactly one newline" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, "tiny.toml", erlang_grammar_toml);
+    const r = try runLaspWithStdin(allocator, &.{ "query", "function", "-", "-g", "tiny.toml" }, "foo() -> 1.\n");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expectEqual(@as(usize, 0), r.stderr.len);
+    try std.testing.expectEqualStrings(
+        "{ \"events\": [ { \"type\": \"function\", \"start\": 0, \"end\": 4, \"line\": 1, \"confidence\": 1.00, \"col\": 0 } ] }\n",
+        r.stdout,
+    );
+}
+test "framing: query with zero matches is an empty events object ending in one newline" {
+    const allocator = std.testing.allocator;
+    const r = try runLasp(allocator, &.{ "query", "nosuchtype", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml" });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expectEqualStrings("{ \"events\": [] }\n", r.stdout);
+}
+test "framing: parse-dir wrapped output is a JSON array ending in exactly one newline" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const fx = try makeParseDirFixture(allocator, &sb);
+    const r = try runLasp(allocator, &.{ "parse-dir", fx.tree, "--grammar-dir", fx.grammars });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try expectParseDirOk(r, allocator);
+    try std.testing.expect(std.mem.endsWith(u8, r.stdout, "\n"));
+    try std.testing.expect(!std.mem.endsWith(u8, r.stdout, "\n\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stdout, "\n"));
+}
+test "framing: parse-dir --jsonl output is one newline-terminated line per event" {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const fx = try makeParseDirFixture(allocator, &sb);
+    const r = try runLasp(allocator, &.{ "parse-dir", fx.tree, "--grammar-dir", fx.grammars, "--jsonl" });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expect(std.mem.endsWith(u8, r.stdout, "\n"));
+    try std.testing.expect(!std.mem.endsWith(u8, r.stdout, "\n\n"));
+    var lines = std.mem.splitScalar(u8, r.stdout[0 .. r.stdout.len - 1], '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| : (n += 1) {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("file") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+}
+test "framing: parse --jsonl and query --jsonl emit no trailing document newline beyond the record newline" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const []const u8{
+        &.{ "parse", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml", "--jsonl" },
+        &.{ "query", "*", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml", "--jsonl" },
+        &.{ "parse", "tests/fixtures/sample.zig", "--jsonl" },
+    };
+    for (args) |a| {
+        const r = try runLasp(allocator, a);
+        defer {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+        try std.testing.expect(r.stdout.len > 0);
+        try std.testing.expect(std.mem.endsWith(u8, r.stdout, "}\n"));
+        try std.testing.expect(!std.mem.endsWith(u8, r.stdout, "\n\n"));
+        try std.testing.expect(r.stdout[0] == '{' and std.mem.startsWith(u8, r.stdout, "{ \"type\""));
+    }
+}
+test "framing: names-only on a grammar parse and on a query ends in exactly one newline, no JSON" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const []const u8{
+        &.{ "parse", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml", "--names-only" },
+        &.{ "query", "*", "tests/fixtures/sample.zig", "-g", "examples/grammars/zig.toml", "--names-only" },
+    };
+    for (args) |a| {
+        const r = try runLasp(allocator, a);
+        defer {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        }
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+        try std.testing.expect(r.stdout.len > 0);
+        try std.testing.expect(std.mem.endsWith(u8, r.stdout, "\n"));
+        try std.testing.expect(!std.mem.endsWith(u8, r.stdout, "\n\n"));
+        try std.testing.expect(std.mem.indexOfScalar(u8, r.stdout, '{') == null);
+    }
+}
 // --- Bug condition exploration tests (spec: json-string-escaping, task 1) ---
 // Encode the EXPECTED (fixed) behavior; MUST FAIL on unfixed code.
 const explore_str_grammar =
@@ -3417,4 +3658,240 @@ test "exploration: grammar type name containing a quote yields parseable output"
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("a\"b", parsed.value.object.get("type").?.string);
+}
+
+// Feature: names-only-prefer-string-capture
+// Test-only copy of the unfixed helper (the F reference): integer first, then capture.
+fn referenceWriteNamesOnlyLine(stdout: *std.Io.Writer, event: events.StructuralEvent) !void {
+    if (event.int_fields.len > 0) {
+        try stdout.print("{d}\n", .{event.int_fields[0].value});
+        return;
+    }
+    if (event.captures.len > 0) {
+        try stdout.writeAll(event.captures[0].value);
+        try stdout.writeAll("\n");
+    }
+}
+
+fn namesOnlyTestEvent(captures: []const events.CaptureEntry, ints: []const events.IntegerField) events.StructuralEvent {
+    return .{
+        .type_name = "test",
+        .captures = captures,
+        .start = 0,
+        .end = 10,
+        .line = 1,
+        .col = 0,
+        .confidence = 1.0,
+        .int_fields = ints,
+    };
+}
+
+fn renderNamesOnly(allocator: std.mem.Allocator, event: events.StructuralEvent, reference: bool) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    if (reference) {
+        try referenceWriteNamesOnlyLine(&aw.writer, event);
+    } else {
+        try output.writeNamesOnlyLine(&aw.writer, event);
+    }
+    return aw.toOwnedSlice();
+}
+
+/// Generated event storage: captures "c<seed>_<i>" and u32 integer fields.
+const NamesOnlyGen = struct {
+    captures: []events.CaptureEntry,
+    ints: []events.IntegerField,
+    values: [][]u8,
+
+    fn init(allocator: std.mem.Allocator, ncap: usize, nint: usize, seed: u32) !NamesOnlyGen {
+        const captures = try allocator.alloc(events.CaptureEntry, ncap);
+        errdefer allocator.free(captures);
+        const values = try allocator.alloc([]u8, ncap);
+        errdefer allocator.free(values);
+        var made: usize = 0;
+        errdefer for (values[0..made]) |v| allocator.free(v);
+        while (made < ncap) : (made += 1) {
+            values[made] = try std.fmt.allocPrint(allocator, "c{d}_{d}", .{ seed, made });
+            captures[made] = .{ .field_name = "name", .value = values[made] };
+        }
+        const ints = try allocator.alloc(events.IntegerField, nint);
+        for (ints, 0..) |*f, i| f.* = .{ .field_name = "n", .value = seed *% 2654435761 +% @as(u32, @intCast(i)) };
+        return .{ .captures = captures, .ints = ints, .values = values };
+    }
+
+    fn deinit(self: NamesOnlyGen, allocator: std.mem.Allocator) void {
+        for (self.values) |v| allocator.free(v);
+        allocator.free(self.values);
+        allocator.free(self.captures);
+        allocator.free(self.ints);
+    }
+};
+
+test "unit: namesOnlyValue prefers first string capture over integer fields" {
+    const caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "add" }};
+    const ints = [_]events.IntegerField{.{ .field_name = "args", .value = 3 }};
+    const v = output.namesOnlyValue(namesOnlyTestEvent(&caps, &ints)).?;
+    try std.testing.expectEqualStrings("add", v.text);
+}
+
+test "unit: namesOnlyValue extent shape (capture n + integer body) returns text" {
+    const caps = [_]events.CaptureEntry{.{ .field_name = "n", .value = "foo" }};
+    const ints = [_]events.IntegerField{.{ .field_name = "body", .value = 10815 }};
+    const v = output.namesOnlyValue(namesOnlyTestEvent(&caps, &ints)).?;
+    try std.testing.expectEqualStrings("foo", v.text);
+}
+
+test "unit: namesOnlyValue several captures and integers returns first capture" {
+    const caps = [_]events.CaptureEntry{
+        .{ .field_name = "a", .value = "first" },
+        .{ .field_name = "b", .value = "second" },
+    };
+    const ints = [_]events.IntegerField{
+        .{ .field_name = "x", .value = 0 },
+        .{ .field_name = "y", .value = 9 },
+    };
+    const v = output.namesOnlyValue(namesOnlyTestEvent(&caps, &ints)).?;
+    try std.testing.expectEqualStrings("first", v.text);
+}
+
+test "unit: namesOnlyValue integer-only returns number, including 0" {
+    const zero = [_]events.IntegerField{.{ .field_name = "body", .value = 0 }};
+    const v0 = output.namesOnlyValue(namesOnlyTestEvent(&.{}, &zero)).?;
+    try std.testing.expectEqual(@as(u32, 0), v0.number);
+    const some = [_]events.IntegerField{ .{ .field_name = "body", .value = 42 }, .{ .field_name = "z", .value = 7 } };
+    const v1 = output.namesOnlyValue(namesOnlyTestEvent(&.{}, &some)).?;
+    try std.testing.expectEqual(@as(u32, 42), v1.number);
+}
+
+test "unit: namesOnlyValue string-only returns text; neither returns null" {
+    const caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "solo" }};
+    const v = output.namesOnlyValue(namesOnlyTestEvent(&caps, &.{})).?;
+    try std.testing.expectEqualStrings("solo", v.text);
+    try std.testing.expect(output.namesOnlyValue(namesOnlyTestEvent(&.{}, &.{})) == null);
+}
+
+test "unit: writeNamesOnlyLine renders text, number, nothing, and empty capture" {
+    const allocator = std.testing.allocator;
+    const caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "name" }};
+    const out_text = try renderNamesOnly(allocator, namesOnlyTestEvent(&caps, &.{}), false);
+    defer allocator.free(out_text);
+    try std.testing.expectEqualStrings("name\n", out_text);
+
+    const ints = [_]events.IntegerField{.{ .field_name = "body", .value = 12 }};
+    const out_num = try renderNamesOnly(allocator, namesOnlyTestEvent(&.{}, &ints), false);
+    defer allocator.free(out_num);
+    try std.testing.expectEqualStrings("12\n", out_num);
+
+    const out_none = try renderNamesOnly(allocator, namesOnlyTestEvent(&.{}, &.{}), false);
+    defer allocator.free(out_none);
+    try std.testing.expectEqual(@as(usize, 0), out_none.len);
+
+    const empty_caps = [_]events.CaptureEntry{.{ .field_name = "name", .value = "" }};
+    const out_empty = try renderNamesOnly(allocator, namesOnlyTestEvent(&empty_caps, &.{}), false);
+    defer allocator.free(out_empty);
+    try std.testing.expectEqualStrings("\n", out_empty);
+}
+
+test "unit: writeNamesOnlyLine both kinds incl. integer 0 prints the name (bug condition)" {
+    const allocator = std.testing.allocator;
+    const caps = [_]events.CaptureEntry{.{ .field_name = "n", .value = "add" }};
+    const ints = [_]events.IntegerField{ .{ .field_name = "args", .value = 0 }, .{ .field_name = "body", .value = 99 } };
+    const out = try renderNamesOnly(allocator, namesOnlyTestEvent(&caps, &ints), false);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("add\n", out);
+}
+
+// Feature: names-only-prefer-string-capture, Property 1: events with a string capture and
+// an integer field render captures[0].value ++ "\n"
+test "property: names-only prefers first string capture (Property 1)" {
+    const t = comptime gen.tuple3(u8, u8, u32, gen.intRange(u8, 1, 3), gen.intRange(u8, 1, 3), gen.intRange(u32, 0, std.math.maxInt(u32)));
+    try minish.check(std.testing.allocator, t, struct {
+        fn prop(v: struct { u8, u8, u32 }) !void {
+            const allocator = std.testing.allocator;
+            const g = try NamesOnlyGen.init(allocator, v[0], v[1], v[2]);
+            defer g.deinit(allocator);
+            const out = try renderNamesOnly(allocator, namesOnlyTestEvent(g.captures, g.ints), false);
+            defer allocator.free(out);
+            const expected = try std.fmt.allocPrint(allocator, "{s}\n", .{g.captures[0].value});
+            defer allocator.free(expected);
+            try std.testing.expectEqualStrings(expected, out);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: names-only-prefer-string-capture, Property 2: non-bug events render as the
+// unfixed reference helper does
+test "property: names-only preserves non-buggy events (Property 2)" {
+    const t = comptime gen.tuple3(u8, u8, u32, gen.intRange(u8, 0, 3), gen.intRange(u8, 0, 3), gen.intRange(u32, 0, std.math.maxInt(u32)));
+    try minish.check(std.testing.allocator, t, struct {
+        fn prop(v: struct { u8, u8, u32 }) !void {
+            // Restrict to captures.len == 0 or int_fields.len == 0.
+            const ncap: usize = v[0];
+            const nint: usize = if (ncap > 0) 0 else v[1];
+            const allocator = std.testing.allocator;
+            const g = try NamesOnlyGen.init(allocator, ncap, nint, v[2]);
+            defer g.deinit(allocator);
+            const ev = namesOnlyTestEvent(g.captures, g.ints);
+            const fixed = try renderNamesOnly(allocator, ev, false);
+            defer allocator.free(fixed);
+            const ref = try renderNamesOnly(allocator, ev, true);
+            defer allocator.free(ref);
+            try std.testing.expectEqualStrings(ref, fixed);
+            if (ncap == 0 and nint > 0) {
+                const digits = try std.fmt.allocPrint(allocator, "{d}\n", .{g.ints[0].value});
+                defer allocator.free(digits);
+                try std.testing.expectEqualStrings(digits, fixed);
+            }
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+// Feature: names-only-prefer-string-capture, Property 3: framing over mixed event lists
+test "property: names-only framing (Property 3)" {
+    const t = comptime gen.tuple2(u8, u32, gen.intRange(u8, 0, 6), gen.intRange(u32, 0, std.math.maxInt(u32)));
+    try minish.check(std.testing.allocator, t, struct {
+        fn prop(v: struct { u8, u32 }) !void {
+            const allocator = std.testing.allocator;
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            var renderable: usize = 0;
+            var i: usize = 0;
+            while (i < v[0]) : (i += 1) {
+                const sel: u32 = (v[1] +% @as(u32, @intCast(i)) *% 7) % 4;
+                const ncap: usize = sel & 1;
+                const nint: usize = (sel >> 1) & 1;
+                const g = try NamesOnlyGen.init(allocator, ncap, nint, v[1] +% @as(u32, @intCast(i)));
+                defer g.deinit(allocator);
+                if (ncap > 0 or nint > 0) renderable += 1;
+                try output.writeNamesOnlyLine(&aw.writer, namesOnlyTestEvent(g.captures, g.ints));
+            }
+            const out = aw.written();
+            try std.testing.expectEqual(renderable, std.mem.count(u8, out, "\n"));
+            try std.testing.expect(out.len == 0 or out[out.len - 1] == '\n');
+            try std.testing.expect(std.mem.indexOf(u8, out, "\n\n") == null);
+            if (renderable == 0) try std.testing.expectEqual(@as(usize, 0), out.len);
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+test "parse-dir --names-only is rejected with one error line and empty stdout" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "parse-dir", "tests/fixtures", "--grammar-dir", "examples/grammars", "--names-only" }, "error: --names-only is not supported on parse-dir\n");
+}
+test "parse-dir --jsonl --names-only still reports the mutual-exclusion error" {
+    const allocator = std.testing.allocator;
+    try expectFatalOnePrefix(allocator, &.{ "parse-dir", "tests/fixtures", "--grammar-dir", "examples/grammars", "--jsonl", "--names-only" }, "error: --jsonl and --names-only are mutually exclusive\n");
+}
+test "framing: parse --names-only with no grammar is raw-token JSON ending in one newline" {
+    const allocator = std.testing.allocator;
+    const r = try runLasp(allocator, &.{ "parse", "tests/fixtures/sample.zig", "--names-only" });
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expect(std.mem.endsWith(u8, r.stdout, "\n"));
+    try std.testing.expect(!std.mem.endsWith(u8, r.stdout, "\n\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, r.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("events").?.array.items.len > 0);
 }

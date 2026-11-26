@@ -495,7 +495,7 @@ declared by a grammar in `--grammar-dir` (suffix match on the basename, e.g.
 pair becomes one JSON object `{ "file", "grammar", "events" }` whose `events`
 array is byte-identical to single-file `parse`; unmatched files are skipped
 silently, a file matched by several grammars yields several entries, and
-`--node` filters each entry's events. Without `--grammar-dir` the command
+`--node` filters each entry's events. `--names-only` is rejected on `parse-dir`. Without `--grammar-dir` the command
 prints `[]` with exit zero. Targets may be relative, absolute, or end in a
 slash.
 
@@ -559,7 +559,9 @@ src/
  │   ├─ args.zig
  │   ├─ diagnostics.zig
  │   ├─ source.zig
- │   └─ grammar_set.zig
+ │   ├─ grammar_set.zig
+ │   ├─ pipeline.zig
+ │   └─ output.zig
  ├─ grammar/
  │   ├─ loader.zig
  │   └─ compiler.zig

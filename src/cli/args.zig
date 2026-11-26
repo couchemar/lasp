@@ -33,6 +33,7 @@ pub const CliError = error{
     AlternativesOnQuery,
     ResembleOnQuery,
     JsonlWithNamesOnly,
+    NamesOnlyOnParseDir,
     JsonlOnNonOutputCommand,
 };
 
@@ -132,6 +133,7 @@ pub fn formatCliError(err: CliError) []const u8 {
         error.AlternativesOnQuery => "--alternatives is supported on the parse command only",
         error.ResembleOnQuery => "--resemble is supported on the parse command only",
         error.JsonlWithNamesOnly => "--jsonl and --names-only are mutually exclusive",
+        error.NamesOnlyOnParseDir => "--names-only is not supported on parse-dir",
         error.JsonlOnNonOutputCommand => "--jsonl is only supported on parse, parse-dir, and query commands",
     };
 }
@@ -234,6 +236,7 @@ pub fn parseArgs(args: []const []const u8) CliError!ParsedArgs {
     }
 
     if (names_only and jsonl) return error.JsonlWithNamesOnly;
+    if (names_only and command == .parse_dir) return error.NamesOnlyOnParseDir;
 
     return ParsedArgs{
         .command = command,
@@ -1286,4 +1289,13 @@ test "property: jsonl plus names-only is a usage error (order-independent)" {
             try testing.expectError(error.JsonlWithNamesOnly, result);
         }
     }.prop, .{ .num_runs = 100 });
+}
+test "--names-only is accepted on parse and query, rejected on parse-dir" {
+    try testing.expect((try parseArgs(&.{ "parse", "file.zig", "--names-only" })).names_only);
+    try testing.expect((try parseArgs(&.{ "query", "function", "file.zig", "-g", "g.toml", "--names-only" })).names_only);
+    try testing.expectError(error.NamesOnlyOnParseDir, parseArgs(&.{ "parse-dir", "src", "--names-only" }));
+    try testing.expectError(error.NamesOnlyOnParseDir, parseArgs(&.{ "parse-dir", "src", "--grammar-dir", "g", "--names-only" }));
+}
+test "formatCliError: NamesOnlyOnParseDir message" {
+    try testing.expectEqualStrings("--names-only is not supported on parse-dir", formatCliError(error.NamesOnlyOnParseDir));
 }

@@ -131,7 +131,7 @@ echo 'def add(a, b): return a + b' | lasp parse - -g .lasp/grammars/python.toml
 ```bash
 lasp parse-dir <directory> --grammar-dir .lasp/grammars/
 ```
-Parses all files in a directory using grammars from the specified directory. Useful for batch analysis of an entire codebase.
+Parses all files in a directory using grammars from the specified directory. Useful for batch analysis of an entire codebase. `--names-only` is not supported here: `parse-dir --names-only` exits non-zero with `error: --names-only is not supported on parse-dir`. Use `--jsonl` and filter the records instead.
 
 A grammar's `[language] extensions` list decides which files it matches
 (suffix match on the basename): `extensions = [".erl"]` matches `foo.erl`,

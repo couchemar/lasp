@@ -43,20 +43,44 @@ pub fn loadGrammarsFromDir(io: std.Io, allocator: std.mem.Allocator, gdir: []con
     var loaded: std.ArrayList(LoadedGrammar) = .empty;
     for (names.items) |name| {
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ gdir, name });
-        const grammar_source = readSourceFile(io, allocator, path) catch {
-            fatalError("failed to read grammar file: {s}", .{path});
-        };
-        const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
-            const msg: []const u8 = grammarErrorMessage(err);
-            fatalError("{s}: {s}", .{ msg, path });
-        };
-        try loaded.append(allocator, .{
-            .name = name,
-            .grammar = grammar,
-            .automaton = try grammar_compiler.compile(grammar.patterns, allocator),
-        });
+        try loaded.append(allocator, try loadGrammarFile(io, allocator, path, name));
     }
     return try loaded.toOwnedSlice(allocator);
+}
+
+/// The only place a grammar file becomes a compiled grammar. Fatal (existing
+/// messages, naming `path`) on read or parse failure.
+pub fn loadGrammarFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, name: []const u8) !LoadedGrammar {
+    const grammar_source = readSourceFile(io, allocator, path) catch {
+        fatalError("failed to read grammar file: {s}", .{path});
+    };
+    const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
+        const msg: []const u8 = grammarErrorMessage(err);
+        fatalError("{s}: {s}", .{ msg, path });
+    };
+    return .{
+        .name = name,
+        .grammar = grammar,
+        .automaton = try grammar_compiler.compile(grammar.patterns, allocator),
+    };
+}
+
+/// The only extension-match rule: a grammar with no extensions never matches;
+/// otherwise any extension that suffix-matches the basename.
+pub fn grammarMatches(grammar: grammar_loader.Grammar, basename: []const u8) bool {
+    for (grammar.extensions) |ext| {
+        if (basenameMatchesExtension(basename, ext)) return true;
+    }
+    return false;
+}
+
+/// Grammars of the default dir (.lasp/grammars); an absent or not-a-directory
+/// default yields an empty slice.
+pub fn loadDefaultGrammars(io: std.Io, allocator: std.mem.Allocator) ![]LoadedGrammar {
+    return loadGrammarsFromDir(io, allocator, default_grammar_dir) catch |e| switch (e) {
+        error.GrammarDirNotFound => &.{},
+        else => return e,
+    };
 }
 
 /// Last path segment; posix separator only (targets are CLI paths).
@@ -66,23 +90,28 @@ fn fileBasename(path: []const u8) []const u8 {
 
 /// Default grammar set for a single target file: all grammars from
 /// .lasp/grammars whose extensions suffix-match the target's basename.
-/// null when target is "-" (stdin, no basename) or the default dir is absent.
-pub fn resolveDefaultGrammars(io: std.Io, allocator: std.mem.Allocator, target_path: []const u8) !?[]LoadedGrammar {
-    if (std.mem.eql(u8, target_path, "-")) return null;
-    const loaded = loadGrammarsFromDir(io, allocator, default_grammar_dir) catch |e| switch (e) {
-        error.GrammarDirNotFound => return null,
-        else => return e,
-    };
+/// Empty for stdin ("-", no basename; the default dir is not loaded) and for
+/// an absent default dir.
+pub fn resolveDefaultGrammars(io: std.Io, allocator: std.mem.Allocator, target_path: []const u8) ![]LoadedGrammar {
+    if (std.mem.eql(u8, target_path, "-")) return &.{};
+    const loaded = try loadDefaultGrammars(io, allocator);
+    const base = fileBasename(target_path);
     var matches: std.ArrayList(LoadedGrammar) = .empty;
     for (loaded) |lg| {
-        if (lg.grammar.extensions.len == 0) continue;
-        const base = fileBasename(target_path);
-        for (lg.grammar.extensions) |ext| {
-            if (basenameMatchesExtension(base, ext)) {
-                try matches.append(allocator, lg);
-                break;
-            }
-        }
+        if (grammarMatches(lg.grammar, base)) try matches.append(allocator, lg);
     }
     return try matches.toOwnedSlice(allocator);
+}
+
+test "grammarMatches: no extensions never match, otherwise any suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pattern = "[[patterns]]\ntype = \"call\"\nsequence = [\"$callee:IDENTIFIER\", \"(\"]\n";
+    const none = try grammar_loader.parseGrammar(pattern, a);
+    try std.testing.expect(!grammarMatches(none, "foo.erl"));
+    const some = try grammar_loader.parseGrammar("[language]\nextensions = [\".erl\", \"cxx\"]\n" ++ pattern, a);
+    try std.testing.expect(grammarMatches(some, "foo.erl"));
+    try std.testing.expect(grammarMatches(some, "file.cxx"));
+    try std.testing.expect(!grammarMatches(some, "foo.py"));
 }

@@ -34,3 +34,17 @@ pub fn readSourceOrStdin(io: std.Io, allocator: std.mem.Allocator, target_path: 
     }
     return readSourceFile(io, allocator, target_path);
 }
+
+/// `readSourceOrStdin` with the CLI's fatal on failure.
+pub fn readTargetOrFatal(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []const u8 {
+    return readSourceOrStdin(io, allocator, path) catch {
+        diagnostics.fatalError("failed to read file: {s}", .{path});
+    };
+}
+
+/// `readSourceFile` (never stdin) with the CLI's fatal on failure.
+pub fn readFileOrFatal(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []const u8 {
+    return readSourceFile(io, allocator, path) catch {
+        diagnostics.fatalError("failed to read file: {s}", .{path});
+    };
+}

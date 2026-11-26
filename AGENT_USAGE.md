@@ -107,7 +107,7 @@ Behavior:
   where `events` is byte-identical to what single-file
   `.bin/lasp parse <file> -g <grammar>` emits for that file.
 - `--node <type>` filters each entry's `events` (empty array when nothing
-  matches). `--names-only` is not wired in dir mode (deferred).
+  matches). `--names-only` is rejected on `parse-dir` (`error: --names-only is not supported on parse-dir`, non-zero exit, empty stdout).
 - No `--grammar-dir` ⇒ the default `.lasp/grammars` is used when present (same
   loader, order, and behavior); with no default dir either, every file matches
   nothing ⇒ `[]` with exit zero.
@@ -180,7 +180,7 @@ subtract
 multiply
 ```
 
-Events with no captures are skipped. When no grammar is specified, `--names-only` is silently ignored and raw token JSON is emitted.
+Events with no captures are skipped. When no grammar is specified, `--names-only` is silently ignored and raw token JSON is emitted, ending in a final newline like every other wrapped JSON output.
 
 ### Composable pipelines
 
@@ -683,6 +683,7 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | Malformed query selector | stderr message, non-zero exit |
 | No args | Usage message on stderr, non-zero exit (same as `--help`) |
 | Downstream reader closes the pipe early (e.g. `\| head`, `\| less` quit) | Broken pipe (EPIPE) is a clean exit: nothing on stderr, zero exit — like `grep`/`jq`. Other stdout write failures (disk full, I/O error) still error non-zero |
+| `--names-only` on `parse-dir` | `error: --names-only is not supported on parse-dir` on stderr, non-zero exit, empty stdout |
 | `parse-dir` target is missing or not a directory | `directory not found` on stderr, non-zero exit |
 | `--grammar-dir` is missing or not a directory | `grammar directory not found` on stderr, non-zero exit |
 | Malformed grammar inside `--grammar-dir` | grammar error message naming the offending `.toml` path, non-zero exit |
