@@ -26,10 +26,30 @@ pub fn fatalError(comptime fmt: []const u8, args: anytype) noreturn {
 /// Single message for `error.InvalidCharSet` (empty, inverted, non-ASCII endpoint, or bad escape).
 const invalid_char_set_message = "[tokens] invalid char set: ranges must have ASCII endpoints and run low-to-high, use \\- for a literal '-' and \\\\ for a literal '\\' (other escapes are not allowed)";
 
+/// Prefix-free message body for a grammar error. For `WrongValueType` it names
+/// the key path and the expected type from `diag`; every other error returns
+/// `grammarErrorMessage(err)`. A buffer that is too small falls back to the
+/// fixed message.
+pub fn grammarErrorDetail(err: grammar_loader.GrammarError, diag: *const grammar_loader.Diagnostic, buf: []u8) []const u8 {
+    if (err != error.WrongValueType) return grammarErrorMessage(err);
+    const fallback = grammarErrorMessage(err);
+    return switch (diag.expected) {
+        .string => std.fmt.bufPrint(buf, "invalid value for '{s}': expected a string", .{diag.path()}),
+        .string_array => std.fmt.bufPrint(buf, "invalid value for '{s}': expected an array of strings", .{diag.path()}),
+        .integer => std.fmt.bufPrint(buf, "invalid value for '{s}': expected an integer from {d} to {d}", .{ diag.path(), diag.lo, diag.hi }),
+        .number => std.fmt.bufPrint(buf, "invalid value for '{s}': expected a number", .{diag.path()}),
+        .boolean => std.fmt.bufPrint(buf, "invalid value for '{s}': expected a boolean", .{diag.path()}),
+        .table => std.fmt.bufPrint(buf, "invalid value for '{s}': expected a table", .{diag.path()}),
+        .table_array => std.fmt.bufPrint(buf, "invalid value for '{s}': expected an array of tables", .{diag.path()}),
+        .array => std.fmt.bufPrint(buf, "invalid value for '{s}': expected an array", .{diag.path()}),
+    } catch fallback;
+}
+
 /// Prefix-free message body for an error from `parseGrammar`.
 pub fn grammarErrorMessage(err: grammar_loader.GrammarError) []const u8 {
     return switch (err) {
         error.InvalidToml => "invalid TOML syntax in grammar file",
+        error.WrongValueType => "invalid value type",
         error.MissingPatterns => "grammar file missing required [[patterns]] section",
         error.EmptyPatternSequence => "pattern has empty sequence",
         error.InvalidCaptureFormat => "invalid capture format, expected $name:IDENTIFIER",
@@ -38,7 +58,7 @@ pub fn grammarErrorMessage(err: grammar_loader.GrammarError) []const u8 {
         error.InvalidPriorValue => "invalid prior value, prior must be greater than 0.0 and at most 2.0",
         error.InvalidKindName => "invalid kind name, expected IDENTIFIER, NUMBER, or STRING",
         error.InvalidConstraintType => "invalid constraint type",
-        error.InvalidConstraintDepth => "invalid constraint depth",
+        error.InvalidConstraintDepth => "invalid constraint depth (expected an integer from 0 to 255)",
         error.InvalidConstraintField => "invalid constraint field",
         error.InvalidConstraintValues => "invalid constraint values",
         error.DeprecatedField => "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead",
@@ -91,4 +111,33 @@ pub fn selectorErrorMessage(err: query_parser.ParseError) []const u8 {
         error.UnexpectedCharacter => "unexpected character in selector",
         error.OutOfMemory => "out of memory",
     };
+}
+
+test "grammarErrorDetail: one message per expected type" {
+    var buf: [256]u8 = undefined;
+    var d: grammar_loader.Diagnostic = .{};
+    d.set("k", .string, 0, 0);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected a string", grammarErrorDetail(error.WrongValueType, &d, &buf));
+    d.set("k", .string_array, 0, 0);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected an array of strings", grammarErrorDetail(error.WrongValueType, &d, &buf));
+    d.set("k", .integer, 0, 255);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected an integer from 0 to 255", grammarErrorDetail(error.WrongValueType, &d, &buf));
+    d.set("k", .number, 0, 0);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected a number", grammarErrorDetail(error.WrongValueType, &d, &buf));
+    d.set("k", .boolean, 0, 0);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected a boolean", grammarErrorDetail(error.WrongValueType, &d, &buf));
+    d.set("k", .table, 0, 0);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected a table", grammarErrorDetail(error.WrongValueType, &d, &buf));
+    d.set("k", .table_array, 0, 0);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected an array of tables", grammarErrorDetail(error.WrongValueType, &d, &buf));
+    d.set("k", .array, 0, 0);
+    try std.testing.expectEqualStrings("invalid value for 'k': expected an array", grammarErrorDetail(error.WrongValueType, &d, &buf));
+}
+
+test "grammarErrorDetail: small buffer falls back, other errors unchanged" {
+    var small: [4]u8 = undefined;
+    var d: grammar_loader.Diagnostic = .{};
+    d.set("patterns[].type", .string, 0, 0);
+    try std.testing.expectEqualStrings("invalid value type", grammarErrorDetail(error.WrongValueType, &d, &small));
+    try std.testing.expectEqualStrings(grammarErrorMessage(error.InvalidConstraintDepth), grammarErrorDetail(error.InvalidConstraintDepth, &d, &small));
 }

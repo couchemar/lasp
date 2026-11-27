@@ -1,5 +1,8 @@
 const std = @import("std");
-const toml = @import("toml");
+const toml_access = @import("toml_access.zig");
+const Node = toml_access.Node;
+const Reader = toml_access.Reader;
+pub const Diagnostic = toml_access.Diagnostic;
 const tokenizer = @import("../parser/tokenizer.zig");
 const TokenKind = tokenizer.TokenKind;
 
@@ -187,6 +190,7 @@ pub const GrammarError = error{
     InvalidExtentAtColumn,
     TooManyExtentTables,
     InvalidExtensionsList,
+    WrongValueType,
 };
 
 const delimiter_chars = "(){}[]";
@@ -201,17 +205,6 @@ fn isPunctuation(s: []const u8) bool {
         if (s[0] == c) return true;
     }
     return false;
-}
-
-/// Extracts an f32 from a TOML value that may be either .float or .integer.
-/// Returns null if the value is neither type.
-fn tomlToF32(v: anytype) ?f32 {
-    // The TOML value is a tagged union pointer — dereference and switch on tag
-    return switch (v.*) {
-        .float => |f| @as(f32, @floatCast(f)),
-        .integer => |i| @as(f32, @floatFromInt(i)),
-        else => null,
-    };
 }
 
 // Writes a string with TOML basic-string escaping (backslash and double quote).
@@ -323,24 +316,25 @@ fn parseCaptureTail(tail: []const u8, vocab: ?tokenizer.KindVocabulary) GrammarE
 /// Absent/invalid-length-0 ⇒ null (byte-identical path). Runs after captures
 /// and count specs exist so field-collision checks see both lists.
 fn parseExtentSpec(
-    pattern_table: anytype,
+    r: Reader,
+    pattern_table: Node,
     captures: []const Capture,
     count_specs: []const CountSpec,
     allocator: std.mem.Allocator,
 ) GrammarError!?ExtentSpec {
-    const extent_val = pattern_table.get("extent") orelse return null;
-    if (extent_val.array.items.items.len > 1) return error.TooManyExtentTables;
-    if (extent_val.array.items.items.len == 0) return null;
-    const et = extent_val.array.items.items[0];
+    const extent_list = (try r.optTableArray(pattern_table, .{ .name = "extent", .path = "patterns[].extent" })) orelse return null;
+    if (extent_list.len() > 1) return error.TooManyExtentTables;
+    if (extent_list.len() == 0) return null;
+    const et = extent_list.at(0);
 
-    const field_val = et.get("field") orelse return error.InvalidExtentField;
-    if (field_val.* != .string or field_val.string.len == 0 or field_val.string.len > 64) return error.InvalidExtentField;
-    const field = try allocator.dupe(u8, field_val.string);
+    const field_str = try r.reqString(et, .{ .name = "field", .invalid = error.InvalidExtentField }, error.InvalidExtentField);
+    if (field_str.len == 0 or field_str.len > 64) return error.InvalidExtentField;
+    const field = try allocator.dupe(u8, field_str);
 
-    const has_open = et.get("open") != null;
-    const has_close = et.get("close") != null;
-    const has_terminator = et.get("terminator") != null;
-    const has_at_column = et.get("at_column") != null;
+    const has_open = et.has("open");
+    const has_close = et.has("close");
+    const has_terminator = et.has("terminator");
+    const has_at_column = et.has("at_column");
 
     if (has_terminator and (has_open or has_close)) return error.ExtentModeConflict;
     if (!has_open and !has_close and !has_terminator) return error.ExtentNoMode;
@@ -348,26 +342,25 @@ fn parseExtentSpec(
     if (has_at_column and !has_terminator) return error.ExtentAtColumnWithoutTerminator;
 
     const mode: ExtentMode = if (has_terminator) blk: {
-        const term_val = et.get("terminator").?;
-        if (term_val.* != .string or term_val.string.len == 0 or term_val.string.len > 8) return error.InvalidExtentDelimiter;
+        const term_str = try r.reqString(et, .{ .name = "terminator", .invalid = error.InvalidExtentDelimiter }, error.InvalidExtentDelimiter);
+        if (term_str.len == 0 or term_str.len > 8) return error.InvalidExtentDelimiter;
         var at_column: ?u16 = null;
         if (has_at_column) {
-            const col_val = et.get("at_column").?;
-            if (col_val.* != .integer or col_val.integer < 0 or col_val.integer > 65535) return error.InvalidExtentAtColumn;
-            at_column = @intCast(col_val.integer);
+            const col = (try r.optInt(et, .{ .name = "at_column", .invalid = error.InvalidExtentAtColumn }, 0, 65535)).?;
+            at_column = std.math.cast(u16, col) orelse return error.InvalidExtentAtColumn;
         }
         break :blk .{ .terminator = .{
-            .terminator = try allocator.dupe(u8, term_val.string),
+            .terminator = try allocator.dupe(u8, term_str),
             .at_column = at_column,
         } };
     } else blk: {
-        const open_val = et.get("open").?;
-        const close_val = et.get("close").?;
-        if (open_val.* != .string or open_val.string.len == 0 or open_val.string.len > 8) return error.InvalidExtentDelimiter;
-        if (close_val.* != .string or close_val.string.len == 0 or close_val.string.len > 8) return error.InvalidExtentDelimiter;
+        const open_str = try r.reqString(et, .{ .name = "open", .invalid = error.InvalidExtentDelimiter }, error.InvalidExtentDelimiter);
+        const close_str = try r.reqString(et, .{ .name = "close", .invalid = error.InvalidExtentDelimiter }, error.InvalidExtentDelimiter);
+        if (open_str.len == 0 or open_str.len > 8) return error.InvalidExtentDelimiter;
+        if (close_str.len == 0 or close_str.len > 8) return error.InvalidExtentDelimiter;
         break :blk .{ .balanced = .{
-            .open = try allocator.dupe(u8, open_val.string),
-            .close = try allocator.dupe(u8, close_val.string),
+            .open = try allocator.dupe(u8, open_str),
+            .close = try allocator.dupe(u8, close_str),
         } };
     };
 
@@ -452,68 +445,62 @@ fn parseSequenceElementV(raw: []const u8, position: usize, allocator: std.mem.Al
 /// Parses the optional [tokens] section into a KindVocabulary. Returns null when
 /// the section is absent. Each kind declaration must contain exactly one of
 /// char_class_run, delimited_span, or literal_set.
-fn parseTokensSection(root: anytype, allocator: std.mem.Allocator) GrammarError!?tokenizer.KindVocabulary {
-    const tokens_table = root.get("tokens") orelse return null;
+fn parseTokensSection(r: Reader, root: Node, allocator: std.mem.Allocator) GrammarError!?tokenizer.KindVocabulary {
+    const tokens_key: toml_access.Key = .{ .name = "tokens", .path = "tokens" };
+    const tokens_table = (try r.optTable(root, tokens_key)) orelse return null;
     var defs: std.ArrayList(tokenizer.KindDefinition) = .empty;
     var names: std.ArrayList([]const u8) = .empty;
-    var it = tokens_table.table.map.iterator();
+    var it = try r.tableEntries(tokens_table, tokens_key);
     while (it.next()) |entry| {
-        const name = try allocator.dupe(u8, entry.key_ptr.*);
+        const name = try allocator.dupe(u8, entry.key);
         if (name.len == 0) return error.EmptyKindName;
         for (names.items) |existing| {
             if (std.mem.eql(u8, existing, name)) return error.DuplicateKindName;
         }
         try names.append(allocator, name);
 
-        const val = entry.value_ptr.*;
-        if (val.* != .table) return error.InvalidTokenSection;
-        const t = val.table;
+        const t = try r.tableOf(entry.value, .{ .name = name, .invalid = error.InvalidTokenSection });
         var rec_count: usize = 0;
-        if (t.map.get("char_class_run")) |ccr| {
-            if (ccr.* != .table) return error.InvalidRecognizer;
-            const start_spec = ccr.table.map.get("start") orelse return error.InvalidRecognizer;
-            if (start_spec.* != .string) return error.InvalidRecognizer;
-            if (start_spec.string.len == 0) return error.InvalidCharSet;
-            const start = try compileCharSet(start_spec.string);
-            const cont = if (ccr.table.map.get("continue")) |csp| blk: {
-                if (csp.* != .string) return error.InvalidRecognizer;
-                break :blk try compileCharSet(csp.string);
-            } else start;
+        if (try r.optTable(t, .{ .name = "char_class_run", .invalid = error.InvalidRecognizer })) |ccr| {
+            const start_spec = try r.reqString(ccr, .{ .name = "start", .invalid = error.InvalidRecognizer }, error.InvalidRecognizer);
+            if (start_spec.len == 0) return error.InvalidCharSet;
+            const start = try compileCharSet(start_spec);
+            const cont = if (try r.optString(ccr, .{ .name = "continue", .invalid = error.InvalidRecognizer })) |csp|
+                try compileCharSet(csp)
+            else
+                start;
             try defs.append(allocator, .{
                 .name = name,
                 .recognizer = .{ .char_class_run = .{ .start = start, .cont = cont } },
             });
             rec_count += 1;
         }
-        if (t.map.get("delimited_span")) |ds| {
-            if (ds.* != .table) return error.InvalidRecognizer;
-            const open = ds.table.map.get("open") orelse return error.InvalidRecognizer;
-            const close = ds.table.map.get("close") orelse return error.InvalidRecognizer;
-            if (open.* != .string or close.* != .string) return error.InvalidRecognizer;
-            if (open.string.len == 0 or close.string.len == 0) return error.InvalidRecognizer;
+        if (try r.optTable(t, .{ .name = "delimited_span", .invalid = error.InvalidRecognizer })) |ds| {
+            const open = try r.reqString(ds, .{ .name = "open", .invalid = error.InvalidRecognizer }, error.InvalidRecognizer);
+            const close = try r.reqString(ds, .{ .name = "close", .invalid = error.InvalidRecognizer }, error.InvalidRecognizer);
+            if (open.len == 0 or close.len == 0) return error.InvalidRecognizer;
             var escape: ?u8 = null;
-            if (ds.table.map.get("escape")) |esc| {
-                if (esc.* != .string or esc.string.len != 1) return error.InvalidRecognizer;
-                escape = esc.string[0];
+            if (try r.optString(ds, .{ .name = "escape", .invalid = error.InvalidRecognizer })) |esc| {
+                if (esc.len != 1) return error.InvalidRecognizer;
+                escape = esc[0];
             }
             try defs.append(allocator, .{
                 .name = name,
                 .recognizer = .{ .delimited_span = .{
-                    .open = try allocator.dupe(u8, open.string),
-                    .close = try allocator.dupe(u8, close.string),
+                    .open = try allocator.dupe(u8, open),
+                    .close = try allocator.dupe(u8, close),
                     .escape = escape,
                 } },
             });
             rec_count += 1;
         }
-        if (t.map.get("literal_set")) |ls| {
-            if (ls.* != .array) return error.InvalidRecognizer;
-            if (ls.array.items.items.len == 0) return error.EmptyLiteralSet;
+        if (try r.optArray(t, .{ .name = "literal_set", .invalid = error.InvalidRecognizer })) |ls| {
+            if (ls.len() == 0) return error.EmptyLiteralSet;
             var lits: std.ArrayList([]const u8) = .empty;
-            for (ls.array.items.items) |item| {
-                if (item != .string) return error.InvalidRecognizer;
-                if (item.string.len == 0) return error.EmptyLiteralSet;
-                try lits.append(allocator, try allocator.dupe(u8, item.string));
+            for (0..ls.len()) |i| {
+                const lit = try r.stringOf(ls.at(i), .{ .name = "literal_set", .invalid = error.InvalidRecognizer });
+                if (lit.len == 0) return error.EmptyLiteralSet;
+                try lits.append(allocator, try allocator.dupe(u8, lit));
             }
             try defs.append(allocator, .{
                 .name = name,
@@ -531,29 +518,35 @@ fn parseTokensSection(root: anytype, allocator: std.mem.Allocator) GrammarError!
 /// The TOML Document's internal arena is freed before returning;
 /// all strings are duped into the caller's allocator.
 pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarError!Grammar {
-    var doc = toml.parse(allocator, source, .{}) catch return error.InvalidToml;
+    var diag: Diagnostic = .{};
+    return parseGrammarDiag(source, allocator, &diag);
+}
+
+/// Same as `parseGrammar`, and fills `diag` when the error is `WrongValueType`.
+pub fn parseGrammarDiag(source: []const u8, allocator: std.mem.Allocator, diag: *Diagnostic) GrammarError!Grammar {
+    const r = Reader{ .diag = diag };
+    var doc = try toml_access.parseDocument(allocator, source);
     defer doc.deinit();
 
-    const root = doc.root;
+    const root = Node.wrap(doc.root);
 
     // --- [language] (optional) ---
-    const lang_table = root.get("language");
+    const lang_table = try r.optTable(root, .{ .name = "language", .path = "language" });
     const language_name: ?[]const u8 = if (lang_table) |lt| blk: {
-        if (lt.get("name")) |name_val| {
-            break :blk try allocator.dupe(u8, name_val.string);
+        if (try r.optString(lt, .{ .name = "name", .path = "[language] name" })) |name_val| {
+            break :blk try allocator.dupe(u8, name_val);
         }
         break :blk null;
     } else null;
 
     const extensions = blk: {
         if (lang_table) |lt| {
-            if (lt.get("extensions")) |ext_val| {
-                if (ext_val.* != .array) return error.InvalidExtensionsList;
+            if (try r.optStringArray(lt, .{ .name = "extensions", .invalid = error.InvalidExtensionsList }, allocator)) |items| {
+                defer allocator.free(items);
                 var exts: std.ArrayList([]const u8) = .empty;
-                for (ext_val.array.items.items) |item| {
-                    if (item != .string) return error.InvalidExtensionsList;
-                    if (item.string.len == 0) return error.InvalidExtensionsList;
-                    try exts.append(allocator, try allocator.dupe(u8, item.string));
+                for (items) |item| {
+                    if (item.len == 0) return error.InvalidExtensionsList;
+                    try exts.append(allocator, try allocator.dupe(u8, item));
                 }
                 break :blk try exts.toOwnedSlice(allocator);
             }
@@ -564,42 +557,50 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
     var categories: std.ArrayList(KeywordCategory) = .empty;
     var all_keywords: std.ArrayList([]const u8) = .empty;
 
-    if (root.get("keywords")) |kw_table| {
-        var kw_it = kw_table.table.map.iterator();
+    const keywords_key: toml_access.Key = .{ .name = "keywords", .path = "keywords" };
+    if (try r.optTable(root, keywords_key)) |kw_table| {
+        var kw_it = try r.tableEntries(kw_table, keywords_key);
         while (kw_it.next()) |entry| {
+            var path_buf: [128]u8 = undefined;
+            const kw_path = std.fmt.bufPrint(&path_buf, "[keywords] {s}", .{entry.key}) catch "[keywords]";
+            const items = (try r.optStringArray(kw_table, .{ .name = entry.key, .path = kw_path }, allocator)).?;
+            defer allocator.free(items);
             var kws: std.ArrayList([]const u8) = .empty;
-            for (entry.value_ptr.*.array.items.items) |item| {
-                const kw = try allocator.dupe(u8, item.string);
+            for (items) |item| {
+                const kw = try allocator.dupe(u8, item);
                 try kws.append(allocator, kw);
                 try all_keywords.append(allocator, kw);
             }
             try categories.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.key_ptr.*),
+                .name = try allocator.dupe(u8, entry.key),
                 .keywords = try kws.toOwnedSlice(allocator),
             });
         }
     }
 
-    const tokens_vocab = try parseTokensSection(root, allocator);
+    const tokens_vocab = try parseTokensSection(r, root, allocator);
 
     // --- [[patterns]] (required) ---
-    const patterns_val = root.get("patterns") orelse return error.MissingPatterns;
+    const patterns_list = try r.reqTableArray(root, .{ .name = "patterns", .path = "patterns" }, error.MissingPatterns);
     var patterns: std.ArrayList(Pattern) = .empty;
 
-    for (patterns_val.array.items.items) |pattern_table| {
-        const type_name = if (pattern_table.get("type")) |t|
-            try allocator.dupe(u8, t.string)
+    for (0..patterns_list.len()) |pattern_idx| {
+        const pattern_table = patterns_list.at(pattern_idx);
+        const type_name = if (try r.optString(pattern_table, .{ .name = "type", .path = "patterns[].type" })) |t|
+            try allocator.dupe(u8, t)
         else
             return error.MissingPatterns;
 
-        const seq_val = pattern_table.get("sequence") orelse return error.EmptyPatternSequence;
-        if (seq_val.array.items.items.len == 0) return error.EmptyPatternSequence;
+        const seq_key: toml_access.Key = .{ .name = "sequence", .path = "patterns[].sequence" };
+        const seq_val = (try r.optArrayExpecting(pattern_table, seq_key, .string_array)) orelse return error.EmptyPatternSequence;
+        if (seq_val.len() == 0) return error.EmptyPatternSequence;
 
         var matchers: std.ArrayList(SequenceElement) = .empty;
         var captures: std.ArrayList(Capture) = .empty;
 
-        for (seq_val.array.items.items, 0..) |item, idx| {
-            const result = try parseSequenceElementV(item.string, idx, allocator, tokens_vocab);
+        for (0..seq_val.len()) |idx| {
+            const item = try r.stringItemOf(seq_val.at(idx), seq_key);
+            const result = try parseSequenceElementV(item, idx, allocator, tokens_vocab);
             try matchers.append(allocator, result.element);
             if (result.capture) |cap| {
                 try captures.append(allocator, cap);
@@ -608,26 +609,26 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
 
         // Phase B: [[patterns.capture]] tables — attach separator/suffix to a
         // field already declared bare in `sequence`.
-        if (pattern_table.get("capture")) |capture_val| {
-            for (capture_val.array.items.items) |ct| {
-                const field_val = ct.get("field") orelse return error.InvalidCaptureTable;
-                if (field_val.* != .string or field_val.string.len == 0) return error.InvalidCaptureTable;
-                const field = field_val.string;
+        if (try r.optTableArray(pattern_table, .{ .name = "capture", .path = "patterns[].capture" })) |capture_val| {
+            for (0..capture_val.len()) |ct_idx| {
+                const ct = capture_val.at(ct_idx);
+                const field = try r.reqString(ct, .{ .name = "field", .invalid = error.InvalidCaptureTable }, error.InvalidCaptureTable);
+                if (field.len == 0) return error.InvalidCaptureTable;
 
                 var found = false;
                 for (captures.items) |*cap| {
                     if (std.mem.eql(u8, cap.field_name, field)) {
                         if (cap.separator != null or cap.suffix_set != null) return error.DuplicateCaptureField;
-                        const sep_val = ct.get("separator");
-                        const suf_val = ct.get("suffix");
-                        if (sep_val == null and suf_val == null) return error.InvalidCaptureTable;
-                        if (sep_val) |s| {
-                            if (s.* != .string or s.string.len == 0 or s.string.len > 8) return error.InvalidCaptureTable;
-                            cap.separator = try allocator.dupe(u8, s.string);
+                        const sep_has = ct.has("separator");
+                        const suf_has = ct.has("suffix");
+                        if (!sep_has and !suf_has) return error.InvalidCaptureTable;
+                        if (try r.optString(ct, .{ .name = "separator", .invalid = error.InvalidCaptureTable })) |sep| {
+                            if (sep.len == 0 or sep.len > 8) return error.InvalidCaptureTable;
+                            cap.separator = try allocator.dupe(u8, sep);
                         }
-                        if (suf_val) |s| {
-                            if (s.* != .string or s.string.len == 0 or s.string.len > 8) return error.InvalidCaptureTable;
-                            cap.suffix_set = try allocator.dupe(u8, s.string);
+                        if (try r.optString(ct, .{ .name = "suffix", .invalid = error.InvalidCaptureTable })) |suf| {
+                            if (suf.len == 0 or suf.len > 8) return error.InvalidCaptureTable;
+                            cap.suffix_set = try allocator.dupe(u8, suf);
                         }
                         found = true;
                         break;
@@ -639,12 +640,12 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
 
         // Phase C: [[patterns.count]] tables.
         var count_specs: std.ArrayList(CountSpec) = .empty;
-        if (pattern_table.get("count")) |count_val| {
-            if (count_val.array.items.items.len > 16) return error.TooManyCountTables;
-            for (count_val.array.items.items) |ct| {
-                const field_val = ct.get("field") orelse return error.InvalidCountTable;
-                if (field_val.* != .string or field_val.string.len == 0) return error.InvalidCountTable;
-                const field = field_val.string;
+        if (try r.optTableArray(pattern_table, .{ .name = "count", .path = "patterns[].count" })) |count_val| {
+            if (count_val.len() > 16) return error.TooManyCountTables;
+            for (0..count_val.len()) |ct_idx| {
+                const ct = count_val.at(ct_idx);
+                const field = try r.reqString(ct, .{ .name = "field", .invalid = error.InvalidCountTable }, error.InvalidCountTable);
+                if (field.len == 0) return error.InvalidCountTable;
 
                 for (captures.items) |cap| {
                     if (std.mem.eql(u8, cap.field_name, field)) return error.DuplicateCountField;
@@ -656,17 +657,17 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
                 var open: []const u8 = "";
                 var close: []const u8 = "";
                 var separator: []const u8 = "";
-                if (ct.get("open")) |v| {
-                    if (v.* != .string or v.string.len == 0 or v.string.len > 8) return error.InvalidCountTable;
-                    open = try allocator.dupe(u8, v.string);
+                if (try r.optString(ct, .{ .name = "open", .invalid = error.InvalidCountTable })) |v| {
+                    if (v.len == 0 or v.len > 8) return error.InvalidCountTable;
+                    open = try allocator.dupe(u8, v);
                 } else return error.InvalidCountTable;
-                if (ct.get("close")) |v| {
-                    if (v.* != .string or v.string.len == 0 or v.string.len > 8) return error.InvalidCountTable;
-                    close = try allocator.dupe(u8, v.string);
+                if (try r.optString(ct, .{ .name = "close", .invalid = error.InvalidCountTable })) |v| {
+                    if (v.len == 0 or v.len > 8) return error.InvalidCountTable;
+                    close = try allocator.dupe(u8, v);
                 } else return error.InvalidCountTable;
-                if (ct.get("separator")) |v| {
-                    if (v.* != .string or v.string.len == 0 or v.string.len > 8) return error.InvalidCountTable;
-                    separator = try allocator.dupe(u8, v.string);
+                if (try r.optString(ct, .{ .name = "separator", .invalid = error.InvalidCountTable })) |v| {
+                    if (v.len == 0 or v.len > 8) return error.InvalidCountTable;
+                    separator = try allocator.dupe(u8, v);
                 } else return error.InvalidCountTable;
 
                 try count_specs.append(allocator, .{
@@ -680,7 +681,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
 
         // Phase D: [[patterns.extent]] tables (validated after captures and
         // count specs exist so field collisions are caught deterministically).
-        const extent_spec = try parseExtentSpec(pattern_table, captures.items, count_specs.items, allocator);
+        const extent_spec = try parseExtentSpec(r, pattern_table, captures.items, count_specs.items, allocator);
 
         try patterns.append(allocator, .{
             .type_name = type_name,
@@ -689,8 +690,8 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
             .count_specs = try count_specs.toOwnedSlice(allocator),
             .extent = extent_spec,
             .position = blk: {
-                if (pattern_table.get("position")) |pos_val| {
-                    if (std.mem.eql(u8, pos_val.string, "start")) {
+                if (try r.optString(pattern_table, .{ .name = "position", .path = "patterns[].position", .invalid = error.InvalidPositionValue })) |pos_val| {
+                    if (std.mem.eql(u8, pos_val, "start")) {
                         break :blk .start;
                     } else {
                         return error.InvalidPositionValue;
@@ -699,8 +700,7 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
                 break :blk null;
             },
             .prior = blk: {
-                if (pattern_table.get("prior")) |v| {
-                    const val = tomlToF32(v) orelse return error.InvalidPriorValue;
+                if (try r.optNumber(pattern_table, .{ .name = "prior", .invalid = error.InvalidPriorValue })) |val| {
                     if (val <= 0.0 or val > 2.0) return error.InvalidPriorValue;
                     break :blk val;
                 }
@@ -708,26 +708,27 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
             },
             .constraints = blk: {
                 // Reject deprecated fields
-                if (pattern_table.get("exclude") != null) return error.DeprecatedField;
-                if (pattern_table.get("not_preceded_by") != null) return error.DeprecatedField;
+                if (pattern_table.has("exclude")) return error.DeprecatedField;
+                if (pattern_table.has("not_preceded_by")) return error.DeprecatedField;
 
-                if (pattern_table.get("constraints")) |constraints_val| {
+                if (try r.optTableArray(pattern_table, .{ .name = "constraints", .path = "patterns[].constraints" })) |constraints_val| {
                     var constraint_list: std.ArrayList(Constraint) = .empty;
-                    for (constraints_val.array.items.items) |ct| {
+                    for (0..constraints_val.len()) |ct_idx| {
+                        const ct = constraints_val.at(ct_idx);
                         // Parse type
-                        const type_str = if (ct.get("type")) |t| t.string else return error.InvalidConstraintType;
+                        const type_str = try r.reqString(ct, .{ .name = "type", .invalid = error.InvalidConstraintType }, error.InvalidConstraintType);
                         const constraint_type: ConstraintType = if (std.mem.eql(u8, type_str, "not"))
                             .not
                         else
                             return error.InvalidConstraintType;
 
                         // Parse depth
-                        const depth_val = ct.get("depth") orelse return error.InvalidConstraintDepth;
-                        const depth: u8 = @intCast(depth_val.integer);
+                        const depth_val = (try r.optInt(ct, .{ .name = "depth", .invalid = error.InvalidConstraintDepth }, 0, 255)) orelse return error.InvalidConstraintDepth;
+                        const depth: u8 = std.math.cast(u8, depth_val) orelse return error.InvalidConstraintDepth;
 
                         // Parse field (optional)
-                        const field: ?[]const u8 = if (ct.get("field")) |f|
-                            try allocator.dupe(u8, f.string)
+                        const field: ?[]const u8 = if (try r.optString(ct, .{ .name = "field", .invalid = error.InvalidConstraintField })) |f|
+                            try allocator.dupe(u8, f)
                         else
                             null;
 
@@ -736,11 +737,13 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
                         if (depth > 0 and field != null) return error.InvalidConstraintField;
 
                         // Parse values
-                        const values_val = ct.get("values") orelse return error.InvalidConstraintValues;
-                        if (values_val.array.items.items.len == 0) return error.InvalidConstraintValues;
+                        const values_key: toml_access.Key = .{ .name = "values", .invalid = error.InvalidConstraintValues };
+                        const values_val = (try r.optArray(ct, values_key)) orelse return error.InvalidConstraintValues;
+                        if (values_val.len() == 0) return error.InvalidConstraintValues;
                         var vals: std.ArrayList([]const u8) = .empty;
-                        for (values_val.array.items.items) |item| {
-                            try vals.append(allocator, try allocator.dupe(u8, item.string));
+                        for (0..values_val.len()) |vi| {
+                            const item = try r.stringOf(values_val.at(vi), values_key);
+                            try vals.append(allocator, try allocator.dupe(u8, item));
                         }
 
                         try constraint_list.append(allocator, .{
@@ -759,19 +762,19 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
 
     // --- [blocks] (optional) ---
     var blocks = BlockConfig{};
-    if (root.get("blocks")) |blocks_table| {
-        if (blocks_table.get("open")) |v| {
-            if (v.string.len > 0) blocks.open = try allocator.dupe(u8, v.string);
+    if (try r.optTable(root, .{ .name = "blocks", .path = "blocks" })) |blocks_table| {
+        if (try r.optString(blocks_table, .{ .name = "open", .path = "[blocks] open" })) |v| {
+            if (v.len > 0) blocks.open = try allocator.dupe(u8, v);
         }
-        if (blocks_table.get("close")) |v| {
-            if (v.string.len > 0) blocks.close = try allocator.dupe(u8, v.string);
+        if (try r.optString(blocks_table, .{ .name = "close", .path = "[blocks] close" })) |v| {
+            if (v.len > 0) blocks.close = try allocator.dupe(u8, v);
         }
-        if (blocks_table.get("indentation")) |v| blocks.indentation = v.bool;
+        if (try r.optBool(blocks_table, .{ .name = "indentation", .path = "[blocks] indentation" })) |v| blocks.indentation = v;
     }
 
     // --- [comments] (optional) ---
     var comments = CommentConfig{};
-    if (root.get("comments")) |comments_table| {
+    if (try r.optTable(root, .{ .name = "comments", .path = "comments" })) |comments_node| {
         // Explicit [comments] section exists, so we start with empty config
         // (overrides defaults)
         comments = .{
@@ -781,14 +784,13 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         };
 
         // Parse line comment prefixes
-        if (comments_table.get("line")) |line_val| {
-            if (line_val.* != .array) return error.InvalidCommentLineType;
-            if (line_val.array.items.items.len > 16) return error.TooManyLinePrefixes;
+        const line_key: toml_access.Key = .{ .name = "line", .invalid = error.InvalidCommentLineType };
+        if (try r.optArray(comments_node, line_key)) |line_val| {
+            if (line_val.len() > 16) return error.TooManyLinePrefixes;
 
             var line_prefixes: std.ArrayList([]const u8) = .empty;
-            for (line_val.array.items.items) |item| {
-                if (item != .string) return error.InvalidCommentLineType;
-                const prefix = item.string;
+            for (0..line_val.len()) |i| {
+                const prefix = try r.stringOf(line_val.at(i), line_key);
                 if (prefix.len == 0) continue; // Skip empty entries
                 if (prefix.len > 8) return error.CommentPrefixTooLong;
                 try line_prefixes.append(allocator, try allocator.dupe(u8, prefix));
@@ -798,21 +800,15 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         // else: no line key -> line_prefixes stays empty (already set above)
 
         // Parse block comment delimiters
-        const has_open = comments_table.get("block_open") != null;
-        const has_close = comments_table.get("block_close") != null;
+        const has_open = comments_node.has("block_open");
+        const has_close = comments_node.has("block_close");
 
         if (has_open and !has_close) return error.UnpairedBlockDelimiter;
         if (!has_open and has_close) return error.UnpairedBlockDelimiter;
 
         if (has_open and has_close) {
-            const open_val = comments_table.get("block_open").?;
-            const close_val = comments_table.get("block_close").?;
-
-            if (open_val.* != .string) return error.InvalidCommentBlockType;
-            if (close_val.* != .string) return error.InvalidCommentBlockType;
-
-            const open = open_val.string;
-            const close = close_val.string;
+            const open = try r.reqString(comments_node, .{ .name = "block_open", .invalid = error.InvalidCommentBlockType }, error.InvalidCommentBlockType);
+            const close = try r.reqString(comments_node, .{ .name = "block_close", .invalid = error.InvalidCommentBlockType }, error.InvalidCommentBlockType);
 
             if (open.len == 0 and close.len == 0) {
                 // Both empty strings -> treat as absent (already null)
@@ -840,29 +836,24 @@ pub fn parseGrammar(source: []const u8, allocator: std.mem.Allocator) GrammarErr
         .blocks = blocks,
         .weights = blk: {
             var w = EvidenceWeights{};
-            if (root.get("weights")) |wt| {
-                if (wt.get("keyword")) |v| {
-                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+            if (try r.optTable(root, .{ .name = "weights", .path = "weights" })) |wn| {
+                if (try r.optNumber(wn, .{ .name = "keyword", .invalid = error.InvalidWeightValue })) |val| {
                     if (val < 0.0) return error.InvalidWeightValue;
                     w.keyword = val;
                 }
-                if (wt.get("identifier")) |v| {
-                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                if (try r.optNumber(wn, .{ .name = "identifier", .invalid = error.InvalidWeightValue })) |val| {
                     if (val < 0.0) return error.InvalidWeightValue;
                     w.identifier = val;
                 }
-                if (wt.get("symbol")) |v| {
-                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                if (try r.optNumber(wn, .{ .name = "symbol", .invalid = error.InvalidWeightValue })) |val| {
                     if (val < 0.0) return error.InvalidWeightValue;
                     w.symbol = val;
                 }
-                if (wt.get("block")) |v| {
-                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                if (try r.optNumber(wn, .{ .name = "block", .invalid = error.InvalidWeightValue })) |val| {
                     if (val < 0.0) return error.InvalidWeightValue;
                     w.block = val;
                 }
-                if (wt.get("relaxed_keyword")) |v| {
-                    const val = tomlToF32(v) orelse return error.InvalidWeightValue;
+                if (try r.optNumber(wn, .{ .name = "relaxed_keyword", .invalid = error.InvalidWeightValue })) |val| {
                     if (val < 0.0) return error.InvalidWeightValue;
                     w.relaxed_keyword = val;
                 }
@@ -5455,4 +5446,377 @@ test "property: extent tables round-trip unchanged" {
             try testing.expectEqualStrings(a.mode.balanced.close, b.mode.balanced.close);
         }
     }.prop, .{ .num_runs = 100 });
+}
+// Spec loader-typed-accessors, task 1 (Property 2: Preservation). These pin the
+// loader's behavior on valid grammars and on the already-guarded error sites as
+// it was before the typed-accessor work; they must pass unchanged afterwards.
+const char_pat = "[[patterns]]\ntype = \"t\"\nsequence = [\"$n:IDENTIFIER\"]\n";
+const plain_pat = "[[patterns]]\ntype = \"t\"\nsequence = [\"(\"]\n";
+fn expectLoadError(expected: GrammarError, source: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(expected, parseGrammar(source, arena.allocator()));
+}
+fn expectLoadErrorWith(expected: GrammarError, head: []const u8, pattern: []const u8, tail: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source = try std.fmt.allocPrint(arena.allocator(), "{s}{s}{s}", .{ head, pattern, tail });
+    try testing.expectError(expected, parseGrammar(source, arena.allocator()));
+}
+test "characterize: omitted optional keys load as before" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = try parseGrammar(plain_pat, a);
+    try testing.expect(g.language_name == null);
+    try testing.expectEqual(@as(usize, 0), g.extensions.len);
+    try testing.expectEqual(@as(usize, 0), g.keyword_categories.len);
+    try testing.expectEqual(@as(usize, 0), g.keyword_table.len);
+    try testing.expect(g.blocks.open == null and g.blocks.close == null and !g.blocks.indentation);
+    try testing.expect(g.tokens == null);
+    try testing.expectEqual((EvidenceWeights{}).keyword, g.weights.keyword);
+    try testing.expectEqual((EvidenceWeights{}).relaxed_keyword, g.weights.relaxed_keyword);
+    try testing.expectEqual(@as(usize, 2), g.comments.line_prefixes.len);
+    try testing.expectEqualStrings("/*", g.comments.block_open.?);
+    const p = g.patterns[0];
+    try testing.expect(p.position == null and p.extent == null);
+    try testing.expectEqual(@as(f32, 1.0), p.prior);
+    try testing.expectEqual(@as(usize, 0), p.constraints.len);
+    try testing.expectEqual(@as(usize, 0), p.captures.len);
+    try testing.expectEqual(@as(usize, 0), p.count_specs.len);
+}
+test "characterize: omitted keys inside present sections load as before" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // [language] without name or extensions.
+    const g1 = try parseGrammar("[language]\n" ++ plain_pat, a);
+    try testing.expect(g1.language_name == null);
+    try testing.expectEqual(@as(usize, 0), g1.extensions.len);
+    // [blocks] with only open.
+    const g2 = try parseGrammar("[blocks]\nopen = \"{\"\n" ++ plain_pat, a);
+    try testing.expectEqualStrings("{", g2.blocks.open.?);
+    try testing.expect(g2.blocks.close == null and !g2.blocks.indentation);
+    // Empty [comments] overrides the default with no recognition.
+    const g3 = try parseGrammar("[comments]\n" ++ plain_pat, a);
+    try testing.expectEqual(@as(usize, 0), g3.comments.line_prefixes.len);
+    try testing.expect(g3.comments.block_open == null and g3.comments.block_close == null);
+    // Partial [weights] keeps defaults for the omitted keys.
+    const g4 = try parseGrammar("[weights]\nkeyword = 0.25\n" ++ plain_pat, a);
+    try testing.expectEqual(@as(f32, 0.25), g4.weights.keyword);
+    try testing.expectEqual((EvidenceWeights{}).identifier, g4.weights.identifier);
+    // Integer weights and priors load as numbers.
+    const g5 = try parseGrammar("[weights]\nsymbol = 1\n\n[[patterns]]\ntype = \"t\"\nsequence = [\"(\"]\nprior = 2\n", a);
+    try testing.expectEqual(@as(f32, 1.0), g5.weights.symbol);
+    try testing.expectEqual(@as(f32, 2.0), g5.patterns[0].prior);
+    // Constraint without field at depth > 0, pattern with position.
+    const g6 = try parseGrammar(plain_pat ++ "position = \"start\"\n\n[[patterns.constraints]]\ntype = \"not\"\ndepth = 1\nvalues = [\"x\"]\n", a);
+    try testing.expect(g6.patterns[0].position.? == .start);
+    try testing.expect(g6.patterns[0].constraints[0].field == null);
+    try testing.expectEqual(@as(u8, 1), g6.patterns[0].constraints[0].depth);
+    // Extent terminator without at_column.
+    const g7 = try parseGrammar(plain_pat ++ "\n[[patterns.extent]]\nfield = \"e\"\nterminator = \".\"\n", a);
+    try testing.expect(g7.patterns[0].extent.?.mode.terminator.at_column == null);
+    // Tokens: delimited_span without escape, char_class_run without continue.
+    const g8 = try parseGrammar("[tokens]\ns = { delimited_span = { open = \"'\", close = \"'\" } }\nw = { char_class_run = { start = \"a-z\" } }\n" ++ plain_pat, a);
+    try testing.expectEqual(@as(usize, 2), g8.tokens.?.kinds.len);
+}
+test "characterize: guarded rows keep their variant (extensions, comments, weights, prior)" {
+    // Row 3: [language] extensions.
+    try expectLoadErrorWith(error.InvalidExtensionsList, "[language]\nextensions = \"erl\"\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidExtensionsList, "[language]\nextensions = [1]\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidExtensionsList, "[language]\nextensions = [\"\"]\n\n", plain_pat, "");
+    // Row 30: [comments] line.
+    try expectLoadErrorWith(error.InvalidCommentLineType, "[comments]\nline = \"//\"\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidCommentLineType, "[comments]\nline = [1]\n\n", plain_pat, "");
+    // Row 32: [comments] block_open / block_close.
+    try expectLoadErrorWith(error.InvalidCommentBlockType, "[comments]\nblock_open = 1\nblock_close = \"*/\"\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidCommentBlockType, "[comments]\nblock_open = \"/*\"\nblock_close = 1\n\n", plain_pat, "");
+    // Row 34: [weights].
+    try expectLoadErrorWith(error.InvalidWeightValue, "[weights]\nkeyword = \"x\"\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidWeightValue, "[weights]\nidentifier = true\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidWeightValue, "[weights]\nsymbol = -1\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidWeightValue, "[weights]\nblock = -0.5\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidWeightValue, "[weights]\nrelaxed_keyword = [1]\n\n", plain_pat, "");
+    // Row 21: prior.
+    try expectLoadErrorWith(error.InvalidPriorValue, "", plain_pat, "prior = \"x\"\n");
+    try expectLoadErrorWith(error.InvalidPriorValue, "", plain_pat, "prior = 0\n");
+    try expectLoadErrorWith(error.InvalidPriorValue, "", plain_pat, "prior = 2.5\n");
+    try expectLoadErrorWith(error.InvalidPriorValue, "", plain_pat, "prior = true\n");
+}
+test "characterize: guarded rows keep their variant (tokens)" {
+    // Row 8: [tokens] entries and recognizer fields.
+    try expectLoadErrorWith(error.InvalidTokenSection, "[tokens]\na = 1\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\nchar_class_run = 1\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\nchar_class_run = { continue = \"a\" }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\nchar_class_run = { start = 1 }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidCharSet, "[tokens.a]\nchar_class_run = { start = \"\" }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\nchar_class_run = { start = \"a\", continue = 1 }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\ndelimited_span = 1\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\ndelimited_span = { open = \"'\" }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\ndelimited_span = { open = 1, close = \"'\" }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\ndelimited_span = { open = \"\", close = \"'\" }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\ndelimited_span = { open = \"'\", close = \"'\", escape = \"ab\" }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\ndelimited_span = { open = \"'\", close = \"'\", escape = 1 }\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\nliteral_set = \"x\"\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.EmptyLiteralSet, "[tokens.a]\nliteral_set = []\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.EmptyLiteralSet, "[tokens.a]\nliteral_set = [\"\"]\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\nliteral_set = [1]\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\n\n", plain_pat, "");
+    try expectLoadErrorWith(error.InvalidRecognizer, "[tokens.a]\nliteral_set = [\"x\"]\nchar_class_run = { start = \"a\" }\n\n", plain_pat, "");
+}
+test "characterize: guarded rows keep their variant (capture, count, extent)" {
+    // Row 15: [[patterns.capture]].
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nfield = 1\nseparator = \".\"\n");
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nfield = \"\"\nseparator = \".\"\n");
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nseparator = \".\"\n");
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nfield = \"n\"\n");
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nfield = \"n\"\nseparator = 1\n");
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nfield = \"n\"\nseparator = \"\"\n");
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nfield = \"n\"\nsuffix = \"123456789\"\n");
+    try expectLoadErrorWith(error.InvalidCaptureTable, "", char_pat, "\n[[patterns.capture]]\nfield = \"n\"\nsuffix = 1\n");
+    try expectLoadErrorWith(error.UnknownCaptureField, "", char_pat, "\n[[patterns.capture]]\nfield = \"zz\"\nsuffix = \"!\"\n");
+    // Row 17: [[patterns.count]].
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nfield = 1\nopen = \"(\"\nclose = \")\"\nseparator = \",\"\n");
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nopen = \"(\"\nclose = \")\"\nseparator = \",\"\n");
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nfield = \"c\"\nopen = 1\nclose = \")\"\nseparator = \",\"\n");
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nfield = \"c\"\nclose = \")\"\nseparator = \",\"\n");
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nfield = \"c\"\nopen = \"(\"\nclose = \"\"\nseparator = \",\"\n");
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nfield = \"c\"\nopen = \"(\"\nclose = \")\"\nseparator = \"123456789\"\n");
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nfield = \"c\"\nopen = \"(\"\nclose = \")\"\nseparator = 1\n");
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "\n[[patterns.count]]\nfield = \"c\"\nopen = \"(\"\nclose = \")\"\n");
+    // Row 19: [[patterns.extent]].
+    try expectLoadErrorWith(error.InvalidExtentField, "", plain_pat, "\n[[patterns.extent]]\nfield = 1\nopen = \"{\"\nclose = \"}\"\n");
+    try expectLoadErrorWith(error.InvalidExtentField, "", plain_pat, "\n[[patterns.extent]]\nopen = \"{\"\nclose = \"}\"\n");
+    try expectLoadErrorWith(error.InvalidExtentDelimiter, "", plain_pat, "\n[[patterns.extent]]\nfield = \"e\"\nterminator = 1\n");
+    try expectLoadErrorWith(error.InvalidExtentDelimiter, "", plain_pat, "\n[[patterns.extent]]\nfield = \"e\"\nterminator = \"\"\n");
+    try expectLoadErrorWith(error.InvalidExtentDelimiter, "", plain_pat, "\n[[patterns.extent]]\nfield = \"e\"\nopen = 1\nclose = \"}\"\n");
+    try expectLoadErrorWith(error.InvalidExtentDelimiter, "", plain_pat, "\n[[patterns.extent]]\nfield = \"e\"\nopen = \"{\"\nclose = 1\n");
+    try expectLoadErrorWith(error.InvalidExtentAtColumn, "", plain_pat, "\n[[patterns.extent]]\nfield = \"e\"\nterminator = \".\"\nat_column = \"0\"\n");
+    try expectLoadErrorWith(error.InvalidExtentAtColumn, "", plain_pat, "\n[[patterns.extent]]\nfield = \"e\"\nterminator = \".\"\nat_column = -1\n");
+    try expectLoadErrorWith(error.InvalidExtentAtColumn, "", plain_pat, "\n[[patterns.extent]]\nfield = \"e\"\nterminator = \".\"\nat_column = 65536\n");
+    // Boundary values stay valid.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g0 = try parseGrammar(plain_pat ++ "\n[[patterns.extent]]\nfield = \"e\"\nterminator = \".\"\nat_column = 0\n", a);
+    try testing.expectEqual(@as(?u16, 0), g0.patterns[0].extent.?.mode.terminator.at_column);
+    const g1 = try parseGrammar(plain_pat ++ "\n[[patterns.extent]]\nfield = \"e\"\nterminator = \".\"\nat_column = 65535\n", a);
+    try testing.expectEqual(@as(?u16, 65535), g1.patterns[0].extent.?.mode.terminator.at_column);
+}
+test "characterize: non-type errors do not move" {
+    try expectLoadError(error.MissingPatterns, "[language]\nname = \"x\"\n");
+    try expectLoadError(error.InvalidToml, "[[patterns\n");
+    try expectLoadError(error.EmptyPatternSequence, "[[patterns]]\ntype = \"t\"\nsequence = []\n");
+    try expectLoadErrorWith(error.DeprecatedField, "", plain_pat, "exclude = [\"x\"]\n");
+    try expectLoadErrorWith(error.DeprecatedField, "", plain_pat, "not_preceded_by = [\"x\"]\n");
+    try expectLoadErrorWith(error.InvalidPositionValue, "", plain_pat, "position = \"end\"\n");
+    try expectLoadErrorWith(error.InvalidConstraintType, "", plain_pat, "\n[[patterns.constraints]]\ntype = \"only\"\ndepth = 1\nvalues = [\"x\"]\n");
+    try expectLoadErrorWith(error.InvalidConstraintType, "", plain_pat, "\n[[patterns.constraints]]\ndepth = 1\nvalues = [\"x\"]\n");
+    try expectLoadErrorWith(error.InvalidConstraintDepth, "", plain_pat, "\n[[patterns.constraints]]\ntype = \"not\"\nvalues = [\"x\"]\n");
+    try expectLoadErrorWith(error.InvalidConstraintDepth, "", plain_pat, "\n[[patterns.constraints]]\ntype = \"not\"\ndepth = 0\nvalues = [\"x\"]\n");
+    try expectLoadErrorWith(error.InvalidConstraintField, "", plain_pat, "\n[[patterns.constraints]]\ntype = \"not\"\ndepth = 1\nfield = \"n\"\nvalues = [\"x\"]\n");
+    try expectLoadErrorWith(error.InvalidConstraintValues, "", plain_pat, "\n[[patterns.constraints]]\ntype = \"not\"\ndepth = 1\n");
+    try expectLoadErrorWith(error.InvalidConstraintValues, "", plain_pat, "\n[[patterns.constraints]]\ntype = \"not\"\ndepth = 1\nvalues = []\n");
+    try expectLoadError(error.InvalidCaptureFormat, "[[patterns]]\ntype = \"t\"\nsequence = [\"$n\"]\n");
+    try expectLoadError(error.ParenthesizedCaptureParam, "[[patterns]]\ntype = \"t\"\nsequence = [\"$n:IDENTIFIER(x)\"]\n");
+    try expectLoadError(error.UnpairedBlockDelimiter, "[comments]\nblock_open = \"/*\"\n" ++ plain_pat);
+    try expectLoadError(error.CommentPrefixTooLong, "[comments]\nline = [\"123456789\"]\n" ++ plain_pat);
+}
+test "characterize: a guarded fault is reported before a later unchecked fault" {
+    // Language extensions (guarded) come before keywords (unchecked).
+    try expectLoadError(error.InvalidExtensionsList, "keywords = 1\n\n[language]\nextensions = 1\n\n" ++ plain_pat);
+    // Within one pattern: prior (guarded) is read before constraints (unchecked).
+    try expectLoadErrorWith(error.InvalidPriorValue, "", plain_pat, "prior = \"x\"\nconstraints = 1\n");
+    // Position (named variant) is read before prior and constraints.
+    try expectLoadErrorWith(error.InvalidPositionValue, "", plain_pat, "position = \"end\"\nprior = \"x\"\nconstraints = 1\n");
+    // Count table (guarded) is read before extent (unchecked).
+    try expectLoadErrorWith(error.InvalidCountTable, "", plain_pat, "extent = 1\n\n[[patterns.count]]\nfield = 1\n");
+}
+// --- loader-typed-accessors, task 6: in-process property tests (after the fix) ---
+// One row per audited key. `pre` precedes the `key = value` line, `post` follows
+// it, so every row builds a complete grammar. `path` is the diagnostic path of
+// the key when a wrong value is reported as `WrongValueType`; rows that keep an
+// existing variant leave it empty. `valid` is a correctly typed, in-range value.
+const WrongExpected = enum { string, string_array, table, table_array, boolean, integer, number };
+const TypedSite = struct {
+    pre: []const u8,
+    key: []const u8,
+    post: []const u8,
+    expected: WrongExpected,
+    path: []const u8,
+    valid: []const u8,
+};
+const ext_pre = plain_pat ++ "[[patterns.extent]]\nfield = \"b\"\nterminator = \".\"\n";
+const typed_sites = [_]TypedSite{
+    .{ .pre = "", .key = "language", .post = plain_pat, .expected = .table, .path = "language", .valid = "{ name = \"x\" }" },
+    .{ .pre = "[language]\n", .key = "name", .post = plain_pat, .expected = .string, .path = "[language] name", .valid = "\"x\"" },
+    .{ .pre = "", .key = "keywords", .post = plain_pat, .expected = .table, .path = "keywords", .valid = "{ function = [\"fn\"] }" },
+    .{ .pre = "[keywords]\n", .key = "function", .post = plain_pat, .expected = .string_array, .path = "[keywords] function", .valid = "[\"fn\"]" },
+    .{ .pre = "", .key = "tokens", .post = plain_pat, .expected = .table, .path = "tokens", .valid = "{ ident = { char_class_run = { start = \"a-z\" } } }" },
+    .{ .pre = "", .key = "blocks", .post = plain_pat, .expected = .table, .path = "blocks", .valid = "{ open = \"{\", close = \"}\" }" },
+    .{ .pre = "[blocks]\n", .key = "open", .post = plain_pat, .expected = .string, .path = "[blocks] open", .valid = "\"{\"" },
+    .{ .pre = "[blocks]\n", .key = "indentation", .post = plain_pat, .expected = .boolean, .path = "[blocks] indentation", .valid = "true" },
+    .{ .pre = "", .key = "comments", .post = plain_pat, .expected = .table, .path = "comments", .valid = "{ line = [\"#\"] }" },
+    .{ .pre = "", .key = "weights", .post = plain_pat, .expected = .table, .path = "weights", .valid = "{ keyword = 0.5 }" },
+    .{ .pre = "[weights]\n", .key = "keyword", .post = plain_pat, .expected = .number, .path = "", .valid = "0.5" },
+    .{ .pre = "[[patterns]]\n", .key = "type", .post = "sequence = [\"(\"]\n", .expected = .string, .path = "patterns[].type", .valid = "\"t\"" },
+    .{ .pre = "[[patterns]]\ntype = \"t\"\n", .key = "sequence", .post = "", .expected = .string_array, .path = "patterns[].sequence", .valid = "[\"(\"]" },
+    .{ .pre = plain_pat, .key = "capture", .post = "", .expected = .table_array, .path = "patterns[].capture", .valid = "[]" },
+    .{ .pre = plain_pat, .key = "count", .post = "", .expected = .table_array, .path = "patterns[].count", .valid = "[{ field = \"n\", open = \"(\", close = \")\", separator = \",\" }]" },
+    .{ .pre = plain_pat, .key = "extent", .post = "", .expected = .table_array, .path = "patterns[].extent", .valid = "[{ field = \"b\", terminator = \".\" }]" },
+    .{ .pre = plain_pat, .key = "constraints", .post = "", .expected = .table_array, .path = "patterns[].constraints", .valid = "[{ type = \"not\", depth = 1, values = [\"x\"] }]" },
+    .{ .pre = plain_pat, .key = "position", .post = "", .expected = .string, .path = "", .valid = "\"start\"" },
+    .{ .pre = plain_pat, .key = "prior", .post = "", .expected = .number, .path = "", .valid = "1.0" },
+    .{ .pre = plain_pat ++ "[[patterns.constraints]]\ntype = \"not\"\nvalues = [\"x\"]\n", .key = "depth", .post = "", .expected = .integer, .path = "", .valid = "1" },
+    .{ .pre = plain_pat ++ "[[patterns.constraints]]\ntype = \"not\"\ndepth = 0\nvalues = [\"x\"]\n", .key = "field", .post = "", .expected = .string, .path = "", .valid = "\"x\"" },
+    .{ .pre = plain_pat ++ "[[patterns.constraints]]\ntype = \"not\"\ndepth = 1\n", .key = "values", .post = "", .expected = .string_array, .path = "", .valid = "[\"x\"]" },
+    .{ .pre = plain_pat ++ "[[patterns.constraints]]\ndepth = 1\nvalues = [\"x\"]\n", .key = "type", .post = "", .expected = .string, .path = "", .valid = "\"not\"" },
+    .{ .pre = ext_pre, .key = "at_column", .post = "", .expected = .integer, .path = "", .valid = "5" },
+};
+const WrongKind = enum { int, negative, too_large, float, boolean, string, array, table };
+const wrong_kind_text = [_][]const u8{ "1", "-1", "99999999999", "1.5", "true", "\"s\"", "[1]", "{ a = 1 }" };
+
+/// True when `kind` is a different TOML tag than the site expects, or an
+/// integer outside the site's range. Valid or unjudgeable values return false.
+fn isWrongForSite(site: TypedSite, kind: WrongKind) bool {
+    return switch (site.expected) {
+        .string => kind != .string,
+        .string_array, .table_array => true,
+        .table => kind != .table,
+        .boolean => kind != .boolean,
+        .integer => kind != .int,
+        // Both TOML numbers load as a number; only the other tags are wrong.
+        .number => switch (kind) {
+            .boolean, .string, .array, .table => true,
+            else => false,
+        },
+    };
+}
+fn buildSiteGrammar(alloc: std.mem.Allocator, site: TypedSite, value: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(alloc, "{s}{s} = {s}\n{s}", .{ site.pre, site.key, value, site.post });
+}
+
+// Feature: loader-typed-accessors, Property 1: a wrong type or range is a grammar error
+// **Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.9**
+test "property: wrong value at any audited site is a grammar error" {
+    const pair_gen = comptime gen.tuple2(u8, u8, gen.intRange(u8, 0, typed_sites.len - 1), gen.intRange(u8, 0, wrong_kind_text.len - 1));
+    try minish.check(testing.allocator, pair_gen, struct {
+        fn prop(vals: struct { u8, u8 }) !void {
+            const site = typed_sites[vals[0]];
+            const kind: WrongKind = @enumFromInt(vals[1]);
+            if (!isWrongForSite(site, kind)) return;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try buildSiteGrammar(alloc, site, wrong_kind_text[vals[1]]);
+            var diag: Diagnostic = .{};
+            if (parseGrammarDiag(source, alloc, &diag)) |_| {
+                std.debug.print("accepted a wrong value: {s}\n", .{source});
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.WrongValueType) {
+                    testing.expectEqualStrings(site.path, diag.path()) catch |e| {
+                        std.debug.print("grammar: {s}\n", .{source});
+                        return e;
+                    };
+                }
+            }
+        }
+    }.prop, .{ .num_runs = 600 });
+}
+
+// Feature: loader-typed-accessors, Property 2: valid values still load
+// **Validates: Requirements 3.1, 3.2**
+test "property: a correctly typed value loads at every audited site" {
+    const site_gen = comptime gen.intRange(u8, 0, typed_sites.len - 1);
+    try minish.check(testing.allocator, site_gen, struct {
+        fn prop(idx: u8) !void {
+            const site = typed_sites[idx];
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try buildSiteGrammar(alloc, site, site.valid);
+            var diag: Diagnostic = .{};
+            _ = parseGrammarDiag(source, alloc, &diag) catch |err| {
+                std.debug.print("rejected a valid value ({s}): {s}\n", .{ @errorName(err), source });
+                return err;
+            };
+        }
+    }.prop, .{ .num_runs = 100 });
+}
+
+fn depthGrammar(alloc: std.mem.Allocator, depth: i64) ![]const u8 {
+    // Depth 0 needs a `field`; every other depth must not have one.
+    const field_line: []const u8 = if (depth == 0) "field = \"name\"\n" else "";
+    return std.fmt.allocPrint(
+        alloc,
+        "[[patterns]]\ntype = \"t\"\nsequence = [\"$name:IDENTIFIER\"]\n[[patterns.constraints]]\ntype = \"not\"\ndepth = {d}\n{s}values = [\"x\"]\n",
+        .{ depth, field_line },
+    );
+}
+fn expectDepthRejected(alloc: std.mem.Allocator, depth: i64) !void {
+    const source = try depthGrammar(alloc, depth);
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidConstraintDepth, parseGrammarDiag(source, alloc, &diag));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings(
+        "invalid constraint depth (expected an integer from 0 to 255)",
+        diagnostics.grammarErrorDetail(error.InvalidConstraintDepth, &diag, &buf),
+    );
+}
+const diagnostics = @import("../cli/diagnostics.zig");
+
+// Feature: loader-typed-accessors, Property 2: integer boundary, no wrap or truncation
+// **Validates: Requirements 2.4, 3.1**
+test "property: constraint depth outside 0..255 is rejected with the range message" {
+    const neg_gen = comptime gen.intRange(i64, -100000, -1);
+    try minish.check(testing.allocator, neg_gen, struct {
+        fn prop(depth: i64) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            try expectDepthRejected(arena.allocator(), depth);
+        }
+    }.prop, .{ .num_runs = 100 });
+    const big_gen = comptime gen.intRange(i64, 256, 1 << 40);
+    try minish.check(testing.allocator, big_gen, struct {
+        fn prop(depth: i64) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            try expectDepthRejected(arena.allocator(), depth);
+        }
+    }.prop, .{ .num_runs = 100 });
+    // Edges, including values that would wrap if truncated to u8 (256 -> 0, 511 -> 255).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]i64{ -1, 256, 257, 511, 65536, std.math.maxInt(i64), std.math.minInt(i64) + 1 }) |d| {
+        try expectDepthRejected(arena.allocator(), d);
+    }
+}
+test "property: constraint depth inside 0..255 loads with exactly that depth" {
+    const depth_gen = comptime gen.intRange(u8, 0, 255);
+    try minish.check(testing.allocator, depth_gen, struct {
+        fn prop(depth: u8) !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const source = try depthGrammar(alloc, depth);
+            const g = try parseGrammar(source, alloc);
+            try testing.expectEqual(@as(usize, 1), g.patterns[0].constraints.len);
+            try testing.expectEqual(depth, g.patterns[0].constraints[0].depth);
+        }
+    }.prop, .{ .num_runs = 256 });
+}
+
+// Feature: loader-typed-accessors, Property 2: check order is unchanged by the fix
+// **Validates: Requirements 3.2**
+test "order of checks: a guarded fault wins over a later wrong-typed value" {
+    // Constraint `type` (guarded) is read before `depth`, `field` and `values`.
+    try expectLoadErrorWith(error.InvalidConstraintType, "", plain_pat, "[[patterns.constraints]]\ntype = \"bad\"\ndepth = \"x\"\nfield = 1\nvalues = 1\n");
+    // Constraint `depth` is read before `field` and `values`.
+    try expectLoadErrorWith(error.InvalidConstraintDepth, "", plain_pat, "[[patterns.constraints]]\ntype = \"not\"\ndepth = 300\nfield = 1\nvalues = 1\n");
+    // Pattern `position` (guarded) is read before a non-array `constraints`.
+    try expectLoadErrorWith(error.InvalidPositionValue, "", plain_pat, "position = 1\nconstraints = 1\n");
+    // Language extensions (guarded) before a scalar `keywords` section.
+    try expectLoadError(error.InvalidExtensionsList, "keywords = 1\n\n[language]\nextensions = [1]\n\n" ++ plain_pat);
 }

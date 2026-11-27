@@ -3,7 +3,7 @@ const grammar_loader = @import("../grammar/loader.zig");
 const grammar_compiler = @import("../grammar/compiler.zig");
 const diagnostics = @import("diagnostics.zig");
 const fatalError = diagnostics.fatalError;
-const grammarErrorMessage = diagnostics.grammarErrorMessage;
+const grammarErrorDetail = diagnostics.grammarErrorDetail;
 const readSourceFile = @import("source.zig").readSourceFile;
 /// Suffix match test in `--grammar-dir` extension matching. The dot-less form
 /// (e.g. `erl`) is the broader documented suffix.
@@ -54,8 +54,10 @@ pub fn loadGrammarFile(io: std.Io, allocator: std.mem.Allocator, path: []const u
     const grammar_source = readSourceFile(io, allocator, path) catch {
         fatalError("failed to read grammar file: {s}", .{path});
     };
-    const grammar = grammar_loader.parseGrammar(grammar_source, allocator) catch |err| {
-        const msg: []const u8 = grammarErrorMessage(err);
+    var diag: grammar_loader.Diagnostic = .{};
+    const grammar = grammar_loader.parseGrammarDiag(grammar_source, allocator, &diag) catch |err| {
+        var detail_buf: [256]u8 = undefined;
+        const msg: []const u8 = grammarErrorDetail(err, &diag, &detail_buf);
         fatalError("{s}: {s}", .{ msg, path });
     };
     return .{

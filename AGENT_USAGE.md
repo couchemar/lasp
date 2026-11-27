@@ -669,7 +669,10 @@ Agents can use confidence to decide whether to trust a match, refine the grammar
 | Grammar not found | stderr message, non-zero exit |
 | Invalid TOML | stderr message, non-zero exit |
 | Missing `[[patterns]]` | stderr message, non-zero exit |
+| Grammar value of the wrong TOML type, or an integer outside its range (for example `[[patterns]] type = 1`, `sequence = [1]`, `keywords.function = "fn"`, `[blocks] open = 1`). Keys whose error already names them keep it: `position` (`invalid position value, expected 'start'`) and constraint `type`/`field`/`values`/`depth` (`invalid constraint ...`) | `error: invalid value for '<key path>': expected <a string\|an array of strings\|an integer from <lo> to <hi>\|a number\|a boolean\|a table\|an array of tables>: <grammar path>` on stderr, empty stdout, exit 1; never a panic |
+| Scalar given for a grammar section (`blocks = 1`, `language = 1`, `comments = 1`, `weights = 1`, ...) or a non-table element in a table array (`patterns = [1]`) | same `invalid value for '<key path>'` error, exit 1 |
 | Invalid `position` value | stderr message, non-zero exit |
+| Constraint `depth` outside 0 to 255 | `invalid constraint depth (expected an integer from 0 to 255)` on stderr, non-zero exit |
 | Negative weight value | stderr message, non-zero exit |
 | `[comments] line` not an array of strings | stderr message, non-zero exit |
 | `[comments]` block delimiter with wrong type | stderr message, non-zero exit |

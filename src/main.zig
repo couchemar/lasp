@@ -193,5 +193,6 @@ test {
     _ = cli;
     _ = tokenizer;
     _ = resemblance;
+    _ = @import("grammar/toml_access.zig");
     _ = @import("main_test.zig");
 }

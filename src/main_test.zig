@@ -3895,3 +3895,803 @@ test "framing: parse --names-only with no grammar is raw-token JSON ending in on
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("events").?.array.items.len > 0);
 }
+
+const CharacterizedGrammar = struct { path: []const u8, rendered: []const u8 };
+// Captured from the unchanged loader (spec loader-typed-accessors task 1.1): parseGrammar then formatGrammar per file.
+const characterized_grammars = [_]CharacterizedGrammar{
+    .{ .path = "examples/grammars/erlang.toml", .rendered =
+    \\[language]
+    \\name = "erlang"
+    \\
+    \\[keywords]
+    \\declaration = ["-module", "-export", "-spec", "-type", "-record", "-behaviour", "-include", "-include_lib", "-define", "-ignore_xref", "-export_type"]
+    \\control = ["case", "of", "end", "if", "when", "try", "catch", "after", "receive", "begin", "maybe", "else"]
+    \\function = ["fun"]
+    \\
+    \\[[patterns]]
+    \\type = "module"
+    \\sequence = ["-module", "(", "$name:IDENTIFIER"]
+    \\
+    \\[[patterns]]
+    \\type = "module_attr"
+    \\sequence = ["-", "module", "(", "$name:IDENTIFIER"]
+    \\
+    \\[[patterns]]
+    \\type = "export"
+    \\sequence = ["-export", "("]
+    \\
+    \\[[patterns]]
+    \\type = "spec"
+    \\sequence = ["-spec", "$name:IDENTIFIER", "("]
+    \\
+    \\[[patterns]]
+    \\type = "function"
+    \\sequence = ["$name:IDENTIFIER", "("]
+    \\position = "start"
+    \\
+    \\[[patterns.constraints]]
+    \\type = "not"
+    \\depth = 4
+    \\values = ["-spec", "-type"]
+    \\
+    \\[[patterns.constraints]]
+    \\type = "not"
+    \\depth = 1
+    \\values = ["fun", "="]
+    \\
+    \\[[patterns]]
+    \\type = "call"
+    \\sequence = ["$callee:IDENTIFIER", ":", "$name:IDENTIFIER", "("]
+    \\
+    \\[[patterns]]
+    \\type = "type"
+    \\sequence = ["-type", "$name:IDENTIFIER"]
+    \\
+    \\[[patterns]]
+    \\type = "record"
+    \\sequence = ["-record", "(", "$name:IDENTIFIER"]
+    \\
+    \\[blocks]
+    \\open = "begin"
+    \\close = "end"
+    \\
+    \\[comments]
+    \\line = ["%"]
+    \\
+    },
+    .{ .path = "examples/grammars/erlang_tokens.toml", .rendered =
+    \\[language]
+    \\name = "Erlang (configurable tokens)"
+    \\
+    \\[[patterns]]
+    \\type = "call"
+    \\sequence = ["atom", "(", "atom", ")"]
+    \\
+    \\[[patterns]]
+    \\type = "quoted"
+    \\sequence = ["quoted_atom"]
+    \\
+    \\[[patterns]]
+    \\type = "assignment"
+    \\sequence = ["variable", "=", "atom"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    \\[tokens]
+    \\[tokens.variable]
+    \\char_class_run = { start = "A-Z_", "continue" = "0-9A-Z_a-z" }
+    \\[tokens.atom]
+    \\char_class_run = { start = "a-z", "continue" = "0-9_a-z" }
+    \\[tokens.quoted_atom]
+    \\delimited_span = { open = "'", close = "'" }
+    \\[tokens.integer]
+    \\char_class_run = { start = "0-9", "continue" = "0-9" }
+    \\[tokens.symbol]
+    \\literal_set = ["(", ")", ",", ".", ";", "|", "[", "]"]
+    \\[tokens.op]
+    \\literal_set = ["+", "-", "*", "/", "=", "<", ">"]
+    \\
+    },
+    .{ .path = "examples/grammars/forth_tokens.toml", .rendered =
+    \\[language]
+    \\name = "Forth (configurable tokens)"
+    \\
+    \\[[patterns]]
+    \\type = "definition"
+    \\sequence = ["defn_start", "$name:word"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    \\[tokens]
+    \\[tokens.defn_start]
+    \\literal_set = [":"]
+    \\[tokens.defn_end]
+    \\literal_set = [";"]
+    \\[tokens.word]
+    \\char_class_run = { start = "!-~", "continue" = "!-~" }
+    \\
+    },
+    .{ .path = "examples/grammars/markdown_tasks.toml", .rendered =
+    \\[language]
+    \\name = "markdown-tasks"
+    \\extensions = [".md"]
+    \\
+    \\[[patterns]]
+    \\type = "task_open"
+    \\sequence = ["-", "[", "]"]
+    \\
+    \\[[patterns]]
+    \\type = "task_done"
+    \\sequence = ["-", "[", "word", "]"]
+    \\
+    \\
+    \\[tokens]
+    \\[tokens.word]
+    \\char_class_run = { start = "0-9A-Z_a-z", "continue" = "0-9A-Z_a-z" }
+    \\[tokens.mark]
+    \\literal_set = ["-", "[", "]"]
+    \\
+    },
+    .{ .path = "examples/grammars/zig.toml", .rendered =
+    \\[language]
+    \\name = "zig"
+    \\
+    \\[keywords]
+    \\function = ["fn", "pub"]
+    \\struct = ["struct", "enum", "union"]
+    \\import = ["@import"]
+    \\control = ["if", "else", "while", "for", "switch", "return", "break", "continue"]
+    \\
+    \\[[patterns]]
+    \\type = "function"
+    \\sequence = ["fn", "$name:IDENTIFIER", "("]
+    \\
+    \\[[patterns]]
+    \\type = "pub_function"
+    \\sequence = ["pub", "fn", "$name:IDENTIFIER", "("]
+    \\
+    \\[[patterns]]
+    \\type = "struct"
+    \\sequence = ["$name:IDENTIFIER", "=", "struct"]
+    \\
+    \\[[patterns]]
+    \\type = "enum"
+    \\sequence = ["$name:IDENTIFIER", "=", "enum"]
+    \\
+    \\[[patterns]]
+    \\type = "call"
+    \\sequence = ["$callee:IDENTIFIER", "("]
+    \\
+    \\[blocks]
+    \\open = "{"
+    \\close = "}"
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/charset_escape.toml", .rendered =
+    \\[language]
+    \\name = "charset-escape"
+    \\
+    \\[[patterns]]
+    \\type = "chunk"
+    \\sequence = ["fence", "{", "label", "$label:label", "}"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    \\[tokens]
+    \\[tokens.fence]
+    \\literal_set = ["```"]
+    \\[tokens.brace]
+    \\literal_set = ["{", "}"]
+    \\[tokens.label]
+    \\char_class_run = { start = "A-Z_a-z", "continue" = "\u002D0-9A-Z_a-z" }
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/charset_escape_nonascii.toml", .rendered = "[language]\nname = \"charset-escape\"\n\n[[patterns]]\ntype = \"chunk\"\nsequence = [\"fence\", \"{\", \"label\", \"$label:label\", \"}\"]\n\n\n[comments]\nline = [\"//\", \"#\"]\nblock_open = \"/*\"\nblock_close = \"*/\"\n\n[tokens]\n[tokens.fence]\nliteral_set = [\"```\"]\n[tokens.brace]\nliteral_set = [\"{\", \"}\"]\n[tokens.label]\nchar_class_run = { start = \"A-Z_a-z\", \"continue\" = \"\\u002D0-9A-Z_a-z\x80\xd0\" }\n" },
+    .{ .path = "tests/fixtures/grammars/colliding_function_call.toml", .rendered =
+    \\[language]
+    \\name = "erlang"
+    \\
+    \\[keywords]
+    \\declaration = ["-module", "-export"]
+    \\
+    \\[[patterns]]
+    \\type = "function"
+    \\sequence = ["$name:IDENTIFIER", "("]
+    \\position = "start"
+    \\
+    \\[[patterns]]
+    \\type = "call"
+    \\sequence = ["$callee:IDENTIFIER", "("]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/counts.toml", .rendered =
+    \\[[patterns]]
+    \\type = "fn"
+    \\sequence = ["identifier", "$n:IDENTIFIER"]
+    \\
+    \\[[patterns.capture]]
+    \\field = "n"
+    \\separator = "."
+    \\suffix = "!?"
+    \\
+    \\[[patterns.count]]
+    \\field = "args"
+    \\open = "("
+    \\close = ")"
+    \\separator = ","
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/extent_brace.toml", .rendered =
+    \\[[patterns]]
+    \\type = "function"
+    \\sequence = ["identifier", "$n:IDENTIFIER", "("]
+    \\
+    \\[[patterns.extent]]
+    \\field = "body"
+    \\open = "{"
+    \\close = "}"
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/extent_terminator.toml", .rendered =
+    \\[[patterns]]
+    \\type = "clause"
+    \\sequence = ["identifier", "(", ")"]
+    \\
+    \\[[patterns.extent]]
+    \\field = "region"
+    \\terminator = "."
+    \\at_column = 0
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/multiline_span.toml", .rendered =
+    \\[language]
+    \\name = "multiline-span"
+    \\
+    \\[[patterns]]
+    \\type = "word"
+    \\sequence = ["$name:word"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    \\[tokens]
+    \\[tokens.word]
+    \\char_class_run = { start = "A-Z_a-z", "continue" = "A-Z_a-z" }
+    \\[tokens.q]
+    \\delimited_span = { open = "'", close = "'", escape = "\u005C" }
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/multiline_span_position.toml", .rendered =
+    \\[language]
+    \\name = "multiline-span-position"
+    \\
+    \\[[patterns]]
+    \\type = "decl"
+    \\sequence = ["$name:word"]
+    \\position = "start"
+    \\
+    \\[[patterns.extent]]
+    \\field = "region"
+    \\terminator = "."
+    \\at_column = 0
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    \\[tokens]
+    \\[tokens.word]
+    \\char_class_run = { start = "A-Z_a-z", "continue" = "A-Z_a-z" }
+    \\[tokens.q]
+    \\delimited_span = { open = "'", close = "'", escape = "\u005C" }
+    \\[tokens.dot]
+    \\literal_set = ["."]
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/number.toml", .rendered =
+    \\[[patterns]]
+    \\type = "num"
+    \\sequence = ["number"]
+    \\
+    \\[[patterns]]
+    \\type = "decl"
+    \\sequence = ["$name:IDENTIFIER", "number?"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/resemblance.toml", .rendered =
+    \\[[patterns]]
+    \\type = "literal"
+    \\sequence = ["hexlit"]
+    \\
+    \\[[patterns]]
+    \\type = "num"
+    \\sequence = ["number"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    \\[tokens]
+    \\[tokens.hexlit]
+    \\literal_set = ["0x01", "0b10"]
+    \\[tokens.number]
+    \\char_class_run = { start = "0-9", "continue" = "0-9" }
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/typed.toml", .rendered =
+    \\[[patterns]]
+    \\type = "msg"
+    \\sequence = ["$s:STRING"]
+    \\
+    \\[[patterns]]
+    \\type = "num"
+    \\sequence = ["$n:NUMBER"]
+    \\
+    \\[[patterns]]
+    \\type = "exact_key"
+    \\sequence = ["key:STRING"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/union.toml", .rendered =
+    \\[language]
+    \\name = "union"
+    \\
+    \\[keywords]
+    \\decl = ["fn", "use"]
+    \\
+    \\[[patterns]]
+    \\type = "decl"
+    \\sequence = ["fn", "$name:IDENTIFIER"]
+    \\
+    \\[[patterns]]
+    \\type = "decl"
+    \\sequence = ["fn", "$name:IDENTIFIER", "("]
+    \\
+    \\[[patterns]]
+    \\type = "call"
+    \\sequence = ["use", "$callee:IDENTIFIER"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/zig.toml", .rendered =
+    \\[language]
+    \\name = "zig"
+    \\
+    \\[keywords]
+    \\function = ["fn"]
+    \\declaration = ["const", "var", "pub"]
+    \\control = ["return", "if", "else", "while", "for"]
+    \\type = ["struct", "enum", "union"]
+    \\
+    \\[[patterns]]
+    \\type = "function"
+    \\sequence = ["fn", "$name:IDENTIFIER", "("]
+    \\
+    \\[[patterns]]
+    \\type = "struct"
+    \\sequence = ["struct", "$name:IDENTIFIER"]
+    \\
+    \\[[patterns]]
+    \\type = "call"
+    \\sequence = ["$callee:IDENTIFIER", "("]
+    \\
+    \\[blocks]
+    \\open = "{"
+    \\close = "}"
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/zig_test_blocks.toml", .rendered =
+    \\[language]
+    \\name = "zig-test-blocks"
+    \\extensions = [".zig"]
+    \\
+    \\[[patterns]]
+    \\type = "test_block"
+    \\sequence = ["test:IDENTIFIER", "string"]
+    \\position = "start"
+    \\
+    \\[[patterns.extent]]
+    \\field = "body_end"
+    \\open = "{"
+    \\close = "}"
+    \\
+    \\[[patterns]]
+    \\type = "test_block_anon"
+    \\sequence = ["test:IDENTIFIER", "{"]
+    \\position = "start"
+    \\
+    \\[[patterns.extent]]
+    \\field = "body_end"
+    \\open = "{"
+    \\close = "}"
+    \\
+    \\
+    \\[comments]
+    \\line = ["//", "#"]
+    \\block_open = "/*"
+    \\block_close = "*/"
+    \\
+    },
+    .{ .path = "tests/fixtures/grammars/zig_union_reads.toml", .rendered =
+    \\[language]
+    \\name = "zig-union-reads"
+    \\extensions = [".zig"]
+    \\
+    \\[[patterns]]
+    \\type = "union_read"
+    \\sequence = ["$base:IDENTIFIER", ".", "$field:IDENTIFIER"]
+    \\
+    \\[[patterns]]
+    \\type = "union_read"
+    \\sequence = ["*", ".", "$field:IDENTIFIER"]
+    \\
+    \\
+    \\[comments]
+    \\line = ["//"]
+    \\
+    },
+};
+test "characterize: shipped and fixture grammars load and render as captured" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (characterized_grammars) |entry| {
+        const source = try source_reader.readSourceFile(std.testing.io, a, entry.path);
+        const grammar = try grammar_loader.parseGrammar(source, a);
+        const rendered = try grammar_loader.formatGrammar(grammar, a);
+        std.testing.expectEqualStrings(entry.rendered, rendered) catch |err| {
+            std.debug.print("rendering differs for {s}\n", .{entry.path});
+            return err;
+        };
+    }
+}
+test "characterize: malformed fixture grammars keep their error variant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { path: []const u8, err: grammar_loader.GrammarError }{
+        .{ .path = "tests/fixtures/grammars/malformed.toml", .err = error.InvalidToml },
+        .{ .path = "tests/fixtures/grammars/invalid_position.toml", .err = error.InvalidPositionValue },
+        .{ .path = "tests/fixtures/grammars/bad_prior.toml", .err = error.InvalidPriorValue },
+    };
+    for (cases) |c| {
+        const source = try source_reader.readSourceFile(std.testing.io, a, c.path);
+        try std.testing.expectError(c.err, grammar_loader.parseGrammar(source, a));
+    }
+}
+test "characterize: grammarErrorMessage bodies for guarded and non-type errors" {
+    const diagnostics = @import("cli/diagnostics.zig");
+    const cases = [_]struct { err: grammar_loader.GrammarError, msg: []const u8 }{
+        .{ .err = error.InvalidExtensionsList, .msg = "[language] extensions must be an array of non-empty strings" },
+        .{ .err = error.InvalidTokenSection, .msg = "[tokens] entries must be tables with exactly one recognizer (char_class_run, delimited_span, or literal_set)" },
+        .{ .err = error.InvalidRecognizer, .msg = "[tokens] recognizer must be exactly one of char_class_run, delimited_span, or literal_set" },
+        .{ .err = error.EmptyLiteralSet, .msg = "[tokens] literal_set must contain non-empty strings" },
+        .{ .err = error.InvalidCaptureTable, .msg = "[[patterns.capture]] must declare a non-empty field and at least one of separator/suffix (1-8 bytes)" },
+        .{ .err = error.InvalidCountTable, .msg = "[[patterns.count]] must declare non-empty field, open, close, and separator strings (1-8 bytes)" },
+        .{ .err = error.InvalidExtentField, .msg = "[[patterns.extent]] field must be 1-64 bytes" },
+        .{ .err = error.InvalidExtentDelimiter, .msg = "[[patterns.extent]] open/close/terminator must be 1-8 bytes" },
+        .{ .err = error.InvalidExtentAtColumn, .msg = "[[patterns.extent]] at_column must be an integer in 0..65535" },
+        .{ .err = error.InvalidPriorValue, .msg = "invalid prior value, prior must be greater than 0.0 and at most 2.0" },
+        .{ .err = error.InvalidCommentLineType, .msg = "[comments] line must be an array of strings" },
+        .{ .err = error.InvalidCommentBlockType, .msg = "[comments] block_open/block_close must be strings" },
+        .{ .err = error.InvalidWeightValue, .msg = "invalid weight value, weights must be non-negative" },
+        .{ .err = error.MissingPatterns, .msg = "grammar file missing required [[patterns]] section" },
+        .{ .err = error.EmptyPatternSequence, .msg = "pattern has empty sequence" },
+        .{ .err = error.DeprecatedField, .msg = "deprecated field (exclude/not_preceded_by), use [[patterns.constraints]] instead" },
+        .{ .err = error.InvalidPositionValue, .msg = "invalid position value, expected 'start'" },
+        .{ .err = error.InvalidConstraintDepth, .msg = "invalid constraint depth (expected an integer from 0 to 255)" },
+        .{ .err = error.InvalidToml, .msg = "invalid TOML syntax in grammar file" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c.msg, diagnostics.grammarErrorMessage(c.err));
+}
+// --- loader-typed-accessors, task 4: bug-condition exploration (Property 1) ---
+// Every audited unchecked site (design audit table) given a wrong TOML type or
+// an out-of-range integer must be a grammar error: exit 1, empty stdout, one
+// `error: ` line naming the key and the grammar path. These tests run the
+// binary as a child process because an in-process panic would abort the runner.
+// They FAIL on code before task 5 (exit 134 for crash rows, exit 0 for
+// scalar-section rows); task 5 turns them green.
+const crash_sec = "[[patterns]]\ntype = \"function\"\nsequence = [\"fn\"]\n";
+const crash_pat = "[[patterns]]\ntype = \"function\"\nsequence = [\"fn\", \"$name:IDENTIFIER\", \"(\"]\n";
+const crash_cons = crash_pat ++ "[[patterns.constraints]]\n";
+fn expectGrammarRejected(
+    r: anytype,
+    key: []const u8,
+    expected: []const u8,
+    grammar_path: []const u8,
+) !void {
+    try expectFatalResultOnePrefix(r.term, r.stdout, r.stderr, null);
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, r.stderr, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        n += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, key) != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, grammar_path) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+/// One audit-table case through `parse - -g`. `key` is a substring the error
+/// line must contain (the key name, or the fixed message of a kept variant);
+/// `expected` is the expected-type text for `WrongValueType` rows ("" when the
+/// row keeps an existing variant or the wording is not fixed by the design).
+fn expectCrashRejected(toml: []const u8, key: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, "crash_g.toml", toml);
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "crash_g.toml" }, "fn add(a) {}");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try expectGrammarRejected(r, key, expected, "crash_g.toml");
+}
+test "crash: language.name = 1" {
+    try expectCrashRejected("[language]\nname = 1\n" ++ crash_pat, "name", "a string");
+}
+test "crash: language = 1 (scalar section)" {
+    try expectCrashRejected("language = 1\n" ++ crash_pat, "language", "a table");
+}
+test "crash: keywords = 1 (scalar section)" {
+    try expectCrashRejected("keywords = 1\n" ++ crash_pat, "keywords", "a table");
+}
+test "crash: keywords.function = \"fn\"" {
+    try expectCrashRejected("[keywords]\nfunction = \"fn\"\n" ++ crash_pat, "function", "an array of strings");
+}
+test "crash: keywords.function = [1]" {
+    try expectCrashRejected("[keywords]\nfunction = [1]\n" ++ crash_pat, "function", "an array of strings");
+}
+test "crash: keywords.function = { a = 1 }" {
+    try expectCrashRejected("[keywords]\nfunction = { a = 1 }\n" ++ crash_pat, "function", "an array of strings");
+}
+test "crash: tokens = 1 (scalar section)" {
+    try expectCrashRejected("tokens = 1\n" ++ crash_pat, "tokens", "a table");
+}
+test "crash: [patterns] as a table" {
+    try expectCrashRejected("[patterns]\ntype = \"function\"\n", "patterns", "an array of tables");
+}
+test "crash: patterns = [1] (non-table element, not MissingPatterns)" {
+    try expectCrashRejected("patterns = [1]\n", "patterns", "invalid value for");
+}
+test "crash: patterns.type = 1" {
+    try expectCrashRejected("[[patterns]]\ntype = 1\nsequence = [\"fn\"]\n", "type", "a string");
+}
+test "crash: patterns.type = true" {
+    try expectCrashRejected("[[patterns]]\ntype = true\nsequence = [\"fn\"]\n", "type", "a string");
+}
+test "crash: patterns.type = [\"x\"]" {
+    try expectCrashRejected("[[patterns]]\ntype = [\"x\"]\nsequence = [\"fn\"]\n", "type", "a string");
+}
+test "crash: patterns.sequence = \"fn\"" {
+    try expectCrashRejected("[[patterns]]\ntype = \"function\"\nsequence = \"fn\"\n", "sequence", "an array of strings");
+}
+test "crash: patterns.sequence = [1]" {
+    try expectCrashRejected("[[patterns]]\ntype = \"function\"\nsequence = [1]\n", "sequence", "an array of strings");
+}
+test "crash: patterns.capture = 1" {
+    try expectCrashRejected(crash_sec ++ "capture = 1\n", "capture", "an array of tables");
+}
+test "crash: patterns.count = 1" {
+    try expectCrashRejected(crash_sec ++ "count = 1\n", "count", "an array of tables");
+}
+test "crash: patterns.extent = 1" {
+    try expectCrashRejected(crash_sec ++ "extent = 1\n", "extent", "an array of tables");
+}
+test "crash: patterns.capture = [1] (non-table element)" {
+    try expectCrashRejected(crash_sec ++ "capture = [1]\n", "capture", "invalid value for");
+}
+test "crash: patterns.count = [1] (non-table element)" {
+    try expectCrashRejected(crash_sec ++ "count = [1]\n", "count", "invalid value for");
+}
+test "crash: patterns.extent = [1] (non-table element)" {
+    try expectCrashRejected(crash_sec ++ "extent = [1]\n", "extent", "invalid value for");
+}
+test "crash: patterns.constraints = [1] (non-table element)" {
+    try expectCrashRejected(crash_sec ++ "constraints = [1]\n", "constraints", "invalid value for");
+}
+test "crash: patterns.position = 1" {
+    try expectCrashRejected(crash_sec ++ "position = 1\n", "position", "");
+}
+test "crash: patterns.constraints = 1" {
+    try expectCrashRejected(crash_sec ++ "constraints = 1\n", "constraints", "an array of tables");
+}
+test "crash: constraint.type = 1" {
+    try expectCrashRejected(crash_cons ++ "type = 1\ndepth = 1\n", "constraint", "");
+}
+test "crash: constraint.field = 1" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = 0\nfield = 1\nvalues = [\"x\"]\n", "field", "");
+}
+test "crash: constraint.values = \"x\"" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = 1\nvalues = \"x\"\n", "values", "");
+}
+test "crash: constraint.values = [1]" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = 1\nvalues = [1]\n", "values", "");
+}
+test "crash: constraint.depth = \"a\"" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = \"a\"\nvalues = [\"x\"]\n", "depth", "");
+}
+test "crash: constraint.depth = -1" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = -1\nvalues = [\"x\"]\n", "depth", "");
+}
+test "crash: constraint.depth = 256" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = 256\nvalues = [\"x\"]\n", "depth", "");
+}
+test "crash: constraint.depth = 300" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = 300\nvalues = [\"x\"]\n", "depth", "");
+}
+test "crash: constraint.depth = 1.5" {
+    try expectCrashRejected(crash_cons ++ "type = \"not\"\ndepth = 1.5\nvalues = [\"x\"]\n", "depth", "");
+}
+test "crash: blocks = 1 (scalar section)" {
+    try expectCrashRejected("blocks = 1\n" ++ crash_pat, "blocks", "a table");
+}
+test "crash: blocks.open = 1" {
+    try expectCrashRejected("[blocks]\nopen = 1\n" ++ crash_pat, "open", "a string");
+}
+test "crash: blocks.close = 1" {
+    try expectCrashRejected("[blocks]\nclose = 1\n" ++ crash_pat, "close", "a string");
+}
+test "crash: blocks.indentation = 1" {
+    try expectCrashRejected("[blocks]\nindentation = 1\n" ++ crash_pat, "indentation", "a boolean");
+}
+test "crash: comments = 1 (scalar section)" {
+    try expectCrashRejected("comments = 1\n" ++ crash_pat, "comments", "a table");
+}
+test "crash: weights = 1 (scalar section)" {
+    try expectCrashRejected("weights = 1\n" ++ crash_pat, "weights", "a table");
+}
+// Four grammar-loading paths, one crash input (`type = 1`) and one range input
+// (`depth = 300`) each.
+const crash_type_toml = "[language]\nname = \"bad\"\nextensions = [\".erl\"]\n[[patterns]]\ntype = 1\nsequence = [\"fn\"]\n";
+const crash_depth_toml = "[language]\nname = \"bad\"\nextensions = [\".erl\"]\n" ++ crash_cons ++ "type = \"not\"\ndepth = 300\nvalues = [\"x\"]\n";
+fn expectPathRejected(comptime mode: enum { parse_g, query_g, parse_dir, default_dir }, toml: []const u8, key: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    const io = std.testing.io;
+    const src = "tests/fixtures/dir_sample/a.erl";
+    const r = switch (mode) {
+        .parse_g => blk: {
+            try writeFixtureFile(sb.tmp.dir, io, "bad.toml", toml);
+            break :blk try runLasp(allocator, &.{ "parse", src, "-g", "bad.toml" });
+        },
+        .query_g => blk: {
+            try writeFixtureFile(sb.tmp.dir, io, "bad.toml", toml);
+            break :blk try runLasp(allocator, &.{ "query", "function", src, "-g", "bad.toml" });
+        },
+        .parse_dir => blk: {
+            try sb.tmp.dir.createDir(io, "gdir", .default_dir);
+            try writeFixtureFile(sb.tmp.dir, io, "gdir/bad.toml", toml);
+            break :blk try runLasp(allocator, &.{ "parse-dir", "tests/fixtures/dir_sample", "--grammar-dir", "gdir" });
+        },
+        .default_dir => blk: {
+            try seedDefaultGrammars(allocator, &sb, &.{.{ .name = "bad.toml", .content = toml }});
+            break :blk try runLasp(allocator, &.{ "parse", src });
+        },
+    };
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try expectGrammarRejected(r, key, expected, "bad.toml");
+}
+test "crash path: parse -g, type = 1" {
+    try expectPathRejected(.parse_g, crash_type_toml, "type", "a string");
+}
+test "crash path: query -g, type = 1" {
+    try expectPathRejected(.query_g, crash_type_toml, "type", "a string");
+}
+test "crash path: parse-dir --grammar-dir, type = 1" {
+    try expectPathRejected(.parse_dir, crash_type_toml, "type", "a string");
+}
+test "crash path: default .lasp/grammars, type = 1" {
+    try expectPathRejected(.default_dir, crash_type_toml, "type", "a string");
+}
+test "crash path: parse -g, depth = 300" {
+    try expectPathRejected(.parse_g, crash_depth_toml, "depth", "");
+}
+test "crash path: query -g, depth = 300" {
+    try expectPathRejected(.query_g, crash_depth_toml, "depth", "");
+}
+test "crash path: parse-dir --grammar-dir, depth = 300" {
+    try expectPathRejected(.parse_dir, crash_depth_toml, "depth", "");
+}
+test "crash path: default .lasp/grammars, depth = 300" {
+    try expectPathRejected(.default_dir, crash_depth_toml, "depth", "");
+}
+// Byte-for-byte message pins (prefix `error: `, grammar path last). `depth`
+// keeps its existing variant, so its text is the fixed constraint-depth body.
+fn expectExactGrammarMessage(toml: []const u8, expected_line: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var sb = try Sandbox.init(allocator);
+    defer sb.deinit();
+    sb.enter();
+    try writeFixtureFile(sb.tmp.dir, std.testing.io, "crash_g.toml", toml);
+    const r = try runLaspWithStdin(allocator, &.{ "parse", "-", "-g", "crash_g.toml" }, "fn add(a) {}");
+    defer {
+        allocator.free(r.stdout);
+        allocator.free(r.stderr);
+    }
+    try expectFatalResultOnePrefix(r.term, r.stdout, r.stderr, null);
+    try std.testing.expectEqualStrings(expected_line, r.stderr);
+}
+test "crash: exact message text, type = 1" {
+    try expectExactGrammarMessage(crash_type_toml, "error: invalid value for 'patterns[].type': expected a string: crash_g.toml\n");
+}
+test "crash: exact message text, depth = 300" {
+    try expectExactGrammarMessage(crash_depth_toml, "error: invalid constraint depth (expected an integer from 0 to 255): crash_g.toml\n");
+}

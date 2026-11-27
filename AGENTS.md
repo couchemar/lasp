@@ -57,6 +57,12 @@ tests/scripts/dead_code.sh zig-out/bin/lasp   # default binary: .bin/lasp
 ```
 Section 1 `Unreferenced functions` lists production functions nothing mentions; exit 1 means section 1 is non-empty (outside the script's `ALLOWLIST`, initially `main`). Section 2 `Test-only functions` lists production functions mentioned only inside test blocks (informational). Exit 2 is a usage or tool failure (missing or failing binary). It uses `tests/fixtures/grammars/zig_test_blocks.toml` to find test blocks. The report is name-based, so it cannot see same-name collisions, write-only locals, test-only fields, transitively dead types, discarded parameters, or duplicate shapes.
 
+**Union-read report (LASP on `src/grammar/loader.zig`):**
+```bash
+bash tests/scripts/union_reads.sh zig-out/bin/lasp src/grammar/loader.zig
+```
+Lists direct TOML union reads outside test blocks, using `tests/fixtures/grammars/zig_union_reads.toml` and the test-block grammar. Exit 0 means none (every typed read goes through `src/grammar/toml_access.zig`), exit 1 means some were found, exit 2 is a usage or tool failure.
+
 **After changing tokenizer, engine, loader, compiler, or query modules:** don't stop at `zig build test`. Smoke-test observable behavior end-to-end:
 
 ```bash
